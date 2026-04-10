@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(plink --help)",
+      "Bash(ls -la /c/dev/TRFS/*.json /c/dev/TRFS/*.yaml /c/dev/TRFS/*.ini /c/dev/TRFS/*.cfg /c/dev/TRFS/*.py)",
+      "Bash(/c/dev/TRFS/venv/Scripts/python -c ':*)",
+      "Bash(/c/dev/TRFS/venv/Scripts/pip list:*)",
+      "Bash(/c/dev/TRFS/venv/Scripts/python src/main.py --dry-run)",
+      "Bash(/c/dev/TRFS/venv/Scripts/python src/main.py --demo --band L900)",
+      "Bash(/c/dev/TRFS/venv/Scripts/python src/main.py --band L900)",
+      "Bash(ls -la /c/dev/TRFS/screenshots/MIN3117_L900_*.png)",
+      "Bash(/c/dev/TRFS/venv/Scripts/playwright install:*)",
+      "Bash(/c/dev/TRFS/venv/Scripts/python -c \"from playwright.sync_api import sync_playwright; print\\('playwright OK'\\)\")",
+      "Bash(venv/Scripts/python test_enm_all.py)",
+      "Bash(venv/Scripts/python test_enm_mapping.py)",
+      "Bash(venv/Scripts/python src/main.py --band L900)",
+      "Bash(c:/dev/TRFS/.venv/Scripts/python.exe -c \"import flet; print\\(flet.__version__\\)\")",
+      "Bash(c:/dev/TRFS/venv/Scripts/python.exe -c \"import flet; print\\(flet.__version__\\)\")",
+      "Bash(../venv/Scripts/python.exe -c ':*)",
+      "Bash(timeout 15 ../venv/Scripts/python.exe -u gui_app.py)"
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 """
-TRFS GUI - Configuration Form Page
+TRFS GUI - Elevated configuration workspace.
 """
 import asyncio
 import os
@@ -9,8 +9,26 @@ import flet as ft
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from config_loader import load_config, build_config_from_form
 from command_parser import parse_commands_file
+from config_loader import build_config_from_form, load_config
+from gui.theme import (
+    ACCENT,
+    ACCENT_WARM,
+    BG_BOTTOM,
+    BG_TOP,
+    BORDER,
+    INFO,
+    PANEL,
+    PANEL_RAISED,
+    SUCCESS,
+    TEXT,
+    TEXT_MUTED,
+    background_gradient,
+    badge,
+    panel,
+    primary_button_style,
+    secondary_button_style,
+)
 
 
 class FormPage:
@@ -42,139 +60,287 @@ class FormPage:
                 self.defaults["username"] = config.ssh.username
                 self.defaults["password"] = config.ssh.password
                 self.defaults["config_path"] = config_path
-                base_dir = config.base_dir
-                self.defaults["commands_file"] = os.path.join(base_dir, config.paths.commands)
+                self.defaults["commands_file"] = os.path.join(config.base_dir, config.paths.commands)
         except Exception:
             pass
 
     def build(self) -> ft.View:
-        self.shortcode_field = ft.TextField(
-            label="Shortcode",
-            value=self.defaults["shortcode"],
-            width=400,
+        self.shortcode_field = self._text_field(
+            "Shortcode",
+            self.defaults["shortcode"],
+            expand=1,
             autofocus=True,
         )
-        self.node_name_field = ft.TextField(
-            label="Node Name",
-            value=self.defaults["node_name"],
-            width=600,
+        self.node_name_field = self._text_field(
+            "Node Name",
+            self.defaults["node_name"],
+            expand=2,
         )
-        self.host_field = ft.TextField(
-            label="SSH Host",
-            value=self.defaults["host"],
-            width=300,
-        )
-        self.username_field = ft.TextField(
-            label="Username",
-            value=self.defaults["username"],
-            width=300,
-        )
-        self.password_field = ft.TextField(
-            label="Password",
-            value=self.defaults["password"],
+        self.host_field = self._text_field("SSH Host", self.defaults["host"], expand=1)
+        self.username_field = self._text_field("Username", self.defaults["username"], expand=1)
+        self.password_field = self._text_field(
+            "Password",
+            self.defaults["password"],
+            expand=1,
             password=True,
             can_reveal_password=True,
-            width=300,
         )
-        self.commands_field = ft.TextField(
-            label="Commands File",
-            value=self.defaults["commands_file"],
-            width=520,
-            read_only=False,
+        self.commands_field = self._text_field(
+            "Commands File",
+            self.defaults["commands_file"],
+            expand=True,
+            on_change=lambda _: self._validate_commands(),
         )
         self.file_picker = ft.FilePicker()
+        self.browse_button = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=ACCENT,
+            tooltip="Browse for commands file",
+            on_click=self._on_browse,
+        )
 
-        self.demo_checkbox = ft.Checkbox(label="Demo Mode (no SSH)", value=False)
-        self.error_text = ft.Text("", color=ft.Colors.RED_400, visible=False)
-        self.parse_info = ft.Text("", color=ft.Colors.GREEN_400, visible=False, size=12)
+        self.demo_switch = ft.Switch(
+            label="Demo mode",
+            value=False,
+            active_color=ACCENT,
+            inactive_thumb_color=TEXT_MUTED,
+            inactive_track_color="#314C61",
+        )
+        self.error_text = ft.Text("", color="#FFB4B4", visible=False, size=12)
+        self.error_box = ft.Container(
+            content=self.error_text,
+            padding=ft.Padding.symmetric(horizontal=12, vertical=10),
+            bgcolor=ft.Colors.with_opacity(0.1, "#FF6B6B"),
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.25, "#FF6B6B")),
+            border_radius=14,
+            visible=False,
+        )
+        self.parse_info = ft.Text("", color=SUCCESS, visible=False, size=12)
+        self.band_count_text = ft.Text("0", size=28, weight=ft.FontWeight.BOLD, color=TEXT)
+        self.category_count_text = ft.Text("0", size=28, weight=ft.FontWeight.BOLD, color=TEXT)
+        self.commands_name_text = ft.Text(
+            "No command map loaded",
+            size=12,
+            color=TEXT_MUTED,
+        )
 
-        return ft.View(
-            route="/form",
-            appbar=ft.AppBar(
-                title=ft.Text("TRFS Automation Tool", size=20, weight=ft.FontWeight.BOLD),
-                bgcolor=ft.Colors.BLUE_900,
-            ),
-            controls=[
-                ft.Container(
-                    content=ft.Column(
+        if self.commands_field.value.strip():
+            self._validate_commands()
+
+        hero = panel(
+            ft.Column(
+                [
+                    badge("Desktop Workflow", ACCENT, ft.Icons.DESKTOP_WINDOWS),
+                    ft.Text(
+                        "TRFS Command Studio",
+                        size=42,
+                        weight=ft.FontWeight.BOLD,
+                        color=TEXT,
+                    ),
+                    ft.Text(
+                        "A sharper control room for SSH execution, ENM capture, and Excel report generation.",
+                        size=15,
+                        color=TEXT_MUTED,
+                    ),
+                    ft.Row(
                         [
-                            ft.Text("Configuration", size=18, weight=ft.FontWeight.W_600),
-                            ft.Divider(),
-                            self.shortcode_field,
-                            self.node_name_field,
-                            ft.Row(
-                                [
-                                    self.host_field,
-                                    self.username_field,
-                                    self.password_field,
-                                ],
-                                wrap=False,
+                            badge("SSH + Moshell", INFO, ft.Icons.TERMINAL),
+                            badge("ENM Browser Capture", ACCENT_WARM, ft.Icons.CAMERA_ALT),
+                            badge("Excel Output", SUCCESS, ft.Icons.GRID_ON),
+                        ],
+                        wrap=True,
+                        spacing=10,
+                    ),
+                    ft.Container(height=10),
+                    ft.Row(
+                        [
+                            self._metric_card("Bands Ready", self.band_count_text, INFO),
+                            self._metric_card("Categories", self.category_count_text, ACCENT),
+                        ],
+                        spacing=14,
+                        wrap=True,
+                    ),
+                    panel(
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Command profile",
+                                    size=12,
+                                    color=TEXT_MUTED,
+                                    weight=ft.FontWeight.W_600,
+                                ),
+                                self.commands_name_text,
+                                self.parse_info,
+                            ],
+                            spacing=8,
+                        ),
+                        bgcolor=PANEL_RAISED,
+                        padding=18,
+                        border_color="#3A5F7C",
+                    ),
+                ],
+                spacing=18,
+            ),
+            bgcolor=PANEL,
+            expand=True,
+            padding=28,
+        )
+
+        form = panel(
+            ft.Column(
+                [
+                    ft.Text("Run Configuration", size=26, weight=ft.FontWeight.BOLD, color=TEXT),
+                    ft.Text(
+                        "Set the site, access, and source file once, then launch the full TRFS flow from one place.",
+                        size=14,
+                        color=TEXT_MUTED,
+                    ),
+                    self._section_label("Site Identity"),
+                    ft.Row(
+                        [self.shortcode_field, self.node_name_field],
+                        spacing=14,
+                    ),
+                    self._section_label("Access"),
+                    ft.Row(
+                        [self.host_field, self.username_field, self.password_field],
+                        spacing=14,
+                    ),
+                    self._section_label("Command Source"),
+                    ft.Row(
+                        [self.commands_field, self.browse_button],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Text(
+                        "Enter the full path to your commands file, for example: C:\\dev\\TRFS\\TRFS commands.txt",
+                        size=11,
+                        color=TEXT_MUTED,
+                    ),
+                    self.error_box,
+                    ft.Container(height=8),
+                    ft.Row(
+                        [
+                            self.demo_switch,
+                            ft.Container(expand=True),
+                            ft.ElevatedButton(
+                                "Launch Run",
+                                icon=ft.Icons.PLAY_CIRCLE_FILL_ROUNDED,
+                                style=primary_button_style(),
+                                on_click=self._on_start,
                             ),
-                            ft.Row(
-                                [
-                                    self.commands_field,
-                                    ft.ElevatedButton(
-                                        "Browse",
-                                        icon=ft.Icons.FOLDER_OPEN,
-                                        on_click=self._browse_commands_file,
-                                    ),
-                                ],
-                            ),
-                            self.parse_info,
-                            ft.Divider(),
-                            ft.Row(
-                                [
-                                    self.demo_checkbox,
-                                    ft.Container(expand=True),
-                                    ft.ElevatedButton(
-                                        "Start",
-                                        icon=ft.Icons.PLAY_ARROW,
-                                        style=ft.ButtonStyle(
-                                            bgcolor=ft.Colors.GREEN_700,
-                                            color=ft.Colors.WHITE,
-                                        ),
-                                        on_click=self._on_start,
-                                    ),
-                                ],
-                            ),
-                            self.error_text,
                         ],
                         spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    padding=30,
-                ),
-            ],
-            scroll=ft.ScrollMode.AUTO,
+                ],
+                spacing=16,
+            ),
+            bgcolor="#0F2132",
+            padding=28,
+            expand=True,
         )
 
-    async def _browse_commands_file(self, e):
-        result = await self.file_picker.pick_files(
-            dialog_title="Select Commands File",
-            file_type=ft.FilePickerFileType.ANY,
+        body = ft.Container(
+            expand=True,
+            gradient=background_gradient(),
+            padding=ft.Padding.symmetric(horizontal=28, vertical=26),
+            content=ft.Row(
+                [hero, form],
+                spacing=20,
+                alignment=ft.MainAxisAlignment.START,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
         )
-        if result and len(result) > 0:
-            self.commands_field.value = result[0].path
-            self._validate_commands()
+
+        return ft.View(route="/form", padding=0, spacing=0, bgcolor=BG_TOP, controls=[body], services=[self.file_picker])
+
+    def _text_field(self, label: str, value: str, expand=None, width=None, **kwargs) -> ft.TextField:
+        return ft.TextField(
+            label=label,
+            value=value,
+            width=width,
+            expand=expand,
+            dense=False,
+            border_radius=16,
+            filled=True,
+            bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+            border_color=BORDER,
+            focused_border_color=ACCENT,
+            label_style=ft.TextStyle(color=TEXT_MUTED),
+            text_style=ft.TextStyle(color=TEXT, size=14),
+            cursor_color=ACCENT,
+            **kwargs,
+        )
+
+    def _metric_card(self, label: str, value_text: ft.Text, accent: str) -> ft.Container:
+        return ft.Container(
+            width=190,
+            padding=18,
+            bgcolor=ft.Colors.with_opacity(0.18, accent),
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.3, accent)),
+            border_radius=20,
+            content=ft.Column(
+                [
+                    ft.Text(label, size=12, color=TEXT_MUTED, weight=ft.FontWeight.W_600),
+                    value_text,
+                ],
+                spacing=8,
+            ),
+        )
+
+    def _section_label(self, text: str) -> ft.Text:
+        return ft.Text(
+            text.upper(),
+            size=11,
+            color=ACCENT_WARM,
+            weight=ft.FontWeight.BOLD,
+        )
+
+    async def _on_browse(self, e):
+        files = await self.file_picker.pick_files(
+            dialog_title="Select Commands File",
+            allowed_extensions=["txt"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allow_multiple=False,
+        )
+        if files:
+            self.commands_field.value = files[0].path
             self.page.update()
+            self._validate_commands()
 
     def _validate_commands(self):
         path = self.commands_field.value.strip()
         if not path or not os.path.isfile(path):
             self.parse_info.visible = False
+            self.commands_name_text.value = "No command map loaded"
+            self.band_count_text.value = "0"
+            self.category_count_text.value = "0"
+            try:
+                self.page.update()
+            except Exception:
+                pass
             return
         try:
             all_cmds = parse_commands_file(path)
             band_names = list(all_cmds.keys())
-            total = sum(len(cats) for cats in all_cmds.values())
-            self.parse_info.value = (
-                f"Found {len(band_names)} bands: {', '.join(band_names)} ({total} categories total)"
-            )
+            total_categories = sum(len(cats) for cats in all_cmds.values())
+            self.parse_info.value = f"Loaded {len(band_names)} bands: {', '.join(band_names)}"
+            self.parse_info.color = SUCCESS
             self.parse_info.visible = True
-            self.parse_info.color = ft.Colors.GREEN_400
+            self.commands_name_text.value = os.path.basename(path)
+            self.band_count_text.value = str(len(band_names))
+            self.category_count_text.value = str(total_categories)
         except Exception as ex:
-            self.parse_info.value = f"Error parsing: {ex}"
+            self.parse_info.value = f"Parser error: {ex}"
+            self.parse_info.color = "#FFB4B4"
             self.parse_info.visible = True
-            self.parse_info.color = ft.Colors.RED_400
+            self.commands_name_text.value = os.path.basename(path)
+            self.band_count_text.value = "-"
+            self.category_count_text.value = "-"
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     def _on_start(self, e):
         shortcode = self.shortcode_field.value.strip()
@@ -183,31 +349,33 @@ class FormPage:
         username = self.username_field.value.strip()
         password = self.password_field.value.strip()
         commands_file = self.commands_field.value.strip()
-        demo_mode = self.demo_checkbox.value
+        demo_mode = self.demo_switch.value
 
         errors = []
         if not shortcode:
-            errors.append("Shortcode is required")
+            errors.append("Shortcode is required.")
         if not node_name:
-            errors.append("Node Name is required")
+            errors.append("Node name is required.")
         if not host and not demo_mode:
-            errors.append("SSH Host is required")
+            errors.append("SSH host is required unless demo mode is enabled.")
         if not username and not demo_mode:
-            errors.append("Username is required")
+            errors.append("Username is required unless demo mode is enabled.")
         if not password and not demo_mode:
-            errors.append("Password is required")
+            errors.append("Password is required unless demo mode is enabled.")
         if not commands_file:
-            errors.append("Commands File is required")
+            errors.append("Commands file is required.")
         elif not os.path.isfile(commands_file):
             errors.append(f"Commands file not found: {commands_file}")
 
         if errors:
-            self.error_text.value = "\n".join(errors)
+            self.error_text.value = " ".join(errors)
             self.error_text.visible = True
+            self.error_box.visible = True
             self.page.update()
             return
 
         self.error_text.visible = False
+        self.error_box.visible = False
 
         config = build_config_from_form(
             shortcode=shortcode,

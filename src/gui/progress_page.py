@@ -1,10 +1,11 @@
 """
-TRFS GUI - Progress Page with live log viewer and band status indicators.
+TRFS GUI - Live run monitor.
 """
 import asyncio
-import os
-import sys
 import logging
+import os
+import re
+import sys
 import threading
 from datetime import datetime
 
@@ -12,10 +13,24 @@ import flet as ft
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from config_loader import get_full_path
 from command_parser import parse_commands_file
 from main import process_band, process_band_demo
 from ssh_runner import MoshellSession
+from gui.theme import (
+    ACCENT,
+    BG_BOTTOM,
+    DANGER,
+    INFO,
+    PANEL,
+    PANEL_RAISED,
+    SUCCESS,
+    TEXT,
+    TEXT_MUTED,
+    background_gradient,
+    badge,
+    panel,
+    secondary_button_style,
+)
 
 
 class FletLogHandler(logging.Handler):
@@ -24,132 +39,342 @@ class FletLogHandler(logging.Handler):
         self.log_callback = log_callback
 
     def emit(self, record):
-        msg = self.format(record)
-        self.log_callback(msg)
+        self.log_callback(self.format(record))
 
 
 class ProgressPage:
     def __init__(self, page: ft.Page):
         self.page = page
         self.cancelled = False
-        self.log_lines = []
-        self.band_status = {}
         self._log_handler = None
 
     def build(self) -> ft.View:
-        config = getattr(self.page, 'trfs_config', None)
-        demo_mode = getattr(self.page, 'trfs_demo_mode', False)
-        commands_file = getattr(self.page, 'trfs_commands_file', '')
-
+        config = getattr(self.page, "trfs_config", None)
+        demo_mode = getattr(self.page, "trfs_demo_mode", False)
+        commands_file = getattr(self.page, "trfs_commands_file", "")
         all_commands = parse_commands_file(commands_file)
         band_names = list(all_commands.keys())
 
-        self.band_indicators = {}
-        for band in band_names:
-            indicator = ft.Container(
-                content=ft.Text(band, size=11, weight=ft.FontWeight.BOLD),
-                bgcolor=ft.Colors.GREY_800,
-                border=ft.border.all(1, ft.Colors.GREY_600),
-                border_radius=6,
-                padding=ft.padding.symmetric(horizontal=10, vertical=6),
-                alignment=ft.Alignment(0, 0),
-            )
-            self.band_indicators[band] = indicator
-
-        self.log_list = ft.Column([], scroll=ft.ScrollMode.AUTO, expand=True)
-        self.status_text = ft.Text("Initializing...", size=13, italic=True)
-        self.elapsed_text = ft.Text("", size=12, color=ft.Colors.GREY_400)
         self.start_time = datetime.now()
-
-        band_row = ft.Row(
-            [self.band_indicators[b] for b in band_names],
-            wrap=True,
-            spacing=6,
+        self.status_text = ft.Text("Preparing automation context", size=28, weight=ft.FontWeight.BOLD, color=TEXT)
+        self.mode_text = ft.Text(
+            "Demo mode enabled" if demo_mode else f"Connecting to {config.ssh.host}:{config.ssh.port}",
+            size=13,
+            color=TEXT_MUTED,
         )
+        self.elapsed_text = ft.Text("Elapsed 00:00:00", size=12, color=TEXT_MUTED)
+        self.log_list = ft.ListView(expand=True, spacing=8, auto_scroll=True)
 
-        self._start_run(config, demo_mode, commands_file, all_commands)
+        # Count categories per band for progress tracking
+        from command_parser import get_moshell_categories
+        moshell_categories = get_moshell_categories()
+        self.band_total_steps = {}
+        for band in band_names:
+            cats = all_commands.get(band, {})
+            # Count moshell categories that have commands + 2 (excel create + excel insert)
+            steps = sum(1 for c in moshell_categories if cats.get(c)) + 2
+            # Add ENM categories
+            steps += sum(1 for k in cats if k.endswith("_ENM"))
+            self.band_total_steps[band] = max(steps, 1)
+        self.band_current_step = {band: 0 for band in band_names}
 
-        return ft.View(
-            route="/progress",
-            appbar=ft.AppBar(
-                title=ft.Text("TRFS - Running", size=18, weight=ft.FontWeight.BOLD),
-                bgcolor=ft.Colors.BLUE_900,
-                automatically_imply_leading=False,
-            ),
-            controls=[
-                ft.Container(
-                    content=ft.Column(
+        self.band_cards = {}
+        band_grid_controls = []
+        for band in band_names:
+            label = ft.Text(band, size=14, weight=ft.FontWeight.BOLD, color=TEXT)
+            pct_text = ft.Text("0%", size=11, color=TEXT_MUTED)
+            state = ft.Text("Queued", size=11, color=TEXT_MUTED)
+            progress_bar = ft.ProgressBar(
+                value=0,
+                bgcolor=ft.Colors.with_opacity(0.15, "#36556E"),
+                color=INFO,
+                bar_height=4,
+                border_radius=2,
+            )
+            chip = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [label, ft.Row([pct_text, state], spacing=6)],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        progress_bar,
+                    ],
+                    spacing=6,
+                ),
+                padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+                bgcolor=PANEL_RAISED,
+                border=ft.Border.all(1, ft.Colors.with_opacity(0.5, "#36556E")),
+                border_radius=12,
+            )
+            self.band_cards[band] = {
+                "container": chip,
+                "state": state,
+                "pct_text": pct_text,
+                "progress_bar": progress_bar,
+            }
+            band_grid_controls.append(chip)
+
+        # Collapsible band radar body
+        self.band_body = ft.Row(band_grid_controls, wrap=True, spacing=8, run_spacing=8)
+        self.band_chevron = ft.Icon(ft.Icons.EXPAND_LESS, color=TEXT_MUTED, size=20)
+
+        def toggle_band_radar(_):
+            self.band_body.visible = not self.band_body.visible
+            self.band_chevron.icon = ft.Icons.EXPAND_MORE if not self.band_body.visible else ft.Icons.EXPAND_LESS
+            self.page.update()
+
+        # Collapsible log body
+        self.log_body = ft.Container(
+            expand=True,
+            padding=18,
+            bgcolor=ft.Colors.with_opacity(0.45, BG_BOTTOM),
+            border_radius=20,
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.45, "#314D64")),
+            content=self.log_list,
+        )
+        self.log_chevron = ft.Icon(ft.Icons.EXPAND_LESS, color=TEXT_MUTED, size=20)
+
+        def toggle_log(_):
+            self.log_body.visible = not self.log_body.visible
+            self.log_chevron.icon = ft.Icons.EXPAND_MORE if not self.log_body.visible else ft.Icons.EXPAND_LESS
+            self.page.update()
+
+        hero = panel(
+            ft.Row(
+                [
+                    ft.Column(
                         [
-                            ft.Text("Band Progress", size=14, weight=ft.FontWeight.W_600),
-                            band_row,
-                            ft.Divider(),
+                            ft.Row(
+                                [
+                                    badge("Live Run", ACCENT, ft.Icons.TIMER),
+                                    badge("SSH" if not demo_mode else "Simulation", INFO, ft.Icons.HUB),
+                                ],
+                                spacing=10,
+                            ),
                             self.status_text,
+                            self.mode_text,
                             self.elapsed_text,
-                            ft.Divider(),
-                            ft.Text("Log Output", size=13, weight=ft.FontWeight.W_500),
-                            self.log_list,
                         ],
                         spacing=8,
                         expand=True,
                     ),
-                    padding=20,
+                    ft.Row(
+                        [
+                            self._metric_box("Bands", str(len(band_names)), INFO),
+                            self._metric_box("Mode", "DEMO" if demo_mode else "LIVE", ACCENT),
+                            self._metric_box("Session", "Active", SUCCESS),
+                        ],
+                        spacing=10,
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor=PANEL,
+            padding=20,
+        )
+
+        progress_panel = panel(
+            ft.Column(
+                [
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Text("Band radar", size=14, weight=ft.FontWeight.BOLD, color=TEXT),
+                                self.band_chevron,
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        on_click=toggle_band_radar,
+                        ink=True,
+                    ),
+                    self.band_body,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#11273A",
+            padding=16,
+        )
+
+        log_panel = panel(
+            ft.Column(
+                [
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text("Run stream", size=18, weight=ft.FontWeight.BOLD, color=TEXT),
+                                        ft.Text(
+                                            "Operational logs, warnings, and completion events appear here in real time.",
+                                            size=12,
+                                            color=TEXT_MUTED,
+                                        ),
+                                    ],
+                                    spacing=4,
+                                    expand=True,
+                                ),
+                                ft.Row(
+                                    [
+                                        self.log_chevron,
+                                        ft.ElevatedButton(
+                                            "Back",
+                                            icon=ft.Icons.ARROW_BACK,
+                                            disabled=True,
+                                            style=secondary_button_style(),
+                                        ),
+                                    ],
+                                    spacing=8,
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        on_click=toggle_log,
+                        ink=True,
+                    ),
+                    self.log_body,
+                ],
+                spacing=16,
+                expand=True,
+            ),
+            bgcolor="#0E1F2F",
+            padding=24,
+            expand=True,
+        )
+
+        self._start_run(config, demo_mode, all_commands)
+
+        return ft.View(
+            route="/progress",
+            padding=0,
+            spacing=0,
+            controls=[
+                ft.Container(
                     expand=True,
-                ),
+                    gradient=background_gradient(),
+                    padding=ft.Padding.symmetric(horizontal=28, vertical=24),
+                    content=ft.Column(
+                        [
+                            hero,
+                            progress_panel,
+                            log_panel,
+                        ],
+                        spacing=18,
+                        expand=True,
+                    ),
+                )
             ],
-            scroll=ft.ScrollMode.AUTO,
+        )
+
+    def _metric_box(self, label: str, value: str, color: str) -> ft.Container:
+        return ft.Container(
+            width=120,
+            padding=12,
+            bgcolor=ft.Colors.with_opacity(0.14, color),
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.28, color)),
+            border_radius=14,
+            content=ft.Column(
+                [
+                    ft.Text(label, size=10, color=TEXT_MUTED, weight=ft.FontWeight.W_600),
+                    ft.Text(value, size=16, color=TEXT, weight=ft.FontWeight.BOLD),
+                ],
+                spacing=4,
+            ),
         )
 
     def _log_message(self, msg: str):
-        self.log_lines.append(msg)
+        # Track per-band progress from log messages like "  [L900] VSWR: Running..."
+        for m in re.finditer(r"\[(\w+)\]", msg):
+            band_candidate = m.group(1)
+            if band_candidate in self.band_cards:
+                self._update_band_progress(band_candidate)
+                break
 
-        color = ft.Colors.GREY_300
-        prefix = ""
+        color = TEXT_MUTED
         if "[WARNING]" in msg:
-            color = ft.Colors.YELLOW_300
-        elif "[ERROR]" in msg:
-            color = ft.Colors.RED_400
+            color = "#FFD27A"
+        elif "[ERROR]" in msg or "FATAL ERROR" in msg:
+            color = "#FF9D9D"
         elif "[INFO]" in msg:
-            prefix = "● "
-            color = ft.Colors.BLUE_200
-        elif "Completed" in msg or "OK" in msg:
-            color = ft.Colors.GREEN_300
+            color = INFO
+        elif "Completed" in msg or "[OK]" in msg:
+            color = SUCCESS
 
         self.log_list.controls.append(
-            ft.Text(f"{prefix}{msg}", size=11, color=color, selectable=True)
+            ft.Text(msg, size=12, color=color, selectable=True, font_family="Consolas")
         )
-
-        if len(self.log_list.controls) > 500:
-            self.log_list.controls = self.log_list.controls[-500:]
-
+        if len(self.log_list.controls) > 600:
+            self.log_list.controls = self.log_list.controls[-600:]
         try:
             self.page.update()
+        except Exception:
+            pass
+
+    def _update_band_progress(self, band: str):
+        """Increment band progress by one step and update the bar."""
+        card = self.band_cards.get(band)
+        if not card:
+            return
+        self.band_current_step[band] = min(
+            self.band_current_step[band] + 1, self.band_total_steps[band]
+        )
+        pct = self.band_current_step[band] / self.band_total_steps[band]
+        card["pct_text"].value = f"{int(pct * 100)}%"
+        card["progress_bar"].value = pct
+        try:
+            card["progress_bar"].update()
+            card["pct_text"].update()
         except Exception:
             pass
 
     def _update_band_status(self, band: str, status: str):
-        indicator = self.band_indicators.get(band)
-        if not indicator:
+        card = self.band_cards.get(band)
+        if not card:
             return
+
+        container: ft.Container = card["container"]
+        state_text: ft.Text = card["state"]
+        pct_text: ft.Text = card["pct_text"]
+        progress_bar: ft.ProgressBar = card["progress_bar"]
+
         if status == "running":
-            indicator.bgcolor = ft.Colors.BLUE_700
-            indicator.border = ft.border.all(1, ft.Colors.BLUE_300)
+            container.bgcolor = ft.Colors.with_opacity(0.16, INFO)
+            container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, INFO))
+            state_text.value = "Running"
+            state_text.color = INFO
+            pct_text.color = INFO
+            pct_text.value = "0%"
+            progress_bar.color = INFO
+            progress_bar.value = 0
         elif status == "done":
-            indicator.bgcolor = ft.Colors.GREEN_700
-            indicator.border = ft.border.all(1, ft.Colors.GREEN_300)
+            container.bgcolor = ft.Colors.with_opacity(0.16, SUCCESS)
+            container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, SUCCESS))
+            state_text.value = "Complete"
+            state_text.color = SUCCESS
+            pct_text.value = "100%"
+            pct_text.color = SUCCESS
+            progress_bar.color = SUCCESS
+            progress_bar.value = 1.0
         elif status == "error":
-            indicator.bgcolor = ft.Colors.RED_700
-            indicator.border = ft.border.all(1, ft.Colors.RED_300)
+            container.bgcolor = ft.Colors.with_opacity(0.16, DANGER)
+            container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, DANGER))
+            state_text.value = "Failed"
+            state_text.color = DANGER
+            pct_text.color = DANGER
+            progress_bar.color = DANGER
+
         try:
-            self.page.update()
+            container.update()
         except Exception:
             pass
 
-    def _start_run(self, config, demo_mode, commands_file, all_commands):
-        log_handler = FletLogHandler(self._log_message)
-        log_handler.setLevel(logging.INFO)
-        log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-        logging.getLogger().addHandler(log_handler)
-        self._log_handler = log_handler
+    def _start_run(self, config, demo_mode, all_commands):
+        handler = FletLogHandler(self._log_message)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+        self._log_handler = handler
 
         thread = threading.Thread(
             target=self._run_worker,
@@ -157,82 +382,80 @@ class ProgressPage:
             daemon=True,
         )
         thread.start()
-
         self.page.trfs_run_thread = thread
 
     def _run_worker(self, config, demo_mode, all_commands):
         generated_files = []
-        self.status_text.value = "Running..."
-
         try:
             if demo_mode:
-                self._log_message("Starting in DEMO mode (no SSH connection)")
+                self._log_message("Starting desktop run in DEMO mode.")
                 self._run_demo(config, all_commands, generated_files)
             else:
-                self._log_message(f"Connecting to {config.ssh.host}:{config.ssh.port}...")
+                self._log_message(f"Opening SSH session to {config.ssh.host}:{config.ssh.port}.")
                 self._run_live(config, all_commands, generated_files)
-        except Exception as e:
-            self._log_message(f"FATAL ERROR: {e}")
-            logging.getLogger(__name__).error(f"Fatal error: {e}", exc_info=True)
+        except Exception as exc:
+            self._log_message(f"FATAL ERROR: {exc}")
+            logging.getLogger(__name__).error("Fatal error", exc_info=True)
 
         self.page.trfs_generated_files = generated_files
         duration = datetime.now() - self.start_time
-        self.status_text.value = f"Complete! ({duration})"
+        self.status_text.value = "Automation complete"
+        self.mode_text.value = f"Run finished in {duration}."
         self.elapsed_text.value = ""
 
         if self._log_handler:
             logging.getLogger().removeHandler(self._log_handler)
 
         try:
+            self.page.update()
             asyncio.create_task(self.page.push_route("/result"))
         except Exception:
             pass
 
     def _run_demo(self, config, all_commands, generated_files):
-        for i, (band, categories) in enumerate(all_commands.items()):
+        for idx, (band, categories) in enumerate(all_commands.items()):
             if self.cancelled:
                 break
             self._update_band_status(band, "running")
-            self.status_text.value = f"Processing band: {band} (DEMO)"
-            remaining = len(all_commands) - i - 1
-            self.elapsed_text.value = f"Elapsed: {datetime.now() - self.start_time} | Remaining bands: {remaining}"
+            self.status_text.value = f"Simulating {band}"
+            self.mode_text.value = "Generating sample screenshots and Excel output."
+            self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
             try:
                 self.page.update()
             except Exception:
                 pass
             try:
-                excel_path = process_band_demo(config, band, categories, is_first_band=(i == 0))
+                excel_path = process_band_demo(config, band, categories, is_first_band=(idx == 0))
                 generated_files.append(excel_path)
                 self._update_band_status(band, "done")
-            except Exception as e:
-                self._log_message(f"Error processing band {band}: {e}")
+            except Exception as exc:
+                self._log_message(f"Error processing band {band}: {exc}")
                 self._update_band_status(band, "error")
 
     def _run_live(self, config, all_commands, generated_files):
         try:
             with MoshellSession(config) as session:
-                self._log_message("SSH connection established. Loading MO tree...")
-                for i, (band, categories) in enumerate(all_commands.items()):
+                self._log_message("SSH connection established.")
+                for idx, (band, categories) in enumerate(all_commands.items()):
                     if self.cancelled:
                         break
                     self._update_band_status(band, "running")
-                    self.status_text.value = f"Processing band: {band}"
-                    remaining = len(all_commands) - i - 1
-                    self.elapsed_text.value = f"Elapsed: {datetime.now() - self.start_time} | Remaining bands: {remaining}"
+                    self.status_text.value = f"Processing {band}"
+                    self.mode_text.value = "Running moshell commands, ENM captures, and Excel updates."
+                    self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
                     try:
                         self.page.update()
                     except Exception:
                         pass
                     try:
-                        from main import process_band
-                        excel_path = process_band(session, config, band, categories, is_first_band=(i == 0))
+                        excel_path = process_band(session, config, band, categories, is_first_band=(idx == 0))
                         generated_files.append(excel_path)
                         self._update_band_status(band, "done")
-                    except Exception as e:
-                        self._log_message(f"Error processing band {band}: {e}")
+                    except Exception as exc:
+                        self._log_message(f"Error processing band {band}: {exc}")
                         self._update_band_status(band, "error")
-        except Exception as e:
-            self._log_message(f"Connection error: {e}")
-            for band in all_commands:
-                if self.band_indicators.get(band, {}).bgcolor != ft.Colors.GREEN_700:
+        except Exception as exc:
+            self._log_message(f"Connection error: {exc}")
+            for band, card in self.band_cards.items():
+                if card["state"].value != "Complete":
                     self._update_band_status(band, "error")
