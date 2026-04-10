@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.xlsx
+output/
+screenshots/
+trfs_automation.log
+*.spec
+dist/
+build/
+config.yaml

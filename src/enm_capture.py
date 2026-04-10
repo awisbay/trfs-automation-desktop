@@ -1,0 +1,1027 @@
+"""
+ENM GUI screenshot capture.
+
+For items marked with (ENM ...) in the commands file, this module handles
+capturing screenshots either semi-automatically by browser automation or by
+picking up manually saved screenshots from a folder.
+"""
+import os
+import time
+import logging
+import re
+from typing import Optional
+
+from config_loader import AppConfig
+
+logger = logging.getLogger(__name__)
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logger.info("playwright not available - ENM browser capture will be manual only")
+
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    PYAUTOGUI_AVAILABLE = False
+    logger.info("pyautogui not available - screen capture will be manual only")
+
+
+def _find_visible_locator(page, selectors):
+    """Return the first visible locator matching any selector in order."""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                try:
+                    if candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _click_any(page, selectors, timeout_ms: int):
+    """Click the first matching selector from a candidate list."""
+    last_error = None
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                if candidate.is_visible():
+                    candidate.click(timeout=timeout_ms)
+                    return selector
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Could not click any selector from: {selectors}") from last_error
+
+
+def _fill_any(page, selectors, value: str, timeout_ms: int):
+    """Fill the first matching input from a candidate list."""
+    last_error = None
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                if candidate.is_visible():
+                    candidate.fill(value, timeout=timeout_ms)
+                    return selector
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Could not fill any selector from: {selectors}") from last_error
+
+
+def _click_text_in_locator(locator, timeout_ms: int):
+    """Click the first visible item within a locator collection."""
+    count = locator.count()
+    for idx in range(count):
+        candidate = locator.nth(idx)
+        try:
+            if candidate.is_visible():
+                candidate.click(timeout=timeout_ms)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _maybe_login(page, config: AppConfig) -> bool:
+    """
+    Try to sign in if a login form is present.
+
+    Returns True if a login flow was attempted.
+    """
+    timeout_ms = config.enm.timeout_ms if config.enm else 30000
+
+    # Some ENM builds show a legal notice that must be acknowledged first.
+    notice_ok = _find_visible_locator(
+        page,
+        [
+            'button#loginNoticeOk',
+            'button:has-text("OK")',
+        ],
+    )
+    if notice_ok is not None:
+        try:
+            notice_ok.click(timeout=timeout_ms)
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+    password_field = _find_visible_locator(
+        page,
+        [
+            '#loginPassword',
+            'input[type="password"]',
+            'input[name*="pass" i]',
+            'input[id*="pass" i]',
+            'input[placeholder*="pass" i]',
+        ],
+    )
+    if password_field is None:
+        return False
+
+    username_field = _find_visible_locator(
+        page,
+        [
+            '#loginUsername',
+            'input[type="email"]',
+            'input[name*="user" i]',
+            'input[id*="user" i]',
+            'input[placeholder*="user" i]',
+            'input[type="text"]',
+        ],
+    )
+    if username_field is None:
+        return False
+
+    username_field.fill(config.ssh.username, timeout=timeout_ms)
+    password_field.fill(config.ssh.password, timeout=timeout_ms)
+
+    try:
+        _click_any(
+            page,
+            [
+                'button#submit',
+                'button:has-text("Login")',
+                'button:has-text("Sign in")',
+                'button:has-text("Sign In")',
+                '[role="button"]:has-text("Login")',
+                '[role="button"]:has-text("Sign in")',
+                'input[type="submit"]',
+            ],
+            timeout_ms,
+        )
+    except Exception:
+        password_field.press("Enter")
+
+    page.wait_for_timeout(1500)
+    return True
+
+
+def _open_search_tab(page, timeout_ms: int) -> None:
+    """Open the Network Search tab in the left panel."""
+    page.wait_for_timeout(2000)
+    tab = _find_visible_locator(
+        page,
+        [
+            'div.ebTabs-tabItem:has-text("Search")',
+            'span.ebTabs-tabItem:has-text("Search")',
+            'text="Search"',
+        ],
+    )
+    if tab is None:
+        raise RuntimeError("Could not find the Search tab in the ENM Network panel.")
+    tab.click(timeout=timeout_ms)
+    page.wait_for_timeout(2000)
+
+
+def _open_cell_management_app(page, timeout_ms: int) -> None:
+    """Open the Cell Management app from the launcher after login."""
+    try:
+        page.get_by_role("link", name="Ericsson Network Manager").click(timeout=timeout_ms)
+        page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+    try:
+        page.get_by_text("Cell Management", exact=True).click(timeout=timeout_ms)
+    except Exception:
+        # If we are already in Cell Management, continue.
+        pass
+
+    page.wait_for_timeout(8000)
+
+
+def _open_alarm_viewer_app(page, config: AppConfig, timeout_ms: int) -> None:
+    """Open the Alarm Viewer app and wait for it to fully load.
+
+    The URL may gain dynamic query params (e.g. ?workspaceId=...) after
+    navigation — that is expected and must not be treated as an error.
+
+    After login, ENM redirects to #launcher/groups — so we navigate to
+    the alarm_url a second time to land on the correct page.
+    """
+    try:
+        page.goto(config.enm.alarm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        pass
+
+    page.wait_for_timeout(3000)
+
+    logged_in = _maybe_login(page, config)
+
+    if logged_in:
+        # ENM redirects to #launcher/groups after login — navigate back to alarm URL
+        logger.info("Login detected, re-navigating to alarm URL after auth redirect...")
+        page.wait_for_timeout(2000)
+        try:
+            page.goto(config.enm.alarm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+
+    # Wait for alarm viewer to fully load (URL may get ?workspaceId=... appended — that's fine)
+    page.wait_for_timeout(5000)
+    logger.info(f"Alarm Viewer URL after load: {page.url}")
+
+
+def _open_shm_software_administration(page, config: AppConfig, timeout_ms: int) -> None:
+    """Open the SHM Software Administration workspace."""
+    try:
+        page.goto(config.enm.shm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        pass
+
+    page.wait_for_timeout(4000)
+    logged_in = _maybe_login(page, config)
+    if logged_in:
+        # ENM redirects to #launcher/groups after login — navigate back to SHM URL
+        logger.info("Login detected, re-navigating to SHM URL after auth redirect...")
+        page.wait_for_timeout(2000)
+        try:
+            page.goto(config.enm.shm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        page.wait_for_timeout(4000)
+    try:
+        page.get_by_role("link", name="Software and Hardware Manager").click(timeout=timeout_ms)
+        page.wait_for_timeout(4000)
+    except Exception:
+        try:
+            page.get_by_text("Software and Hardware Manager", exact=False).click(timeout=timeout_ms)
+            page.wait_for_timeout(4000)
+        except Exception:
+            pass
+    try:
+        page.get_by_role("link", name="Software Administration").click(timeout=timeout_ms)
+        page.wait_for_timeout(4000)
+    except Exception:
+        try:
+            page.get_by_text("Software Administration", exact=False).click(timeout=timeout_ms)
+            page.wait_for_timeout(4000)
+        except Exception:
+            pass
+
+
+def _is_site_already_in_network_panel(page, site_name: str) -> bool:
+    """Check if the site node is already visible in the left Network panel.
+
+    ENM remembers topology per user workspace on the server side, so a
+    previously added site may still be present even in a fresh browser.
+    """
+    try:
+        # Look for the site name anywhere in the left Network panel area
+        locator = page.locator(f'text="{site_name}"')
+        if locator.count() > 0:
+            for idx in range(locator.count()):
+                try:
+                    if locator.nth(idx).is_visible():
+                        return True
+                except Exception:
+                    continue
+        # Also try partial match (ENM may truncate long node names)
+        short_name = site_name[:20]
+        partial = page.locator(f'text=/{re.escape(short_name)}/')
+        if partial.count() > 0:
+            for idx in range(partial.count()):
+                try:
+                    if partial.nth(idx).is_visible():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _open_add_topology_data(page, timeout_ms: int) -> None:
+    """Open the Add Topology Data panel/button."""
+    button = _find_visible_locator(
+        page,
+        [
+            'button:has-text("Add Topology Data")',
+            'span.ebBtn-caption:has-text("Add Topology Data")',
+            'text="Add Topology Data"',
+        ],
+    )
+    if button is None:
+        raise RuntimeError("Could not find the Add Topology Data button.")
+    button.evaluate("(el) => el.click()")
+    page.wait_for_timeout(2000)
+
+
+def _add_topology_for_site(page, site_name: str, timeout_ms: int) -> None:
+    """Search topology by site name in the Add Network Objects sidebar,
+    tick the checkbox, click Add, then close the sidebar."""
+
+    # Click the "Search" tab inside the Add Network Objects sidebar
+    tab = _find_visible_locator(
+        page,
+        [
+            'div.ebTabs-tabItem:has-text("Search")',
+            'span.ebTabs-tabItem:has-text("Search")',
+        ],
+    )
+    if tab is not None:
+        tab.click(timeout=timeout_ms)
+        page.wait_for_timeout(1500)
+
+    search_box = _find_visible_locator(
+        page,
+        [
+            'input.elNetworkExplorerLib-wSimpleSearchInput-searchInput',
+            'input[placeholder="Enter Search Criteria"]',
+            'input[name="criteria"]',
+        ],
+    )
+    if search_box is None:
+        raise RuntimeError("Could not find the topology search input for Alarm Viewer.")
+
+    search_box.fill(site_name, timeout=timeout_ms)
+    try:
+        search_box.press("Enter")
+    except Exception:
+        pass
+
+    page.wait_for_timeout(1000)
+
+    search_button = _find_visible_locator(
+        page,
+        [
+            'button.elNetworkExplorerLib-rSimpleSearch-form-searchBtn',
+            'button[type="submit"]',
+            'button:has-text("Search")',
+        ],
+    )
+    if search_button is not None:
+        try:
+            search_button.click(timeout=timeout_ms)
+        except Exception:
+            pass
+
+    page.wait_for_timeout(2500)
+
+    # Tick the checkbox next to the search result
+    checkbox = _find_visible_locator(
+        page,
+        [
+            'input.ebCheckbox',
+            'input[type="checkbox"]',
+        ],
+    )
+    if checkbox is None:
+        raise RuntimeError("Could not find a topology checkbox to select.")
+
+    checkbox.click(timeout=timeout_ms)
+    page.wait_for_timeout(1000)
+
+    # Click the "Add" button at the bottom of the sidebar.
+    # Must use exact text match — "Add Topology Data" also contains "Add".
+    # Target: <span class="ebBtn-caption">Add</span>
+    add_button = page.locator('span.ebBtn-caption', has_text="Add").filter(has_text=re.compile(r'^Add$'))
+    clicked = False
+    try:
+        count = add_button.count()
+        for idx in range(count):
+            candidate = add_button.nth(idx)
+            if candidate.is_visible():
+                candidate.click(timeout=timeout_ms)
+                clicked = True
+                logger.info("Clicked the Add button in sidebar")
+                break
+    except Exception:
+        pass
+
+    if not clicked:
+        # Fallback: find by JS — look for span.ebBtn-caption with exact "Add" text
+        try:
+            page.evaluate("""() => {
+                const spans = document.querySelectorAll('span.ebBtn-caption');
+                for (const s of spans) {
+                    if (s.textContent.trim() === 'Add') {
+                        s.closest('button') ? s.closest('button').click() : s.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            clicked = True
+            logger.info("Clicked the Add button via JS fallback")
+        except Exception:
+            pass
+
+    if not clicked:
+        raise RuntimeError("Could not find or click the Add button in sidebar.")
+
+    page.wait_for_timeout(3000)
+
+    # Close the "Add Network Objects" sidebar by clicking X or Cancel
+    _close_add_network_objects_sidebar(page, timeout_ms)
+
+
+def _close_add_network_objects_sidebar(page, timeout_ms: int) -> None:
+    """Close the Add Network Objects sidebar after adding topology."""
+    # Try the X close button first (top-right of the sidebar)
+    close_btn = _find_visible_locator(
+        page,
+        [
+            'button.ebDialogBox-actionBlock-close',
+            'button.ebDialog-close',
+            'button[title="Close"]',
+            'span.ebIcon_close',
+        ],
+    )
+    if close_btn is not None:
+        try:
+            close_btn.click(timeout=timeout_ms)
+            page.wait_for_timeout(1000)
+            logger.info("Closed Add Network Objects sidebar via X button")
+            return
+        except Exception:
+            pass
+
+    # Try Cancel button
+    cancel_btn = _find_visible_locator(
+        page,
+        [
+            'button:has-text("Cancel")',
+            'span.ebBtn-caption:has-text("Cancel")',
+        ],
+    )
+    if cancel_btn is not None:
+        try:
+            cancel_btn.click(timeout=timeout_ms)
+            page.wait_for_timeout(1000)
+            logger.info("Closed Add Network Objects sidebar via Cancel button")
+            return
+        except Exception:
+            pass
+
+    # Fallback: try clicking the X icon shown in the screenshot (small box with X)
+    try:
+        page.evaluate("""() => {
+            // Look for close buttons near "Add Network Objects" text
+            const allButtons = document.querySelectorAll('button, [role="button"], .ebIcon_close, .ebDialogBox-closeIcon');
+            for (const btn of allButtons) {
+                const rect = btn.getBoundingClientRect();
+                // The X button is in the top-right area of the sidebar
+                if (rect.x > 1100 && rect.y < 100 && rect.width < 40) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        page.wait_for_timeout(1000)
+        logger.info("Closed Add Network Objects sidebar via fallback JS click")
+    except Exception:
+        logger.warning("Could not close the Add Network Objects sidebar")
+
+
+def capture_shm_software_administration_screenshot(
+    config: AppConfig,
+    save_path: str,
+) -> str:
+    """
+    Open the SHM Software Administration page, add topology, and capture a screenshot.
+    """
+    if not config.enm or not config.enm.enabled:
+        raise RuntimeError("ENM browser capture is not enabled in config.yaml.")
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "playwright is not installed. Install it with: pip install -r requirements.txt"
+        )
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    timeout_ms = config.enm.timeout_ms
+    viewport = {
+        "width": config.enm.viewport_width,
+        "height": config.enm.viewport_height,
+    }
+
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=config.enm.headless)
+            context = browser.new_context(
+                viewport=viewport,
+                ignore_https_errors=True,
+            )
+            page = context.new_page()
+            _open_shm_software_administration(page, config, timeout_ms)
+
+            if _is_site_already_in_network_panel(page, config.site.node_name):
+                logger.info(f"Site already present in SHM, skipping Add Topology")
+            else:
+                _open_add_topology_data(page, timeout_ms)
+                _add_topology_for_site(page, config.site.node_name, timeout_ms)
+
+            page.wait_for_timeout(3000)
+            page.screenshot(path=save_path, full_page=True)
+            logger.info(f"ENM SHM screenshot saved: {save_path}")
+            return save_path
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+
+def _search_site_and_open(page, site_name: str, timeout_ms: int) -> None:
+    """Search for the site and open the matching result row."""
+    search_box = _find_visible_locator(
+        page,
+        [
+            'input.elNetworkExplorerLib-wSimpleSearchInput-searchInput',
+            'input[placeholder="Enter Search Criteria"]',
+            'input[name="criteria"]',
+        ],
+    )
+    if search_box is None:
+        raise RuntimeError("Could not find the ENM simple search input.")
+
+    search_box.fill(site_name, timeout=timeout_ms)
+    try:
+        search_box.press("Enter")
+    except Exception:
+        pass
+
+    page.wait_for_timeout(1200)
+
+    search_button = _find_visible_locator(
+        page,
+        [
+            'button.elNetworkExplorerLib-rSimpleSearch-form-searchBtn',
+            'button[type="submit"]',
+        ],
+    )
+    if search_button is not None:
+        try:
+            search_button.click(timeout=timeout_ms)
+        except Exception:
+            pass
+
+    page.wait_for_timeout(2500)
+
+    _click_any(
+        page,
+        [
+            f'td:has-text("{site_name}")',
+            f'.ebTableCell:has-text("{site_name}")',
+            f'tr:has-text("{site_name}")',
+            f'text="{site_name}"',
+        ],
+        timeout_ms,
+    )
+    page.wait_for_timeout(1500)
+
+
+def _click_tab(page, tab_name: str, timeout_ms: int) -> None:
+    """Click a tab or tab-like control by visible text."""
+    _click_any(
+        page,
+        [
+            f'div.ebTabs-tabItem:has-text("{tab_name}")',
+            f'span.ebTabs-tabItem:has-text("{tab_name}")',
+            f'text="{tab_name}"',
+        ],
+        timeout_ms,
+    )
+
+
+def _adjust_multi_sliding_panel(page, target_left_px: int | None, timeout_ms: int) -> None:
+    """
+    Move the ENM multi-sliding panel splitter to a target left position.
+
+    The UI exposes a draggable resize handle. We first try to drag it into place,
+    then we fall back to a direct style adjustment if the drag is not enough.
+    """
+    if target_left_px is None:
+        return
+
+    handle = _find_visible_locator(
+        page,
+        [
+            'div.elLayouts-MultiSlidingPanels-resizeElement_left',
+        ],
+    )
+    if handle is None:
+        return
+
+    try:
+        handle.scroll_into_view_if_needed(timeout=timeout_ms)
+    except Exception:
+        pass
+
+    try:
+        current_left = handle.evaluate(
+            """(el) => {
+                const value = window.getComputedStyle(el).left || el.style.left || "";
+                const parsed = parseFloat(value);
+                return Number.isFinite(parsed) ? parsed : null;
+            }"""
+        )
+    except Exception:
+        current_left = None
+
+    try:
+        box = handle.bounding_box()
+    except Exception:
+        box = None
+
+    if box is not None:
+        start_x = box["x"] + box["width"] / 2
+        start_y = box["y"] + box["height"] / 2
+        if current_left is not None:
+            delta_x = target_left_px - current_left
+        else:
+            delta_x = -90
+
+        try:
+            page.mouse.move(start_x, start_y)
+            page.mouse.down()
+            page.mouse.move(start_x + delta_x, start_y, steps=10)
+            page.mouse.up()
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+    try:
+        handle.evaluate(
+            """(el, targetLeftPx) => {
+                const root = el.closest('.elLayouts-MultiSlidingPanels') || el.parentElement;
+                if (!root) {
+                    return false;
+                }
+
+                const leftPane = root.querySelector('.elLayouts-MultiSlidingPanels-leftWrapper');
+                const rightPane = root.querySelector('.elLayouts-MultiSlidingPanels-rightWrapper');
+                el.style.left = `${targetLeftPx}px`;
+                if (leftPane) {
+                    leftPane.style.width = `${targetLeftPx}px`;
+                }
+                if (rightPane) {
+                    rightPane.style.left = `${targetLeftPx + 1}px`;
+                }
+                root.dispatchEvent(new Event('resize', { bubbles: true }));
+                window.dispatchEvent(new Event('resize'));
+                return true;
+            }""",
+            target_left_px,
+        )
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def _scroll_table_to_suffixes(page, suffixes: list[str], timeout_ms: int) -> None:
+    """
+    Scroll the active cell table until a row containing one of the suffixes is visible.
+
+    ENM uses a virtualized or clipped grid, so the table may not show all rows at once.
+    We look for rows in the right-side table and bring the first matching row into view.
+    """
+    if not suffixes:
+        return
+
+    right_rows = page.locator('div.elLayouts-MultiSlidingPanels-rightWrapper tr')
+    row_count = right_rows.count()
+    if row_count == 0:
+        return
+
+    normalized_patterns = [s.strip() for s in suffixes if s and s.strip()]
+    if not normalized_patterns:
+        return
+
+    for idx in range(row_count):
+        row = right_rows.nth(idx)
+        try:
+            row_text = row.inner_text(timeout=timeout_ms).strip()
+            if any(pattern in row_text for pattern in normalized_patterns):
+                row.scroll_into_view_if_needed(timeout=timeout_ms)
+                page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+
+    # Fallback: nudge the ENM table scrollbar downward a little and leave the
+    # table in a more useful position even if the exact suffix is not present.
+    thumb = _find_visible_locator(
+        page,
+        [
+            'div.elWidgets-ScrollBar-thumb',
+        ],
+    )
+    if thumb is None:
+        return
+
+    try:
+        box = thumb.bounding_box()
+    except Exception:
+        box = None
+
+    if not box:
+        return
+
+    start_x = box["x"] + box["width"] / 2
+    start_y = box["y"] + box["height"] / 2
+    try:
+        page.mouse.move(start_x, start_y)
+        page.mouse.down()
+        page.mouse.move(start_x, start_y + 120, steps=12)
+        page.mouse.up()
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+
+def capture_cell_management_screenshots(
+    config: AppConfig,
+    save_base_path: str,
+    band: str | None = None,
+    tabs_override: list[str] | None = None,
+) -> list[str]:
+    """
+    Open the ENM page, search the configured site, and capture the tab screenshots.
+
+    Args:
+        tabs_override: If provided, only capture these tabs instead of all configured tabs.
+                       e.g. ["LTE Cells"] for LTE bands, ["NR Cells"] for NR bands.
+    """
+    if not config.enm or not config.enm.enabled:
+        raise RuntimeError("ENM browser capture is not enabled in config.yaml.")
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "playwright is not installed. Install it with: pip install -r requirements.txt"
+        )
+
+    os.makedirs(os.path.dirname(save_base_path), exist_ok=True)
+
+    timeout_ms = config.enm.timeout_ms
+    viewport = {
+        "width": config.enm.viewport_width,
+        "height": config.enm.viewport_height,
+    }
+
+    screenshots: list[str] = []
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=config.enm.headless)
+            context = browser.new_context(
+                viewport=viewport,
+                ignore_https_errors=True,
+            )
+            page = context.new_page()
+            page.goto(config.enm.url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1500)
+
+            logged_in = _maybe_login(page, config)
+            if logged_in:
+                # ENM redirects to #launcher/groups after login — re-navigate
+                logger.info("Login detected, re-navigating to Cell Management URL...")
+                page.wait_for_timeout(2000)
+                try:
+                    page.goto(config.enm.url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+            _open_cell_management_app(page, timeout_ms)
+            _open_search_tab(page, timeout_ms)
+            _search_site_and_open(page, config.site.node_name, timeout_ms)
+            _adjust_multi_sliding_panel(page, config.enm.panel_splitter_left_px, timeout_ms)
+
+            tabs_to_capture = tabs_override if tabs_override else config.enm.tabs
+            for idx, tab_name in enumerate(tabs_to_capture, start=1):
+                _click_tab(page, tab_name, timeout_ms)
+                page.wait_for_timeout(2000)
+                if band:
+                    _scroll_table_to_suffixes(
+                        page,
+                        config.enm.band_cell_patterns.get(band, []),
+                        timeout_ms,
+                    )
+
+                save_path = f"{save_base_path}_{idx}.png"
+                page.screenshot(path=save_path, full_page=True)
+                screenshots.append(save_path)
+                logger.info(f"ENM browser screenshot saved: {save_path}")
+
+            return screenshots
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+
+
+def capture_alarm_viewer_screenshot(
+    config: AppConfig,
+    save_path: str,
+) -> str:
+    """
+    Open the Alarm Viewer, add the site topology, and capture a screenshot.
+
+    The final URL may contain dynamic params (e.g. ?workspaceId=...) — this
+    is normal ENM behaviour and should not cause failures.
+    """
+    if not config.enm or not config.enm.enabled:
+        raise RuntimeError("ENM browser capture is not enabled in config.yaml.")
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "playwright is not installed. Install it with: pip install -r requirements.txt"
+        )
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    timeout_ms = config.enm.timeout_ms
+    viewport = {
+        "width": config.enm.viewport_width,
+        "height": config.enm.viewport_height,
+    }
+
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=config.enm.headless)
+            context = browser.new_context(
+                viewport=viewport,
+                ignore_https_errors=True,
+            )
+            page = context.new_page()
+
+            # Open Alarm Viewer (URL may get ?workspaceId=... appended — that's fine)
+            _open_alarm_viewer_app(page, config, timeout_ms)
+
+            # Check if the site is already in the Network panel (server-side session)
+            if _is_site_already_in_network_panel(page, config.site.node_name):
+                logger.info(f"Site {config.site.node_name} already present in Network panel, skipping Add Topology")
+            else:
+                logger.info(f"Site not found in Network panel, adding topology...")
+                _open_add_topology_data(page, timeout_ms)
+                _add_topology_for_site(page, config.site.node_name, timeout_ms)
+
+            # Wait for alarm data to fully load
+            page.wait_for_timeout(5000)
+
+            # Take viewport-only screenshot (not full_page) to match the actual
+            # browser view the user sees — clean view without sidebar
+            page.screenshot(path=save_path, full_page=False)
+            logger.info(f"ENM alarm viewer screenshot saved: {save_path}")
+            return save_path
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+
+
+def capture_screen_region(
+    save_path: str,
+    region: Optional[tuple] = None,
+) -> str:
+    """
+    Capture a screenshot of the screen or a specific region.
+
+    Args:
+        save_path: Path to save the screenshot PNG
+        region: Optional (left, top, width, height) tuple for region capture.
+                If None, captures the full screen.
+
+    Returns:
+        Path to saved screenshot
+    """
+    if not PYAUTOGUI_AVAILABLE:
+        raise RuntimeError("pyautogui is not installed. Install it with: pip install pyautogui")
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    if region:
+        screenshot = pyautogui.screenshot(region=region)
+    else:
+        screenshot = pyautogui.screenshot()
+
+    screenshot.save(save_path)
+    logger.info(f"ENM screenshot captured: {save_path}")
+    return save_path
+
+
+def prompt_and_capture(
+    enm_item: str,
+    save_path: str,
+    band: str,
+    category: str,
+) -> Optional[str]:
+    """
+    Prompt the user to navigate to the ENM GUI page, then capture screenshot.
+
+    Args:
+        enm_item: The ENM item description (e.g., "ENM CELL M SS")
+        save_path: Path to save the screenshot
+        band: Current band being processed
+        category: Current category
+
+    Returns:
+        Path to saved screenshot, or None if skipped
+    """
+    print(f"\n{'='*60}")
+    print(f"  ENM Screenshot Required")
+    print(f"  Band: {band} | Category: {category}")
+    print(f"  Item: {enm_item}")
+    print(f"{'='*60}")
+    print(f"  Please open the ENM GUI in your browser and navigate to:")
+    print(f"  -> {enm_item}")
+    print()
+
+    while True:
+        choice = input("  [C]apture screen | [S]kip | [M]anual (provide file path): ").strip().upper()
+
+        if choice == "C":
+            if not PYAUTOGUI_AVAILABLE:
+                print("  pyautogui not available. Please use [M]anual or [S]kip.")
+                continue
+
+            print("  Capturing screenshot in 3 seconds... Switch to ENM browser window!")
+            time.sleep(3)
+            return capture_screen_region(save_path)
+
+        elif choice == "S":
+            logger.info(f"Skipped ENM screenshot: {enm_item}")
+            return None
+
+        elif choice == "M":
+            file_path = input("  Enter path to screenshot file: ").strip().strip('"')
+            if os.path.exists(file_path):
+                # Copy to expected location
+                import shutil
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                shutil.copy2(file_path, save_path)
+                logger.info(f"Manual ENM screenshot copied: {save_path}")
+                return save_path
+            else:
+                print(f"  File not found: {file_path}")
+                continue
+
+        else:
+            print("  Invalid choice. Please enter C, S, or M.")
+
+
+def check_manual_screenshots(
+    screenshots_dir: str,
+    band: str,
+    category: str,
+) -> list[str]:
+    """
+    Check for pre-saved manual screenshots in the screenshots directory.
+
+    Expected naming convention: {band}_{category}_ENM_*.png
+    e.g., L900_CELL_ENM_1.png
+
+    Args:
+        screenshots_dir: Directory to search for screenshots
+        band: Band key
+        category: Category key (without _ENM suffix)
+
+    Returns:
+        List of found screenshot paths
+    """
+    prefix = f"{band}_{category}_ENM"
+    found = []
+
+    if not os.path.exists(screenshots_dir):
+        return found
+
+    for filename in sorted(os.listdir(screenshots_dir)):
+        if filename.startswith(prefix) and filename.lower().endswith(".png"):
+            found.append(os.path.join(screenshots_dir, filename))
+
+    if found:
+        logger.info(f"Found {len(found)} pre-saved ENM screenshots for {band}/{category}")
+
+    return found

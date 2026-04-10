@@ -1,0 +1,298 @@
+
+******************************
+*******FOR NR700 *************
+
+
+*********** VSWR *************
+sdir
+get B28_RRU.*,rfport=[A-D] vswrSupervisionSensitivity        
+get B28_RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+
+*********** CELL *************
+st nrcelldu=.*P-
+st B28
+(ENM CELL M SS)
+*********** NOC LOGS *********
+get N28.* bschannelBW	
+hget Carrier=N28 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr GUtranCellRelation=5152-0000000000902002-50
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+
+************* PIM ***********
+pmxhetd NRCellDU=TCPHTP3ACANOCOTAGUMDDNP  Int_AvgRadioRecInterferencePower$
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel
+
+
+
+
+******************************
+*******FOR NR2600 *************
+
+
+*********** VSWR *************
+
+*********** CELL *************
+st nrcelldu=.*N-
+st N41
+(ENM CELL M SS)
+*********** NOC LOGS *********
+get N41 bschannelBW	
+hget Carrier=N41 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr GUtranCellRelation=5152-0000000000902002-40
+cvcu
+(ENM SHM SW SS)
+
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+
+************* PIM ***********
+pmxhetd NRCellDU=TCPHTP3ACANOCOTAGUMDDNN  Int_AvgRadioRecInterferencePower$
+
+************* RET ***********
+get NRSectorCarrier=N41.*,CommonBeamforming=1 digitalTilt
+
+
+
+******************************
+*******FOR G900 *************
+
+
+*********** VSWR *************
+sdir
+get rfport=[A-D] vswrSupervisionSensitivity        
+get rfport=[A-D],freq* vswrSupervisionSensitivity
+*********** CELL *************
+st trx
+st sec
+hget . gsmsectorId|bscNodeIdentity|gsmsectorid
+(ENM CELL M SS)
+
+*********** NOC LOGS *********
+hget . noOfTxAntennas|noOfRxAntennas
+cvcu
+(ENM SHM SW SS)
+
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+
+************* PIM ***********
+rxtcp:mo=rxstg-310;
+rxtcp:mo=rxstg-311;
+rxtcp:mo=rxstg-312;
+rlcrp:cell=M31179S1;
+rlcrp:cell=M31179S2;
+rlcrp:cell=M31179S3;
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel 
+
+
+
+
+
+******************************
+**********FOR L1800 **********
+******************************
+
+*********** VSWR *************
+sdir
+get B3.*RRU.*,rfport=[A-D] vswrSupervisionSensitivity
+get B3.*RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+*********** CELL *************
+st cellfdd=.*F-
+st B3
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget cellfdd=.*F dlchannelbandwidth|ulchannelbandwidth|arfc
+hget Carrier=B3 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNF.*,EUtranFreqRelation=.*,EUtranCellRelation=
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNF Int_RadioRecInterferencePwr$
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel 
+
+
+
+******************************
+**********FOR L700 **********
+******************************
+
+*********** VSWR *************
+sdir
+get B28.*RRU.*,rfport=[A-D] vswrSupervisionSensitivity
+get B28.*RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+*********** CELL *************
+st cellfdd=.*L-
+st B28
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget cellfdd=.*L dlchannelbandwidth|ulchannelbandwidth|arfc
+hget Carrier=B28 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNL.*,EUtranFreqRelation=.*,EUtranCellRelation=
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNL Int_RadioRecInterferencePwr$
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel 
+
+
+
+
+******************************
+**********FOR L2100 **********
+******************************
+
+*********** VSWR *************
+sdir
+get B1.*RRU.*,rfport=[A-D] vswrSupervisionSensitivity
+get B1.*RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+*********** CELL *************
+st cellfdd=.*W-
+st B1
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget cellfdd=.*W dlchannelbandwidth|ulchannelbandwidth|arfc
+hget Carrier=B1 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNW.*,EUtranFreqRelation=.*,EUtranCellRelation=
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNW Int_RadioRecInterferencePwr$
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel 
+
+
+
+******************************
+**********FOR L900 **********
+******************************
+
+*********** VSWR *************
+sdir
+get B0B28.*RRU.*,rfport=[A-D] vswrSupervisionSensitivity
+get B0B28.*RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+*********** CELL *************
+st cellfdd=.*Y-
+st B0
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget cellfdd=.*Y dlchannelbandwidth|ulchannelbandwidth|arfc
+hget Carrier=B0 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNY.*,EUtranFreqRelation=.*,EUtranCellRelation=
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNY Int_RadioRecInterferencePwr$
+
+************* RET ***********
+hgetc RetSubUnit=.* electricalAntennaTilt|operationalState|userLabel 
+
+
+
+******************************
+**********FOR L2300 **********
+******************************
+
+*********** VSWR *************
+sdir
+get B40.*RRU.*,rfport=[A-D] vswrSupervisionSensitivity
+get B40.*RRU.*,rfport=[A-D],freq* vswrSupervisionSensitivity
+
+*********** CELL *************
+st cellTdd=.*K-
+st B40
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget celltdd=.*K channelBandwidth|arfc
+hget Carrier=B40 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNK.*,EUtranFreqRelation=.*,EUtranCellRelation=
+
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNK Int_RadioRecInterferencePwr$
+
+************* RET ***********
+get sectorcarrier=B40 digitaltilt
+
+
+
+******************************
+**********FOR L2600 **********
+******************************
+
+*********** VSWR *************
+
+*********** CELL *************
+st cellTdd=.*V-
+st B41
+(ENM CELL M SS)
+*********** NOC LOGS *********
+hget celltdd=.*V channelBandwidth|arfc
+hget Carrier=B41 noOfUsedTxAntennas|noOfUsedRxAntennas
+lpr TCPHTP3ACANOCOTAGUMDDNV.*,EUtranFreqRelation=.*,EUtranCellRelation=
+
+cvcu
+(ENM SHM SW SS)
+
+************ ALARM **********
+alt
+(ENM FM SS)
+
+************* PIM ***********
+
+pmxhetd TCPHTP3ACANOCOTAGUMDDNV Int_RadioRecInterferencePwr$
+
+************* RET ***********
+get sectorcarrier=B41 digitaltilt
+
