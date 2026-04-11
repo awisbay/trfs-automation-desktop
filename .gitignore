@@ -11,3 +11,6 @@ trfs_automation.log
 dist/
 build/
 config.yaml
+.session.json
+src/.session.json
+logs/
