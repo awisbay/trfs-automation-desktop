@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from command_parser import parse_commands_file
 from config_loader import build_config_from_form, load_config
+from session import load_session, save_session
 from gui.theme import (
     ACCENT,
     ACCENT_WARM,
@@ -63,6 +64,16 @@ class FormPage:
                 self.defaults["commands_file"] = os.path.join(config.base_dir, config.paths.commands)
         except Exception:
             pass
+
+        session = load_session()
+        if session.get("host"):
+            self.defaults["host"] = session["host"]
+        if session.get("port"):
+            self.defaults["port"] = session["port"]
+        if session.get("username"):
+            self.defaults["username"] = session["username"]
+        if session.get("password"):
+            self.defaults["password"] = session["password"]
 
     def build(self) -> ft.View:
         self.shortcode_field = self._text_field(
@@ -183,7 +194,7 @@ class FormPage:
                 spacing=18,
             ),
             bgcolor=PANEL,
-            expand=True,
+            expand=1,
             padding=28,
         )
 
@@ -238,7 +249,7 @@ class FormPage:
             ),
             bgcolor="#0F2132",
             padding=28,
-            expand=True,
+            expand=2,
         )
 
         body = ft.Container(
@@ -378,6 +389,8 @@ class FormPage:
 
         self.error_text.visible = False
         self.error_box.visible = False
+
+        save_session(host=host, port=port, username=username, password=password)
 
         config = build_config_from_form(
             shortcode=shortcode,

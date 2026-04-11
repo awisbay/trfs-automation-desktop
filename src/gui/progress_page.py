@@ -58,6 +58,13 @@ class ProgressPage:
         self.page = page
         self.cancelled = False
         self._log_handler = None
+        self.back_button = ft.ElevatedButton(
+            "Back to Form",
+            icon=ft.Icons.ARROW_BACK,
+            disabled=True,
+            style=secondary_button_style(),
+            on_click=lambda _: asyncio.create_task(self.page.push_route("/")),
+        )
 
     def build(self) -> ft.View:
         config = getattr(self.page, "trfs_config", None)
@@ -229,12 +236,7 @@ class ProgressPage:
                                 ft.Row(
                                     [
                                         self.log_chevron,
-                                        ft.ElevatedButton(
-                                            "Back",
-                                            icon=ft.Icons.ARROW_BACK,
-                                            disabled=True,
-                                            style=secondary_button_style(),
-                                        ),
+                                        self.back_button,
                                     ],
                                     spacing=8,
                                 ),
@@ -501,6 +503,7 @@ class ProgressPage:
         self.status_text.value = "Automation complete"
         self.mode_text.value = f"Run finished in {duration}."
         self.elapsed_text.value = ""
+        self.back_button.disabled = False
 
         if self._log_handler:
             logging.getLogger().removeHandler(self._log_handler)

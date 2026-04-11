@@ -119,8 +119,8 @@ class ResultPage:
                     ft.Row(
                         [
                             ft.ElevatedButton(
-                                "Run Again",
-                                icon=ft.Icons.REPLAY_ROUNDED,
+                                "Run Another Site",
+                                icon=ft.Icons.ARROW_BACK,
                                 style=primary_button_style(),
                                 on_click=lambda _: asyncio.create_task(self.page.push_route("/")),
                             ),
