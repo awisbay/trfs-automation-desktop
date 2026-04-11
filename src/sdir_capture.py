@@ -80,7 +80,7 @@ def capture_shared_sdir_screenshot(config: AppConfig) -> Optional[str]:
     screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
     os.makedirs(screenshots_dir, exist_ok=True)
 
-    logs_dir = os.path.join(os.path.dirname(screenshots_dir), "logs")
+    logs_dir = os.path.join(config.base_dir, "logs", config.site.shortcode)
     os.makedirs(logs_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

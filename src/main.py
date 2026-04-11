@@ -14,7 +14,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from config_loader import load_config, get_full_path, AppConfig
+from config_loader import load_config, get_full_path, AppConfig, _apply_shortcode_paths
 from command_parser import parse_commands_file, get_moshell_categories
 from ssh_runner import MoshellSession
 from terminal_renderer import render_terminal_screenshot, render_multi_command_screenshot
@@ -668,6 +668,7 @@ def main():
     config_path = os.path.abspath(args.config)
     logger.info(f"Loading config from: {config_path}")
     config = load_config(config_path)
+    _apply_shortcode_paths(config)
 
     # Parse commands
     commands_file = get_full_path(config, config.paths.commands)

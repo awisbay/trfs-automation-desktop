@@ -73,6 +73,15 @@ class AppConfig:
     base_dir: str = ""
 
 
+def _apply_shortcode_paths(config: AppConfig) -> None:
+    """Append the site shortcode as a subfolder inside output_dir and screenshots_dir."""
+    sc = config.site.shortcode
+    config.paths.output_dir = os.path.join(config.paths.output_dir, sc)
+    config.paths.screenshots_dir = os.path.join(config.paths.screenshots_dir, sc)
+    os.makedirs(os.path.join(config.base_dir, config.paths.output_dir), exist_ok=True)
+    os.makedirs(os.path.join(config.base_dir, config.paths.screenshots_dir), exist_ok=True)
+
+
 def load_config(config_path: str) -> AppConfig:
     """Load configuration from YAML file."""
     with open(config_path, "r", encoding="utf-8") as f:
@@ -84,7 +93,6 @@ def load_config(config_path: str) -> AppConfig:
     ssh = SSHConfig(**raw["ssh"])
 
     moshell_data = raw["moshell"]
-    # Substitute node_name in login_command and prompt_pattern
     moshell_data["login_command"] = moshell_data["login_command"].format(
         node_name=site.node_name
     )
@@ -112,10 +120,6 @@ def load_config(config_path: str) -> AppConfig:
         enm=enm,
         base_dir=base_dir,
     )
-
-    # Ensure output and screenshots directories exist
-    os.makedirs(os.path.join(base_dir, paths.output_dir), exist_ok=True)
-    os.makedirs(os.path.join(base_dir, paths.screenshots_dir), exist_ok=True)
 
     return config
 
@@ -145,6 +149,7 @@ def build_config_from_form(
             node_name,
         ) if "{node_name}" not in config.moshell.login_command else config.moshell.login_command.format(node_name=node_name)
         config.moshell.prompt_pattern = config.moshell.prompt_pattern.format(node_name=node_name)
+        _apply_shortcode_paths(config)
     else:
         base_dir = os.path.dirname(os.path.abspath(commands_file)) if commands_file else os.getcwd()
         config = AppConfig(
@@ -178,8 +183,7 @@ def build_config_from_form(
             enm=None,
             base_dir=base_dir,
         )
-        os.makedirs(os.path.join(base_dir, config.paths.output_dir), exist_ok=True)
-        os.makedirs(os.path.join(base_dir, config.paths.screenshots_dir), exist_ok=True)
+        _apply_shortcode_paths(config)
 
     return config
 

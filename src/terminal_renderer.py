@@ -80,7 +80,7 @@ def render_terminal_screenshot(
         lines.pop()
 
     # Cap very long outputs to prevent oversized images
-    MAX_LINES = 200
+    MAX_LINES = 3000
     if len(lines) > MAX_LINES:
         truncated_count = len(lines) - MAX_LINES
         lines = lines[:MAX_LINES]
