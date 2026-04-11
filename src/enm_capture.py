@@ -171,16 +171,24 @@ def _maybe_login(page, config: AppConfig) -> bool:
 
 
 def _open_search_tab(page, timeout_ms: int) -> None:
-    """Open the Network Search tab in the left panel."""
-    page.wait_for_timeout(2000)
-    tab = _find_visible_locator(
-        page,
-        [
-            'div.ebTabs-tabItem:has-text("Search")',
-            'span.ebTabs-tabItem:has-text("Search")',
-            'text="Search"',
-        ],
-    )
+    """Open the Network Search tab in the left panel.
+
+    Poll for the tab because the Network panel may not be fully rendered
+    yet immediately after Cell Management loads.
+    """
+    selectors = [
+        'div.ebTabs-tabItem:has-text("Search")',
+        'span.ebTabs-tabItem:has-text("Search")',
+        'text="Search"',
+    ]
+    tab = None
+    for attempt in range(6):  # up to ~12s polling
+        tab = _find_visible_locator(page, selectors)
+        if tab is not None:
+            break
+        logger.info(f"Search tab not yet visible, retry {attempt + 1}/6")
+        page.wait_for_timeout(2000)
+
     if tab is None:
         raise RuntimeError("Could not find the Search tab in the ENM Network panel.")
     tab.click(timeout=timeout_ms)
@@ -232,7 +240,9 @@ def _open_alarm_viewer_app(page, config: AppConfig, timeout_ms: int) -> None:
             pass
 
     # Wait for alarm viewer to fully load (URL may get ?workspaceId=... appended — that's fine)
-    page.wait_for_timeout(5000)
+    # 5s was not enough on slower ENM responses — the Network panel and its
+    # buttons render after the initial DOM is ready. Give it more time.
+    page.wait_for_timeout(10000)
     logger.info(f"Alarm Viewer URL after load: {page.url}")
 
 
@@ -306,15 +316,24 @@ def _is_site_already_in_network_panel(page, site_name: str) -> bool:
 
 
 def _open_add_topology_data(page, timeout_ms: int) -> None:
-    """Open the Add Topology Data panel/button."""
-    button = _find_visible_locator(
-        page,
-        [
-            'button:has-text("Add Topology Data")',
-            'span.ebBtn-caption:has-text("Add Topology Data")',
-            'text="Add Topology Data"',
-        ],
-    )
+    """Open the Add Topology Data panel/button.
+
+    The button may not be rendered immediately after the Alarm Viewer loads,
+    so we poll for it with short waits before giving up.
+    """
+    selectors = [
+        'button:has-text("Add Topology Data")',
+        'span.ebBtn-caption:has-text("Add Topology Data")',
+        'text="Add Topology Data"',
+    ]
+    button = None
+    for attempt in range(6):  # up to ~12s of polling
+        button = _find_visible_locator(page, selectors)
+        if button is not None:
+            break
+        logger.info(f"Add Topology Data button not yet visible, retry {attempt + 1}/6")
+        page.wait_for_timeout(2000)
+
     if button is None:
         raise RuntimeError("Could not find the Add Topology Data button.")
     button.evaluate("(el) => el.click()")
@@ -751,6 +770,238 @@ def _scroll_table_to_suffixes(page, suffixes: list[str], timeout_ms: int) -> Non
         page.wait_for_timeout(800)
     except Exception:
         pass
+
+
+class EnmBrowserSession:
+    """
+    A single persistent Playwright browser session that handles all ENM
+    captures for one band. Login happens once; subsequent captures just
+    navigate to a different URL on the same page so cookies/session are
+    preserved. Use as a context manager.
+
+    Debug artifacts: on any capture failure, a debug_<stage>.png is saved
+    to the screenshots dir so the caller can inspect the page state.
+    """
+
+    def __init__(self, config: AppConfig, debug_dir: str):
+        if not config.enm or not config.enm.enabled:
+            raise RuntimeError("ENM browser capture is not enabled in config.yaml.")
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError("playwright is not installed.")
+
+        self.config = config
+        self.debug_dir = debug_dir
+        os.makedirs(debug_dir, exist_ok=True)
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self.page = None
+        self._logged_in = False
+
+    def __enter__(self):
+        timeout_ms = self.config.enm.timeout_ms
+        viewport = {
+            "width": self.config.enm.viewport_width,
+            "height": self.config.enm.viewport_height,
+        }
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=self.config.enm.headless)
+        self._context = self._browser.new_context(
+            viewport=viewport,
+            ignore_https_errors=True,
+        )
+        self.page = self._context.new_page()
+
+        # Initial login — navigate to the base ENM page and sign in once.
+        login_url = self.config.enm.url
+        logger.info(f"[ENM] Opening session and logging in: {login_url}")
+        try:
+            self.page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            self._save_debug("login_nav_failed")
+            raise RuntimeError(f"Failed to navigate to ENM base URL: {exc}") from exc
+
+        self.page.wait_for_timeout(2000)
+        try:
+            self._logged_in = _maybe_login(self.page, self.config)
+        except Exception as exc:
+            self._save_debug("login_flow_failed")
+            raise RuntimeError(f"ENM login flow failed: {exc}") from exc
+
+        if self._logged_in:
+            logger.info("[ENM] Login successful — session is live.")
+            self.page.wait_for_timeout(2000)
+        else:
+            logger.info("[ENM] Page loaded without login form (already authenticated).")
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
+        return False
+
+    def _save_debug(self, stage: str) -> str:
+        """Save a debug screenshot + current URL to help diagnose failures."""
+        try:
+            path = os.path.join(self.debug_dir, f"debug_enm_{stage}.png")
+            self.page.screenshot(path=path, full_page=True)
+            logger.info(f"[ENM] Debug screenshot: {path} (url={self.page.url})")
+            return path
+        except Exception as exc:
+            logger.warning(f"[ENM] Could not save debug screenshot for {stage}: {exc}")
+            return ""
+
+    def capture_cell_management(
+        self,
+        save_base_path: str,
+        band: str | None = None,
+        tabs_override: list[str] | None = None,
+    ) -> list[str]:
+        timeout_ms = self.config.enm.timeout_ms
+        os.makedirs(os.path.dirname(save_base_path), exist_ok=True)
+        page = self.page
+
+        try:
+            page.goto(self.config.enm.url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            self._save_debug(f"cellmgmt_nav_{band}")
+            raise RuntimeError(f"Cell Management navigation failed: {exc}") from exc
+
+        page.wait_for_timeout(3000)
+
+        try:
+            _open_cell_management_app(page, timeout_ms)
+            _open_search_tab(page, timeout_ms)
+            _search_site_and_open(page, self.config.site.node_name, timeout_ms)
+            _adjust_multi_sliding_panel(page, self.config.enm.panel_splitter_left_px, timeout_ms)
+        except Exception as exc:
+            self._save_debug(f"cellmgmt_setup_{band}")
+            raise RuntimeError(f"Cell Management setup failed: {exc}") from exc
+
+        tabs_to_capture = tabs_override if tabs_override else self.config.enm.tabs
+        screenshots: list[str] = []
+        for idx, tab_name in enumerate(tabs_to_capture, start=1):
+            try:
+                _click_tab(page, tab_name, timeout_ms)
+                page.wait_for_timeout(2000)
+                if band:
+                    _scroll_table_to_suffixes(
+                        page,
+                        self.config.enm.band_cell_patterns.get(band, []),
+                        timeout_ms,
+                    )
+                save_path = f"{save_base_path}_{idx}.png"
+                page.screenshot(path=save_path, full_page=True)
+                screenshots.append(save_path)
+                logger.info(f"[ENM] Cell Management screenshot saved: {save_path}")
+            except Exception as exc:
+                self._save_debug(f"cellmgmt_tab_{band}_{tab_name}")
+                raise RuntimeError(
+                    f"Cell Management tab capture failed for '{tab_name}': {exc}"
+                ) from exc
+
+        return screenshots
+
+    def capture_alarm_viewer(self, save_path: str) -> str:
+        timeout_ms = self.config.enm.timeout_ms
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        page = self.page
+
+        try:
+            page.goto(self.config.enm.alarm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            self._save_debug("alarm_nav")
+            raise RuntimeError(f"Alarm Viewer navigation failed: {exc}") from exc
+
+        # Give Network panel + toolbar time to render.
+        page.wait_for_timeout(10000)
+        logger.info(f"[ENM] Alarm Viewer URL after load: {page.url}")
+
+        try:
+            if _is_site_already_in_network_panel(page, self.config.site.node_name):
+                logger.info(f"[ENM] Site already in Network panel, skipping Add Topology")
+            else:
+                logger.info(f"[ENM] Adding topology for alarm viewer")
+                _open_add_topology_data(page, timeout_ms)
+                _add_topology_for_site(page, self.config.site.node_name, timeout_ms)
+        except Exception as exc:
+            self._save_debug("alarm_addtopo")
+            raise RuntimeError(f"Alarm Viewer topology add failed: {exc}") from exc
+
+        page.wait_for_timeout(5000)
+        try:
+            page.screenshot(path=save_path, full_page=False)
+            logger.info(f"[ENM] Alarm Viewer screenshot saved: {save_path}")
+            return save_path
+        except Exception as exc:
+            self._save_debug("alarm_screenshot")
+            raise RuntimeError(f"Alarm Viewer screenshot failed: {exc}") from exc
+
+    def capture_shm_software_admin(self, save_path: str) -> str:
+        timeout_ms = self.config.enm.timeout_ms
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        page = self.page
+
+        try:
+            page.goto(self.config.enm.shm_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            self._save_debug("shm_nav")
+            raise RuntimeError(f"SHM navigation failed: {exc}") from exc
+
+        page.wait_for_timeout(4000)
+
+        # Click the drill-down links (Software and Hardware Manager -> Software Administration)
+        try:
+            page.get_by_role("link", name="Software and Hardware Manager").click(timeout=timeout_ms)
+            page.wait_for_timeout(4000)
+        except Exception:
+            try:
+                page.get_by_text("Software and Hardware Manager", exact=False).click(timeout=timeout_ms)
+                page.wait_for_timeout(4000)
+            except Exception:
+                pass
+        try:
+            page.get_by_role("link", name="Software Administration").click(timeout=timeout_ms)
+            page.wait_for_timeout(4000)
+        except Exception:
+            try:
+                page.get_by_text("Software Administration", exact=False).click(timeout=timeout_ms)
+                page.wait_for_timeout(4000)
+            except Exception:
+                pass
+
+        try:
+            if _is_site_already_in_network_panel(page, self.config.site.node_name):
+                logger.info(f"[ENM] Site already in SHM, skipping Add Topology")
+            else:
+                _open_add_topology_data(page, timeout_ms)
+                _add_topology_for_site(page, self.config.site.node_name, timeout_ms)
+        except Exception as exc:
+            self._save_debug("shm_addtopo")
+            raise RuntimeError(f"SHM topology add failed: {exc}") from exc
+
+        page.wait_for_timeout(3000)
+        try:
+            page.screenshot(path=save_path, full_page=True)
+            logger.info(f"[ENM] SHM screenshot saved: {save_path}")
+            return save_path
+        except Exception as exc:
+            self._save_debug("shm_screenshot")
+            raise RuntimeError(f"SHM screenshot failed: {exc}") from exc
 
 
 def capture_cell_management_screenshots(

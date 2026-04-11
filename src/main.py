@@ -11,6 +11,7 @@ import os
 import sys
 import logging
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from config_loader import load_config, get_full_path, AppConfig
@@ -24,7 +25,9 @@ from enm_capture import (
     capture_cell_management_screenshots,
     capture_alarm_viewer_screenshot,
     capture_shm_software_administration_screenshot,
+    EnmBrowserSession,
 )
+from sdir_capture import capture_shared_sdir_screenshot
 
 # Setup logging
 logging.basicConfig(
@@ -44,6 +47,7 @@ def run_band_commands(
     band: str,
     commands_by_category: dict,
     is_first_band: bool = True,
+    shared_sdir_screenshot: str | None = None,
 ) -> dict:
     """
     Run all moshell commands for a band and generate screenshots.
@@ -70,20 +74,32 @@ def run_band_commands(
 
         logger.info(f"  [{band}] {category}: Running {len(commands)} command(s)...")
 
-        # Run all commands for this category and collect outputs
-        cmd_outputs = []
+        # Walk commands in order. Each command becomes one screenshot entry.
+        # For sdir/sdi we reuse the shared capture (one-shot, node-level).
+        cmd_entries: list[tuple[str, str | None]] = []  # (cmd, output_or_None)
         for cmd in commands:
-            actual_cmd = cmd
-            if cmd.strip().lower() == "sdir" and not is_first_band:
-                actual_cmd = "sdi"
-                logger.info(f"  [{band}] {category}: Using sdi (sector dir already loaded)")
-            output = session.run_command(actual_cmd)
-            cmd_outputs.append((actual_cmd, output))
+            if cmd.strip().lower() in ("sdir", "sdi"):
+                if shared_sdir_screenshot:
+                    cmd_entries.append((cmd, None))  # marker: use shared path
+                else:
+                    logger.warning(
+                        f"  [{band}] {category}: Shared sdir screenshot unavailable — skipping {cmd}"
+                    )
+                continue
+            output = session.run_command(cmd)
+            cmd_entries.append((cmd, output))
 
-        # Generate separate screenshot per command
+        if not cmd_entries:
+            logger.info(f"  [{band}] {category}: No commands produced output, skipping screenshots")
+            continue
+
         category_screenshots = []
-        for idx, (cmd, output) in enumerate(cmd_outputs):
-            suffix = f"_{idx+1}" if len(cmd_outputs) > 1 else ""
+        for idx, (cmd, output) in enumerate(cmd_entries):
+            suffix = f"_{idx+1}" if len(cmd_entries) > 1 else ""
+            if output is None:
+                # Reuse the shared sdir screenshot as-is
+                category_screenshots.append(shared_sdir_screenshot)
+                continue
             screenshot_path = os.path.join(
                 screenshots_dir,
                 f"{config.site.shortcode}_{band}_{category}{suffix}.png",
@@ -106,6 +122,7 @@ def handle_enm_items(
     config: AppConfig,
     band: str,
     commands_by_category: dict,
+    enm_prompt=None,
 ) -> dict:
     """
     Handle ENM GUI screenshot items for a band.
@@ -123,85 +140,253 @@ def handle_enm_items(
 
     enm_categories = {k: v for k, v in commands_by_category.items() if k.endswith("_ENM")}
 
+    # Separate items that still need the browser from ones already served
+    # by pre-saved manual screenshots.
+    pending: dict[str, list[str]] = {}
     for enm_key, enm_items in enm_categories.items():
         parent_category = enm_key.replace("_ENM", "")
-
-        # Check for pre-saved manual screenshots first
         manual_screenshots = check_manual_screenshots(screenshots_dir, band, parent_category)
         if manual_screenshots:
             screenshots[enm_key] = manual_screenshots
-            continue
+        else:
+            pending[enm_key] = enm_items
 
-        if config.enm and config.enm.enabled:
-            # CELL_ENM -> Cell Management (NR Cells tab for NR bands, LTE Cells for LTE/G)
-            if enm_key == "CELL_ENM":
-                save_base_path = os.path.join(
-                    screenshots_dir,
-                    f"{config.site.shortcode}_{band}_{parent_category}_ENM",
-                )
-                # Determine which tab to capture based on band type
-                is_nr = band.upper().startswith("NR")
-                target_tab = "NR Cells" if is_nr else "LTE Cells"
-                try:
-                    automated_screenshots = capture_cell_management_screenshots(
-                        config,
-                        save_base_path,
-                        band=band,
-                        tabs_override=[target_tab],
+    # If nothing left to capture via browser, we are done.
+    if not pending:
+        return screenshots
+
+    # If ENM is enabled, open ONE browser session and reuse it for every
+    # pending category in this band. Login happens only once.
+    browser_session = None
+    if config.enm and config.enm.enabled:
+        try:
+            browser_session = EnmBrowserSession(config, debug_dir=screenshots_dir).__enter__()
+        except Exception as e:
+            logger.warning(f"[{band}] Failed to open ENM browser session: {e}")
+            browser_session = None
+
+    try:
+        for enm_key, enm_items in pending.items():
+            parent_category = enm_key.replace("_ENM", "")
+
+            if browser_session is not None:
+                if enm_key == "CELL_ENM":
+                    save_base_path = os.path.join(
+                        screenshots_dir,
+                        f"{config.site.shortcode}_{band}_{parent_category}_ENM",
                     )
-                    if automated_screenshots:
-                        screenshots[enm_key] = automated_screenshots
-                        continue
-                except Exception as e:
-                    logger.warning(f"Automated Cell Management capture failed for {band}/{enm_key}: {e}")
+                    is_nr = band.upper().startswith("NR")
+                    target_tab = "NR Cells" if is_nr else "LTE Cells"
+                    try:
+                        automated = browser_session.capture_cell_management(
+                            save_base_path,
+                            band=band,
+                            tabs_override=[target_tab],
+                        )
+                        if automated:
+                            screenshots[enm_key] = automated
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            f"[{band}] Cell Management capture failed: {e}"
+                        )
 
-            # ALARM_ENM -> FM Alarm Viewer
-            elif enm_key == "ALARM_ENM":
+                elif enm_key == "ALARM_ENM":
+                    save_path = os.path.join(
+                        screenshots_dir,
+                        f"{config.site.shortcode}_{band}_{parent_category}_ENM_1.png",
+                    )
+                    try:
+                        captured = browser_session.capture_alarm_viewer(save_path)
+                        if captured:
+                            screenshots[enm_key] = [captured]
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            f"[{band}] Alarm Viewer capture failed: {e}"
+                        )
+
+                elif enm_key == "NOC_Logs_ENM":
+                    save_path = os.path.join(
+                        screenshots_dir,
+                        f"{config.site.shortcode}_{band}_{parent_category}_ENM_1.png",
+                    )
+                    try:
+                        captured = browser_session.capture_shm_software_admin(save_path)
+                        if captured:
+                            screenshots[enm_key] = [captured]
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            f"[{band}] SHM capture failed: {e}"
+                        )
+
+            # Fallback: prompt user for each ENM item (GUI callback or terminal input)
+            enm_screenshots = []
+            for i, item in enumerate(enm_items):
                 save_path = os.path.join(
                     screenshots_dir,
-                    f"{config.site.shortcode}_{band}_{parent_category}_ENM_1.png",
+                    f"{config.site.shortcode}_{band}_{parent_category}_ENM_{i+1}.png",
                 )
                 try:
-                    captured_path = capture_alarm_viewer_screenshot(config, save_path)
-                    if captured_path:
-                        screenshots[enm_key] = [captured_path]
-                        continue
-                except Exception as e:
-                    logger.warning(f"Automated Alarm Viewer capture failed for {band}/{enm_key}: {e}")
+                    if enm_prompt is not None:
+                        result = enm_prompt(item, save_path, band, parent_category)
+                    else:
+                        result = prompt_and_capture(item, save_path, band, parent_category)
+                except EOFError:
+                    logger.info(f"  [{band}] {enm_key}: Skipped (non-interactive mode)")
+                    break
+                if result:
+                    enm_screenshots.append(result)
 
-            # NOC_Logs_ENM -> SHM Software Administration
-            elif enm_key == "NOC_Logs_ENM":
-                save_path = os.path.join(
-                    screenshots_dir,
-                    f"{config.site.shortcode}_{band}_{parent_category}_ENM_1.png",
-                )
-                try:
-                    captured_path = capture_shm_software_administration_screenshot(config, save_path)
-                    if captured_path:
-                        screenshots[enm_key] = [captured_path]
-                        continue
-                except Exception as e:
-                    logger.warning(f"Automated SHM capture failed for {band}/{enm_key}: {e}")
-
-        # Fallback: prompt user for each ENM item (skip if non-interactive)
-        enm_screenshots = []
-        for i, item in enumerate(enm_items):
-            save_path = os.path.join(
-                screenshots_dir,
-                f"{config.site.shortcode}_{band}_{parent_category}_ENM_{i+1}.png",
-            )
+            if enm_screenshots:
+                screenshots[enm_key] = enm_screenshots
+    finally:
+        if browser_session is not None:
             try:
-                result = prompt_and_capture(item, save_path, band, parent_category)
-            except EOFError:
-                logger.info(f"  [{band}] {enm_key}: Skipped (non-interactive mode)")
-                break
-            if result:
-                enm_screenshots.append(result)
-
-        if enm_screenshots:
-            screenshots[enm_key] = enm_screenshots
+                browser_session.__exit__(None, None, None)
+            except Exception:
+                pass
 
     return screenshots
+
+
+def run_moshell_for_band(
+    session: MoshellSession,
+    config: AppConfig,
+    band: str,
+    commands_by_category: dict,
+    is_first_band: bool = True,
+    shared_sdir_screenshot: str | None = None,
+) -> tuple[str, dict]:
+    """
+    Phase 1 worker: create Excel file + run moshell commands for one band.
+    Does NOT touch ENM (browser captures happen in a shared phase later).
+
+    Returns:
+        (excel_path, moshell_screenshots_dict)
+    """
+    logger.info(f"\n{'='*60}")
+    logger.info(f"[{band}] Moshell phase starting")
+    logger.info(f"{'='*60}")
+    excel_path = create_band_excel(config, band)
+    moshell_screenshots = run_band_commands(
+        session, config, band, commands_by_category, is_first_band,
+        shared_sdir_screenshot=shared_sdir_screenshot,
+    )
+    return excel_path, moshell_screenshots
+
+
+def capture_enm_shared_artifacts(config: AppConfig) -> dict:
+    """
+    Phase 2: open ONE browser session and capture the four node-level ENM
+    artifacts that can be reused across every band:
+
+        - SHM Software Administration
+        - FM Alarm Viewer
+        - Cell Management / NR Cells tab
+        - Cell Management / LTE Cells tab
+
+    Returns a dict mapping artifact name to screenshot path (or None on
+    failure). Caller distributes these into the per-band screenshots dict.
+    """
+    result = {"shm": None, "alarm": None, "cellmgmt_nr": None, "cellmgmt_lte": None}
+
+    if not config.enm or not config.enm.enabled:
+        logger.info("[ENM shared] Skipped — enm disabled in config")
+        return result
+
+    screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
+    shortcode = config.site.shortcode
+
+    try:
+        session = EnmBrowserSession(config, debug_dir=screenshots_dir).__enter__()
+    except Exception as e:
+        logger.warning(f"[ENM shared] Failed to open browser session: {e}")
+        return result
+
+    try:
+        # 1. Cell Management — capture BOTH tabs in one go so we don't
+        #    re-navigate to the Cell Management page twice.
+        try:
+            base_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_CELL_ENM")
+            captured = session.capture_cell_management(
+                base_path,
+                band=None,  # no band-specific scroll — we want the full tab view
+                tabs_override=["NR Cells", "LTE Cells"],
+            )
+            # capture_cell_management returns [<base>_1.png, <base>_2.png]
+            # matching the order of tabs_override
+            if len(captured) >= 1:
+                result["cellmgmt_nr"] = captured[0]
+            if len(captured) >= 2:
+                result["cellmgmt_lte"] = captured[1]
+            logger.info(f"[ENM shared] Cell Management captured: NR={result['cellmgmt_nr']}, LTE={result['cellmgmt_lte']}")
+        except Exception as e:
+            logger.warning(f"[ENM shared] Cell Management failed: {e}")
+
+        # 2. SHM Software Administration
+        try:
+            shm_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_NOC_Logs_ENM_1.png")
+            result["shm"] = session.capture_shm_software_admin(shm_path)
+            logger.info(f"[ENM shared] SHM captured: {result['shm']}")
+        except Exception as e:
+            logger.warning(f"[ENM shared] SHM failed: {e}")
+
+        # 3. Alarm Viewer
+        try:
+            alarm_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_ALARM_ENM_1.png")
+            result["alarm"] = session.capture_alarm_viewer(alarm_path)
+            logger.info(f"[ENM shared] Alarm Viewer captured: {result['alarm']}")
+        except Exception as e:
+            logger.warning(f"[ENM shared] Alarm Viewer failed: {e}")
+    finally:
+        try:
+            session.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    return result
+
+
+def build_enm_screenshots_for_band(
+    band: str,
+    commands_by_category: dict,
+    shared_artifacts: dict,
+    config: AppConfig,
+) -> dict:
+    """
+    Phase 3 helper: given the shared ENM artifacts and the ENM items a
+    band actually needs, build a per-band ENM screenshots dict that can
+    be merged into the final insert step.
+
+    Manual pre-saved screenshots (band-specific files in screenshots_dir)
+    still take priority over the shared cache.
+    """
+    screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
+    out: dict = {}
+    enm_categories = {k: v for k, v in commands_by_category.items() if k.endswith("_ENM")}
+
+    for enm_key in enm_categories:
+        parent_category = enm_key.replace("_ENM", "")
+
+        # Manual override: if band has pre-saved files, use those and skip cache.
+        manual = check_manual_screenshots(screenshots_dir, band, parent_category)
+        if manual:
+            out[enm_key] = manual
+            continue
+
+        if enm_key == "NOC_Logs_ENM" and shared_artifacts.get("shm"):
+            out[enm_key] = [shared_artifacts["shm"]]
+        elif enm_key == "ALARM_ENM" and shared_artifacts.get("alarm"):
+            out[enm_key] = [shared_artifacts["alarm"]]
+        elif enm_key == "CELL_ENM":
+            is_nr = band.upper().startswith("NR")
+            key = "cellmgmt_nr" if is_nr else "cellmgmt_lte"
+            if shared_artifacts.get(key):
+                out[enm_key] = [shared_artifacts[key]]
+
+    return out
 
 
 def process_band(
@@ -210,6 +395,7 @@ def process_band(
     band: str,
     commands_by_category: dict,
     is_first_band: bool = True,
+    enm_prompt=None,
 ) -> str:
     """
     Process a single band: run commands, capture screenshots, create Excel.
@@ -236,14 +422,27 @@ def process_band(
 
     # Step 3: Handle ENM GUI screenshots (best-effort, won't block)
     try:
-        enm_screenshots = handle_enm_items(config, band, commands_by_category)
+        enm_screenshots = handle_enm_items(config, band, commands_by_category, enm_prompt=enm_prompt)
     except Exception as e:
         logger.warning(f"ENM screenshots skipped: {e}")
         enm_screenshots = {}
 
     # Step 4: Merge all screenshots and insert into Excel
     all_screenshots = {**moshell_screenshots, **enm_screenshots}
-    insert_screenshots_for_band(excel_path, all_screenshots)
+
+    # Defensive: if the Excel file disappeared between create and insert
+    # (Windows Defender, manual delete, antivirus, etc.) re-create it from
+    # the template so we never lose the run's work.
+    if not os.path.exists(excel_path):
+        logger.warning(f"Excel file vanished before insert — re-creating from template: {excel_path}")
+        excel_path = create_band_excel(config, band)
+
+    try:
+        insert_screenshots_for_band(excel_path, all_screenshots)
+    except FileNotFoundError:
+        logger.warning(f"Excel file missing at insert time — re-creating and retrying: {excel_path}")
+        excel_path = create_band_excel(config, band)
+        insert_screenshots_for_band(excel_path, all_screenshots)
 
     logger.info(f"Completed band {band}: {excel_path}")
     return excel_path
@@ -450,12 +649,18 @@ def main():
     )
     parser.add_argument(
         "--band",
-        help="Process only a specific band (e.g., L900, NR700)",
+        help="Process only specific bands. Comma-separated for multiple (e.g., L900 or NR700,L1800,L2600)",
     )
     parser.add_argument(
         "--demo",
         action="store_true",
         help="Demo mode: simulate with sample output, no SSH needed",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Process N bands in parallel (each gets its own SSH session). Default: 1 (sequential)",
     )
     args = parser.parse_args()
 
@@ -473,11 +678,12 @@ def main():
 
     # Filter to specific band if requested
     if args.band:
-        band_upper = args.band.upper()
-        if band_upper not in all_commands:
-            logger.error(f"Band '{args.band}' not found. Available: {', '.join(all_commands.keys())}")
+        requested = [b.strip().upper() for b in args.band.split(",") if b.strip()]
+        missing = [b for b in requested if b not in all_commands]
+        if missing:
+            logger.error(f"Band(s) not found: {', '.join(missing)}. Available: {', '.join(all_commands.keys())}")
             sys.exit(1)
-        bands_to_process = {band_upper: all_commands[band_upper]}
+        bands_to_process = {b: all_commands[b] for b in requested}
     else:
         bands_to_process = all_commands
 
@@ -530,15 +736,93 @@ def main():
     print(f"  Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    with MoshellSession(config) as session:
-        for i, (band, categories) in enumerate(bands_to_process.items()):
+    parallel = max(1, args.parallel)
+    band_items = list(bands_to_process.items())
+
+    # Phase 0 — shared sdir capture (one SSH session, runs once, reused by
+    # every band). Must finish before Phase 1 so bands can reference it.
+    print("  Phase 0: take sdir command (shared across all bands)\n")
+    logger.info("[sdir] Phase 0: capturing shared sdir screenshot...")
+    shared_sdir_path = capture_shared_sdir_screenshot(config)
+    if shared_sdir_path:
+        print(f"  [OK phase0] sdir -> {shared_sdir_path}\n")
+    else:
+        print("  [WARN phase0] sdir capture failed — VSWR sdir entries will be skipped\n")
+
+    # Phase 1 — moshell SSH (parallel per-band). No ENM yet.
+    # Each band gets a tuple (excel_path, moshell_screenshots_dict).
+    phase1_results: dict[str, tuple[str, dict]] = {}
+
+    def _moshell_worker(band: str, categories: dict) -> tuple[str, dict]:
+        logger.info(f"[{band}] Opening SSH session...")
+        with MoshellSession(config) as session:
+            # Each parallel session has its own sdir state — treat as first band.
+            return run_moshell_for_band(
+                session, config, band, categories, is_first_band=True,
+                shared_sdir_screenshot=shared_sdir_path,
+            )
+
+    if parallel == 1:
+        print("  Phase 1: sequential SSH\n")
+        with MoshellSession(config) as session:
+            for i, (band, categories) in enumerate(band_items):
+                try:
+                    excel_path, moshell = run_moshell_for_band(
+                        session, config, band, categories, is_first_band=(i == 0),
+                        shared_sdir_screenshot=shared_sdir_path,
+                    )
+                    phase1_results[band] = (excel_path, moshell)
+                    print(f"  [OK phase1] {band}")
+                except Exception as e:
+                    logger.error(f"[{band}] Phase 1 error: {e}", exc_info=True)
+                    print(f"  [ERROR phase1] {band}: {e}")
+    else:
+        print(f"  Phase 1: parallel SSH ({parallel} workers)\n")
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = {
+                pool.submit(_moshell_worker, band, cats): band
+                for band, cats in band_items
+            }
+            for fut in as_completed(futures):
+                band = futures[fut]
+                try:
+                    excel_path, moshell = fut.result()
+                    phase1_results[band] = (excel_path, moshell)
+                    print(f"  [OK phase1] {band}")
+                except Exception as e:
+                    logger.error(f"[{band}] Phase 1 error: {e}", exc_info=True)
+                    print(f"  [ERROR phase1] {band}: {e}")
+
+    # Phase 2 — shared ENM artifacts (one browser, four captures max).
+    print("\n  Phase 2: shared ENM capture (one browser)\n")
+    shared_enm = capture_enm_shared_artifacts(config)
+
+    # Phase 3 — distribute ENM artifacts per band and insert into Excel.
+    print("\n  Phase 3: inserting screenshots into Excel\n")
+    for band, (excel_path, moshell) in phase1_results.items():
+        try:
+            categories = bands_to_process[band]
+            enm_for_band = build_enm_screenshots_for_band(
+                band, categories, shared_enm, config
+            )
+            all_screenshots = {**moshell, **enm_for_band}
+
+            if not os.path.exists(excel_path):
+                logger.warning(f"[{band}] Excel vanished — re-creating")
+                excel_path = create_band_excel(config, band)
+
             try:
-                excel_path = process_band(session, config, band, categories, is_first_band=(i == 0))
-                generated_files.append(excel_path)
-            except Exception as e:
-                logger.error(f"Error processing band {band}: {e}", exc_info=True)
-                print(f"\n  ERROR: Failed to process band {band}: {e}")
-                continue
+                insert_screenshots_for_band(excel_path, all_screenshots)
+            except FileNotFoundError:
+                logger.warning(f"[{band}] Excel missing at insert — re-creating")
+                excel_path = create_band_excel(config, band)
+                insert_screenshots_for_band(excel_path, all_screenshots)
+
+            generated_files.append(excel_path)
+            print(f"  [OK phase3] {band} -> {excel_path}")
+        except Exception as e:
+            logger.error(f"[{band}] Phase 3 error: {e}", exc_info=True)
+            print(f"  [ERROR phase3] {band}: {e}")
 
     # Summary
     end_time = datetime.now()

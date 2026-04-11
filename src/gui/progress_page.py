@@ -5,8 +5,10 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import flet as ft
@@ -14,8 +16,17 @@ import flet as ft
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from command_parser import parse_commands_file
-from main import process_band, process_band_demo
+from main import (
+    process_band,
+    process_band_demo,
+    run_moshell_for_band,
+    capture_enm_shared_artifacts,
+    build_enm_screenshots_for_band,
+)
+from sdir_capture import capture_shared_sdir_screenshot
+from excel_writer import create_band_excel, insert_screenshots_for_band
 from ssh_runner import MoshellSession
+from config_loader import get_full_path
 from gui.theme import (
     ACCENT,
     BG_BOTTOM,
@@ -311,6 +322,94 @@ class ProgressPage:
         except Exception:
             pass
 
+    def _gui_enm_prompt(self, enm_item: str, save_path: str, band: str, category: str):
+        """Worker-thread callback: open a dialog and block until user responds."""
+        event = threading.Event()
+        result = {"path": None}
+
+        file_picker = ft.FilePicker()
+
+        def finish(path):
+            result["path"] = path
+            try:
+                dialog.open = False
+                self.page.update()
+            except Exception:
+                pass
+            event.set()
+
+        def on_skip(_):
+            self._log_message(f"  [{band}] {category} ENM: Skipped by user")
+            finish(None)
+
+        def on_file_picked(e: ft.FilePickerResultEvent):
+            if e.files:
+                src = e.files[0].path
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    shutil.copy2(src, save_path)
+                    self._log_message(f"  [{band}] {category} ENM: Manual file accepted")
+                    finish(save_path)
+                except Exception as exc:
+                    self._log_message(f"  [{band}] {category} ENM: Copy failed: {exc}")
+                    finish(None)
+
+        def on_browse(_):
+            file_picker.pick_files(
+                dialog_title=f"Select screenshot for {band} / {enm_item}",
+                allowed_extensions=["png", "jpg", "jpeg"],
+                allow_multiple=False,
+            )
+
+        def on_capture(_):
+            try:
+                from enm_capture import capture_screen_region
+                captured = capture_screen_region(save_path)
+                self._log_message(f"  [{band}] {category} ENM: Screen captured")
+                finish(captured)
+            except Exception as exc:
+                self._log_message(f"  [{band}] {category} ENM: Capture failed: {exc}")
+                finish(None)
+
+        file_picker.on_result = on_file_picked
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"ENM screenshot needed — {band}"),
+            content=ft.Column(
+                [
+                    ft.Text(f"Item: {enm_item}", size=13),
+                    ft.Text(f"Category: {category}", size=12, color=TEXT_MUTED),
+                    ft.Text(
+                        "Open ENM in your browser and navigate to this item, "
+                        "then choose Capture Screen, Browse for a saved PNG, or Skip.",
+                        size=12,
+                        color=TEXT_MUTED,
+                    ),
+                ],
+                tight=True,
+                spacing=8,
+            ),
+            actions=[
+                ft.TextButton("Skip", on_click=on_skip),
+                ft.TextButton("Browse...", on_click=on_browse),
+                ft.FilledButton("Capture Screen", on_click=on_capture),
+            ],
+        )
+
+        try:
+            if file_picker not in self.page.overlay:
+                self.page.overlay.append(file_picker)
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
+        except Exception as exc:
+            self._log_message(f"  [{band}] {category} ENM: Dialog failed ({exc}) — skipping")
+            return None
+
+        event.wait()
+        return result["path"]
+
     def _update_band_progress(self, band: str):
         """Increment band progress by one step and update the bar."""
         card = self.band_cards.get(band)
@@ -433,29 +532,139 @@ class ProgressPage:
                 self._update_band_status(band, "error")
 
     def _run_live(self, config, all_commands, generated_files):
+        """
+        Three-phase live run:
+          1. Moshell SSH in parallel (each band = one dedicated SSH session)
+          2. Shared ENM browser capture (one browser, four artifacts max)
+          3. Distribute ENM artifacts per-band + insert everything into Excel
+        """
+        MAX_PARALLEL = 3
+        band_items = list(all_commands.items())
+
+        # Phase 0 — shared sdir capture (one SSH session, reused by all bands)
+        self.status_text.value = "Phase 0/3: take sdir command"
+        self.mode_text.value = "Running sdir once (up to 15 min) — result is shared across all bands."
         try:
+            self.page.update()
+        except Exception:
+            pass
+        self._log_message("[sdir] Taking sdir command (shared across all bands)...")
+        shared_sdir_path = capture_shared_sdir_screenshot(config)
+        if shared_sdir_path:
+            self._log_message(f"[sdir] Shared capture OK -> {shared_sdir_path}")
+        else:
+            self._log_message("[sdir] Shared capture FAILED — VSWR sdir entries will be skipped")
+
+        if self.cancelled:
+            return
+
+        # Phase 1 — SSH parallel
+        self.status_text.value = f"Phase 1/3: moshell SSH (parallel x{MAX_PARALLEL})"
+        self.mode_text.value = f"Processing {len(band_items)} bands — each opens its own SSH session."
+        for band, _ in band_items:
+            self._update_band_status(band, "running")
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+        phase1: dict = {}  # band -> (excel_path, moshell_screenshots)
+        lock = threading.Lock()
+
+        def _moshell_worker(band: str, categories: dict):
+            self._log_message(f"[{band}] Opening SSH session...")
             with MoshellSession(config) as session:
-                self._log_message("SSH connection established.")
-                for idx, (band, categories) in enumerate(all_commands.items()):
-                    if self.cancelled:
-                        break
-                    self._update_band_status(band, "running")
-                    self.status_text.value = f"Processing {band}"
-                    self.mode_text.value = "Running moshell commands, ENM captures, and Excel updates."
-                    self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
-                    try:
-                        self.page.update()
-                    except Exception:
-                        pass
-                    try:
-                        excel_path = process_band(session, config, band, categories, is_first_band=(idx == 0))
-                        generated_files.append(excel_path)
-                        self._update_band_status(band, "done")
-                    except Exception as exc:
-                        self._log_message(f"Error processing band {band}: {exc}")
-                        self._update_band_status(band, "error")
-        except Exception as exc:
-            self._log_message(f"Connection error: {exc}")
-            for band, card in self.band_cards.items():
-                if card["state"].value != "Complete":
+                self._log_message(f"[{band}] SSH connected, running moshell commands.")
+                return run_moshell_for_band(
+                    session, config, band, categories, is_first_band=True,
+                    shared_sdir_screenshot=shared_sdir_path,
+                )
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+            futures = {
+                pool.submit(_moshell_worker, band, cats): band
+                for band, cats in band_items
+            }
+            for fut in as_completed(futures):
+                if self.cancelled:
+                    break
+                band = futures[fut]
+                try:
+                    excel_path, moshell = fut.result()
+                    with lock:
+                        phase1[band] = (excel_path, moshell)
+                    self._log_message(f"[{band}] Moshell phase done")
+                except Exception as exc:
+                    self._log_message(f"[{band}] Moshell phase error: {exc}")
                     self._update_band_status(band, "error")
+
+                self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
+                try:
+                    self.page.update()
+                except Exception:
+                    pass
+
+        if self.cancelled:
+            return
+
+        # Phase 2 — shared ENM (one browser session, four captures max)
+        self.status_text.value = "Phase 2/3: shared ENM capture"
+        self.mode_text.value = "Opening one Chromium session — SHM, Alarm, Cell Management (NR + LTE)."
+        try:
+            self.page.update()
+        except Exception:
+            pass
+        self._log_message("[ENM] Starting shared ENM capture phase.")
+        shared_enm = capture_enm_shared_artifacts(config)
+        self._log_message(
+            f"[ENM] Shared capture complete: "
+            f"SHM={'ok' if shared_enm['shm'] else 'FAIL'}, "
+            f"Alarm={'ok' if shared_enm['alarm'] else 'FAIL'}, "
+            f"CellNR={'ok' if shared_enm['cellmgmt_nr'] else 'FAIL'}, "
+            f"CellLTE={'ok' if shared_enm['cellmgmt_lte'] else 'FAIL'}"
+        )
+
+        if self.cancelled:
+            return
+
+        # Phase 3 — insert everything into Excel per-band
+        self.status_text.value = "Phase 3/3: building Excel reports"
+        self.mode_text.value = "Merging moshell + ENM screenshots per band."
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+        for band, (excel_path, moshell) in phase1.items():
+            if self.cancelled:
+                break
+            try:
+                categories = all_commands[band]
+                enm_for_band = build_enm_screenshots_for_band(
+                    band, categories, shared_enm, config
+                )
+                all_screenshots = {**moshell, **enm_for_band}
+
+                if not os.path.exists(excel_path):
+                    self._log_message(f"[{band}] Excel missing — re-creating from template")
+                    excel_path = create_band_excel(config, band)
+
+                try:
+                    insert_screenshots_for_band(excel_path, all_screenshots)
+                except FileNotFoundError:
+                    self._log_message(f"[{band}] Excel missing at insert — re-creating")
+                    excel_path = create_band_excel(config, band)
+                    insert_screenshots_for_band(excel_path, all_screenshots)
+
+                generated_files.append(excel_path)
+                self._update_band_status(band, "done")
+                self._log_message(f"[{band}] Complete -> {excel_path}")
+            except Exception as exc:
+                self._log_message(f"[{band}] Excel phase error: {exc}")
+                self._update_band_status(band, "error")
+
+            self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
+            try:
+                self.page.update()
+            except Exception:
+                pass

@@ -114,15 +114,29 @@ def insert_screenshots_for_band(
     """
     Insert all screenshots for a band into the appropriate sheets.
 
+    SSH (moshell) screenshots are placed first, then ENM screenshots are
+    appended below them on the same sheet so the two never overlap.
+
     Args:
         excel_path: Path to the Excel file
         screenshots: Dict mapping category to list of screenshot paths
-                     e.g., {"VSWR": ["path1.png"], "CELL": ["path2.png", "path3.png"]}
     """
     wb = load_workbook(excel_path)
 
-    for category, image_paths in screenshots.items():
-        # Determine target sheet
+    # Sort categories so SSH (parent) entries are processed before their
+    # matching _ENM entries on the same sheet. Unknown categories are skipped.
+    def sort_key(cat: str):
+        is_enm = 1 if cat.endswith("_ENM") else 0
+        return (is_enm, cat)
+
+    # Per-sheet cursor: tracks the next free row on each sheet across
+    # categories. openpyxl images are floating and do NOT advance
+    # ws.max_row, so we must track this ourselves.
+    next_row_by_sheet: Dict[str, int] = {}
+
+    for category in sorted(screenshots.keys(), key=sort_key):
+        image_paths = screenshots[category]
+
         if category in ENM_PARENT_CATEGORY:
             sheet_name = ENM_PARENT_CATEGORY[category]
         elif category in CATEGORY_TO_SHEET:
@@ -137,29 +151,36 @@ def insert_screenshots_for_band(
 
         ws = wb[sheet_name]
 
-        # Find the next available row for images
-        # Start after any existing content
-        start_row = ws.max_row + 2 if ws.max_row > 1 else 2
+        # First time touching this sheet — start just below the template header
+        if sheet_name not in next_row_by_sheet:
+            next_row_by_sheet[sheet_name] = max(ws.max_row + 2, 2)
 
-        for i, img_path in enumerate(image_paths):
+        start_row = next_row_by_sheet[sheet_name]
+
+        for img_path in image_paths:
             if not os.path.exists(img_path):
                 logger.warning(f"Screenshot not found: {img_path}")
                 continue
 
             img = XlImage(img_path)
-            cell = f"A{start_row}"
 
-            # Add label
+            # Label row above the image
+            label_row = start_row
+            image_row = start_row + 1
             if category.endswith("_ENM"):
-                ws[f"A{start_row - 1}"] = f"[ENM] {category.replace('_ENM', '')}"
+                ws[f"A{label_row}"] = f"[ENM] {category.replace('_ENM', '')}"
             else:
-                ws[f"A{start_row - 1}"] = category
+                ws[f"A{label_row}"] = category
 
-            ws.add_image(img, cell)
+            ws.add_image(img, f"A{image_row}")
 
-            # Estimate rows needed based on image height (rough: 1 row ~ 15px)
-            rows_for_image = max(5, int(img.height / 15) + 2) if img.height else 30
-            start_row += rows_for_image + 2
+            # Excel default row height is ~20px. Add a generous buffer so
+            # consecutive images never collide.
+            px_height = img.height or 600
+            rows_for_image = max(8, int(px_height / 18) + 3)
+            start_row = image_row + rows_for_image + 2
+
+        next_row_by_sheet[sheet_name] = start_row
 
     wb.save(excel_path)
     logger.info(f"All screenshots inserted into {excel_path}")
