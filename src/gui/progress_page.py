@@ -2,12 +2,14 @@
 TRFS GUI - Live run monitor.
 """
 import asyncio
+import gc
 import logging
 import os
 import re
 import shutil
 import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -464,6 +466,15 @@ class ProgressPage:
             state_text.color = DANGER
             pct_text.color = DANGER
             progress_bar.color = DANGER
+        elif status == "skipped":
+            container.bgcolor = ft.Colors.with_opacity(0.10, TEXT_MUTED)
+            container.border = ft.Border.all(1, ft.Colors.with_opacity(0.25, TEXT_MUTED))
+            state_text.value = "Skipped"
+            state_text.color = TEXT_MUTED
+            pct_text.value = "-"
+            pct_text.color = TEXT_MUTED
+            progress_bar.color = TEXT_MUTED
+            progress_bar.value = 0
 
         try:
             container.update()
@@ -477,10 +488,12 @@ class ProgressPage:
         logging.getLogger().addHandler(handler)
         self._log_handler = handler
 
+        # Non-daemon so Python waits for this thread on shutdown instead of
+        # killing it mid-Excel-write when the Flet session is GC'd.
         thread = threading.Thread(
             target=self._run_worker,
             args=(config, demo_mode, all_commands),
-            daemon=True,
+            daemon=False,
         )
         thread.start()
         self.page.trfs_run_thread = thread
@@ -494,9 +507,15 @@ class ProgressPage:
             else:
                 self._log_message(f"Opening SSH session to {config.ssh.host}:{config.ssh.port}.")
                 self._run_live(config, all_commands, generated_files)
-        except Exception as exc:
-            self._log_message(f"FATAL ERROR: {exc}")
-            logging.getLogger(__name__).error("Fatal error", exc_info=True)
+        except BaseException as exc:
+            tb = traceback.format_exc()
+            try:
+                self._log_message(f"FATAL ERROR: {exc}")
+                for line in tb.splitlines():
+                    self._log_message(f"  {line}")
+            except Exception:
+                pass
+            logging.getLogger(__name__).error("Fatal error in run worker\n%s", tb)
 
         self.page.trfs_generated_files = generated_files
         duration = datetime.now() - self.start_time
@@ -510,14 +529,33 @@ class ProgressPage:
 
         try:
             self.page.update()
-            asyncio.create_task(self.page.push_route("/result"))
         except Exception:
             pass
+        # _run_worker is a background thread — we can't asyncio.create_task
+        # here (no running loop in this thread). Hand the coroutine back to
+        # Flet's event loop via page.run_task (thread-safe).
+        try:
+            self.page.run_task(self.page.push_route, "/result")
+        except Exception:
+            try:
+                loop = getattr(self.page, "loop", None)
+                if loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self.page.push_route("/result"), loop
+                    )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to navigate to /result after run"
+                )
 
     def _run_demo(self, config, all_commands, generated_files):
         for idx, (band, categories) in enumerate(all_commands.items()):
             if self.cancelled:
                 break
+            if band.upper().startswith("G"):
+                self._log_message(f"[{band}] Skipped — GSM flow not implemented yet")
+                self._update_band_status(band, "skipped")
+                continue
             self._update_band_status(band, "running")
             self.status_text.value = f"Simulating {band}"
             self.mode_text.value = "Generating sample screenshots and Excel output."
@@ -541,8 +579,17 @@ class ProgressPage:
           2. Shared ENM browser capture (one browser, four artifacts max)
           3. Distribute ENM artifacts per-band + insert everything into Excel
         """
-        MAX_PARALLEL = 3
-        band_items = list(all_commands.items())
+        # Filter out GSM bands — GSM flow is not implemented yet.
+        all_items = list(all_commands.items())
+        gsm_items = [(b, c) for b, c in all_items if b.upper().startswith("G")]
+        band_items = [(b, c) for b, c in all_items if not b.upper().startswith("G")]
+        for gsm_band, _ in gsm_items:
+            self._log_message(f"[{gsm_band}] Skipped — GSM flow not implemented yet")
+            self._update_band_status(gsm_band, "skipped")
+        # Cap parallel SSH sessions to 3 — running all 8 bands at once has
+        # caused instability in the past. Extra bands queue and start as
+        # slots free up.
+        PARALLEL = max(1, min(3, len(band_items)))
 
         # Phase 0 — shared sdir capture (one SSH session, reused by all bands)
         self.status_text.value = "Phase 0/3: take sdir command"
@@ -552,7 +599,12 @@ class ProgressPage:
         except Exception:
             pass
         self._log_message("[sdir] Taking sdir command (shared across all bands)...")
-        shared_sdir_path = capture_shared_sdir_screenshot(config)
+        try:
+            shared_sdir_path = capture_shared_sdir_screenshot(config)
+        except Exception as exc:
+            self._log_message(f"[sdir] Shared capture raised: {exc}")
+            logging.getLogger(__name__).exception("Shared sdir capture failed")
+            shared_sdir_path = None
         if shared_sdir_path:
             self._log_message(f"[sdir] Shared capture OK -> {shared_sdir_path}")
         else:
@@ -561,8 +613,8 @@ class ProgressPage:
         if self.cancelled:
             return
 
-        # Phase 1 — SSH parallel
-        self.status_text.value = f"Phase 1/3: moshell SSH (parallel x{MAX_PARALLEL})"
+        # Phase 1 — SSH parallel (all bands concurrently)
+        self.status_text.value = f"Phase 1/3: moshell SSH (parallel x{PARALLEL})"
         self.mode_text.value = f"Processing {len(band_items)} bands — each opens its own SSH session."
         for band, _ in band_items:
             self._update_band_status(band, "running")
@@ -583,7 +635,7 @@ class ProgressPage:
                     shared_sdir_screenshot=shared_sdir_path,
                 )
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
             futures = {
                 pool.submit(_moshell_worker, band, cats): band
                 for band, cats in band_items
@@ -618,7 +670,18 @@ class ProgressPage:
         except Exception:
             pass
         self._log_message("[ENM] Starting shared ENM capture phase.")
-        shared_enm = capture_enm_shared_artifacts(config)
+        debug_msg = (
+            f"[ENM][debug] config.enm is {'set' if config.enm else 'None'}"
+            + (f", enabled={config.enm.enabled}, url={config.enm.url!r}" if config.enm else "")
+        )
+        self._log_message(debug_msg)
+        logging.getLogger(__name__).info(debug_msg)
+        try:
+            shared_enm = capture_enm_shared_artifacts(config)
+        except Exception as exc:
+            self._log_message(f"[ENM] Shared capture raised: {exc}")
+            logging.getLogger(__name__).exception("Shared ENM capture failed")
+            shared_enm = {"shm": None, "alarm": None, "cellmgmt_nr": None, "cellmgmt_lte": None}
         self._log_message(
             f"[ENM] Shared capture complete: "
             f"SHM={'ok' if shared_enm['shm'] else 'FAIL'}, "
@@ -641,6 +704,7 @@ class ProgressPage:
         for band, (excel_path, moshell) in phase1.items():
             if self.cancelled:
                 break
+            self._log_message(f"[Phase3] starting band {band}")
             try:
                 categories = all_commands[band]
                 enm_for_band = build_enm_screenshots_for_band(
@@ -662,9 +726,21 @@ class ProgressPage:
                 generated_files.append(excel_path)
                 self._update_band_status(band, "done")
                 self._log_message(f"[{band}] Complete -> {excel_path}")
-            except Exception as exc:
+            except BaseException as exc:
+                tb = traceback.format_exc()
                 self._log_message(f"[{band}] Excel phase error: {exc}")
+                for line in tb.splitlines():
+                    self._log_message(f"  {line}")
+                logging.getLogger(__name__).exception(
+                    "[%s] Excel phase crashed", band
+                )
                 self._update_band_status(band, "error")
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+                    raise
+            finally:
+                # Release openpyxl/PIL image buffers between bands so we
+                # don't accumulate hundreds of PNGs in memory across 8 bands.
+                gc.collect()
 
             self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
             try:

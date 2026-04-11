@@ -11,6 +11,8 @@ from typing import List
 class SiteConfig:
     shortcode: str
     node_name: str
+    gsm_node_name: str = ""
+    bsc_name: str = ""
 
 
 @dataclass
@@ -133,12 +135,16 @@ def build_config_from_form(
     password: str = "",
     commands_file: str = "",
     config_path: str | None = None,
+    gsm_node_name: str = "",
+    bsc_name: str = "",
 ) -> AppConfig:
     """Build an AppConfig from GUI form values, merging with existing config.yaml defaults."""
     if config_path and os.path.isfile(config_path):
         config = load_config(config_path)
         config.site.shortcode = shortcode
         config.site.node_name = node_name
+        config.site.gsm_node_name = gsm_node_name
+        config.site.bsc_name = bsc_name
         config.ssh.host = host
         config.ssh.port = port
         config.ssh.username = username
@@ -153,7 +159,12 @@ def build_config_from_form(
     else:
         base_dir = os.path.dirname(os.path.abspath(commands_file)) if commands_file else os.getcwd()
         config = AppConfig(
-            site=SiteConfig(shortcode=shortcode, node_name=node_name),
+            site=SiteConfig(
+                shortcode=shortcode,
+                node_name=node_name,
+                gsm_node_name=gsm_node_name,
+                bsc_name=bsc_name,
+            ),
             ssh=SSHConfig(
                 host=host,
                 port=port,

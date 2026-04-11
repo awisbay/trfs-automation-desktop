@@ -14,7 +14,10 @@ from gui.theme import BG_TOP
 
 
 def main(page: ft.Page):
-    page.title = "TRFS Command Studio"
+    page.title = "TRFS Generator — by ewisbay"
+    _icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "snapshot.ico")
+    if os.path.exists(_icon_path):
+        page.window.icon = _icon_path
     page.window.width = 1380
     page.window.height = 920
     page.window.min_width = 1080
@@ -81,4 +84,5 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    _assets = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ft.run(main, assets_dir=_assets)

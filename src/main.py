@@ -659,8 +659,8 @@ def main():
     parser.add_argument(
         "--parallel",
         type=int,
-        default=1,
-        help="Process N bands in parallel (each gets its own SSH session). Default: 1 (sequential)",
+        default=0,
+        help="Process N bands in parallel (each gets its own SSH session). Default: 0 = auto (all non-GSM bands concurrently)",
     )
     args = parser.parse_args()
 
@@ -709,6 +709,9 @@ def main():
         generated_files = []
 
         for i, (band, categories) in enumerate(bands_to_process.items()):
+            if band.upper().startswith("G"):
+                print(f"  [SKIP] {band} — GSM flow not implemented yet")
+                continue
             try:
                 excel_path = process_band_demo(config, band, categories, is_first_band=(i == 0))
                 generated_files.append(excel_path)
@@ -737,8 +740,20 @@ def main():
     print(f"  Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    parallel = max(1, args.parallel)
-    band_items = list(bands_to_process.items())
+    # Filter out GSM bands — GSM flow not implemented yet.
+    all_items = list(bands_to_process.items())
+    gsm_items = [(b, c) for b, c in all_items if b.upper().startswith("G")]
+    band_items = [(b, c) for b, c in all_items if not b.upper().startswith("G")]
+    for gsm_band, _ in gsm_items:
+        print(f"  [SKIP] {gsm_band} — GSM flow not implemented yet")
+        logger.info(f"[{gsm_band}] Skipped — GSM flow not implemented yet")
+
+    # Default: run every non-GSM band in parallel. User can still override
+    # with --parallel to cap concurrency (useful for debugging / rate limits).
+    if args.parallel and args.parallel > 0:
+        parallel = args.parallel
+    else:
+        parallel = max(1, len(band_items))
 
     # Phase 0 — shared sdir capture (one SSH session, runs once, reused by
     # every band). Must finish before Phase 1 so bands can reference it.

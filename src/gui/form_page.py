@@ -41,6 +41,8 @@ class FormPage:
         self.defaults = {
             "shortcode": "",
             "node_name": "",
+            "gsm_node_name": "",
+            "bsc_name": "",
             "host": "",
             "port": 5023,
             "username": "",
@@ -48,22 +50,43 @@ class FormPage:
             "commands_file": "",
             "config_path": "",
         }
-        try:
-            config_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "..", "config.yaml"
+        # form_page.py lives at src/gui/ — config.yaml is normally at the
+        # repo root. Walk upward from this file so we find it regardless of
+        # how the app was launched (CWD, frozen bundle, etc.).
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        config_path = ""
+        here = os.path.dirname(os.path.abspath(__file__))
+        for up in range(4):
+            candidate = os.path.normpath(
+                os.path.join(here, *([".."] * up), "config.yaml")
             )
-            if os.path.exists(config_path):
+            if os.path.isfile(candidate):
+                config_path = candidate
+                break
+        _log.info("[form] __file__=%s", os.path.abspath(__file__))
+        _log.info("[form] resolved config_path=%r (exists=%s)",
+                  config_path, bool(config_path))
+        if config_path:
+            # Always remember the path so downstream build_config_from_form
+            # loads enm/moshell/paths defaults — even if prefill below fails.
+            self.defaults["config_path"] = config_path
+            try:
                 config = load_config(config_path)
                 self.defaults["shortcode"] = config.site.shortcode
                 self.defaults["node_name"] = config.site.node_name
+                self.defaults["gsm_node_name"] = getattr(config.site, "gsm_node_name", "") or ""
+                self.defaults["bsc_name"] = getattr(config.site, "bsc_name", "") or ""
                 self.defaults["host"] = config.ssh.host
                 self.defaults["port"] = config.ssh.port
                 self.defaults["username"] = config.ssh.username
                 self.defaults["password"] = config.ssh.password
-                self.defaults["config_path"] = config_path
                 self.defaults["commands_file"] = os.path.join(config.base_dir, config.paths.commands)
-        except Exception:
-            pass
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed to prefill form defaults from config.yaml: %s", exc
+                )
 
         session = load_session()
         if session.get("host"):
@@ -83,9 +106,19 @@ class FormPage:
             autofocus=True,
         )
         self.node_name_field = self._text_field(
-            "Node Name",
+            "Node Name (LTE/NR)",
             self.defaults["node_name"],
             expand=2,
+        )
+        self.gsm_node_name_field = self._text_field(
+            "Node Name (GSM)",
+            self.defaults["gsm_node_name"],
+            expand=1,
+        )
+        self.bsc_name_field = self._text_field(
+            "BSC Name",
+            self.defaults["bsc_name"],
+            expand=1,
         )
         self.host_field = self._text_field("ENM IP", self.defaults["host"], expand=2)
         self.port_field = self._text_field("Port", str(self.defaults["port"]), expand=1)
@@ -144,7 +177,7 @@ class FormPage:
                 [
                     badge("Desktop Workflow", ACCENT, ft.Icons.DESKTOP_WINDOWS),
                     ft.Text(
-                        "TRFS Command Studio",
+                        "TRFS Generator",
                         size=42,
                         weight=ft.FontWeight.BOLD,
                         color=TEXT,
@@ -190,6 +223,20 @@ class FormPage:
                         padding=18,
                         border_color="#3A5F7C",
                     ),
+                    ft.Container(expand=True),
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.COPYRIGHT, size=12, color=TEXT_MUTED),
+                            ft.Text(
+                                "Crafted by ewisbay",
+                                size=11,
+                                color=TEXT_MUTED,
+                                weight=ft.FontWeight.W_500,
+                            ),
+                        ],
+                        spacing=6,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                 ],
                 spacing=18,
             ),
@@ -210,6 +257,10 @@ class FormPage:
                     self._section_label("Site Identity"),
                     ft.Row(
                         [self.shortcode_field, self.node_name_field],
+                        spacing=14,
+                    ),
+                    ft.Row(
+                        [self.gsm_node_name_field, self.bsc_name_field],
                         spacing=14,
                     ),
                     self._section_label("Access"),
@@ -357,6 +408,8 @@ class FormPage:
     def _on_start(self, e):
         shortcode = self.shortcode_field.value.strip()
         node_name = self.node_name_field.value.strip()
+        gsm_node_name = self.gsm_node_name_field.value.strip()
+        bsc_name = self.bsc_name_field.value.strip()
         host = self.host_field.value.strip()
         port = int(self.port_field.value.strip()) if self.port_field.value.strip() else 5023
         username = self.username_field.value.strip()
@@ -401,6 +454,8 @@ class FormPage:
             password=password,
             commands_file=commands_file,
             config_path=self.defaults.get("config_path") or None,
+            gsm_node_name=gsm_node_name,
+            bsc_name=bsc_name,
         )
 
         self.page.trfs_config = config
