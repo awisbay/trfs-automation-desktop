@@ -124,9 +124,10 @@ def build_config_from_form(
     shortcode: str,
     node_name: str,
     host: str,
-    username: str,
-    password: str,
-    commands_file: str,
+    port: int = 5023,
+    username: str = "",
+    password: str = "",
+    commands_file: str = "",
     config_path: str | None = None,
 ) -> AppConfig:
     """Build an AppConfig from GUI form values, merging with existing config.yaml defaults."""
@@ -135,6 +136,7 @@ def build_config_from_form(
         config.site.shortcode = shortcode
         config.site.node_name = node_name
         config.ssh.host = host
+        config.ssh.port = port
         config.ssh.username = username
         config.ssh.password = password
         config.paths.commands = os.path.basename(commands_file)
@@ -149,7 +151,7 @@ def build_config_from_form(
             site=SiteConfig(shortcode=shortcode, node_name=node_name),
             ssh=SSHConfig(
                 host=host,
-                port=5023,
+                port=port,
                 username=username,
                 password=password,
             ),

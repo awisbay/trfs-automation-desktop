@@ -76,7 +76,8 @@ class FormPage:
             self.defaults["node_name"],
             expand=2,
         )
-        self.host_field = self._text_field("SSH Host", self.defaults["host"], expand=1)
+        self.host_field = self._text_field("ENM IP", self.defaults["host"], expand=2)
+        self.port_field = self._text_field("Port", str(self.defaults["port"]), expand=1)
         self.username_field = self._text_field("Username", self.defaults["username"], expand=1)
         self.password_field = self._text_field(
             "Password",
@@ -202,7 +203,7 @@ class FormPage:
                     ),
                     self._section_label("Access"),
                     ft.Row(
-                        [self.host_field, self.username_field, self.password_field],
+                        [self.host_field, self.port_field, self.username_field, self.password_field],
                         spacing=14,
                     ),
                     self._section_label("Command Source"),
@@ -346,6 +347,7 @@ class FormPage:
         shortcode = self.shortcode_field.value.strip()
         node_name = self.node_name_field.value.strip()
         host = self.host_field.value.strip()
+        port = int(self.port_field.value.strip()) if self.port_field.value.strip() else 5023
         username = self.username_field.value.strip()
         password = self.password_field.value.strip()
         commands_file = self.commands_field.value.strip()
@@ -357,7 +359,7 @@ class FormPage:
         if not node_name:
             errors.append("Node name is required.")
         if not host and not demo_mode:
-            errors.append("SSH host is required unless demo mode is enabled.")
+            errors.append("ENM IP is required unless demo mode is enabled.")
         if not username and not demo_mode:
             errors.append("Username is required unless demo mode is enabled.")
         if not password and not demo_mode:
@@ -381,6 +383,7 @@ class FormPage:
             shortcode=shortcode,
             node_name=node_name,
             host=host,
+            port=port,
             username=username,
             password=password,
             commands_file=commands_file,
