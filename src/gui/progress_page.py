@@ -27,6 +27,14 @@ from main import (
     build_enm_screenshots_for_band,
 )
 from sdir_capture import capture_shared_sdir_screenshot
+from srs_capture import (
+    launch_edge_with_debug_port,
+    is_edge_debug_port_open,
+    SrsBrowserSession,
+    CDP_PORT,
+    SRS_BASE_URL,
+    _find_edge_exe,
+)
 from excel_writer import create_band_excel, insert_screenshots_for_band
 from ssh_runner import MoshellSession
 from config_loader import get_full_path
@@ -468,6 +476,86 @@ class ProgressPage:
         event.wait()
         return result["path"]
 
+    def _srs_login_dialog(self) -> bool:
+        """Show a dialog asking the user to log in to SRS via Azure SSO in Edge.
+
+        Blocks the worker thread until the user clicks Continue or Skip.
+        Returns True if user clicked Continue, False if skipped.
+        """
+        event = threading.Event()
+        result = {"continue": False}
+
+        def on_continue(_):
+            result["continue"] = True
+            try:
+                dialog.open = False
+                self.page.update()
+            except Exception:
+                pass
+            event.set()
+
+        def on_skip(_):
+            result["continue"] = False
+            try:
+                dialog.open = False
+                self.page.update()
+            except Exception:
+                pass
+            event.set()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("SRS Login Required"),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Microsoft Edge has been opened to srs.ericsson.com.",
+                        size=14,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    ft.Text(
+                        "Please log in using your Azure SSO credentials in the Edge window.\n\n"
+                        "Once you are fully logged in and can see the SRS dashboard, "
+                        "click Continue below to capture the screenshots.\n\n"
+                        "If you want to skip SRS screenshots, click Skip.",
+                        size=13,
+                        color=TEXT_MUTED,
+                    ),
+                    ft.Container(
+                        padding=ft.Padding(top=12, bottom=0, left=0, right=0),
+                        content=ft.Row(
+                            [
+                                ft.Icon(ft.Icons.INFO_OUTLINE, color=INFO, size=18),
+                                ft.Text(
+                                    "Edge is using your real profile so SSO cookies are preserved.",
+                                    size=11,
+                                    color=INFO,
+                                ),
+                            ],
+                            spacing=8,
+                        ),
+                    ),
+                ],
+                tight=True,
+                spacing=8,
+            ),
+            actions=[
+                ft.TextButton("Skip", on_click=on_skip),
+                ft.FilledButton("Continue — I'm logged in", on_click=on_continue),
+            ],
+        )
+
+        try:
+            self.page.dialog = dialog
+            dialog.open = True
+            self.page.update()
+        except Exception as exc:
+            self._log_message(f"[SRS] Login dialog failed ({exc}) — skipping")
+            return False
+
+        event.wait()
+        return result["continue"]
+
     def _update_band_progress(self, band: str):
         """Increment band progress by one step and update the bar.
         Called from _flush_log_queue on the UI thread — safe to mutate controls."""
@@ -668,7 +756,7 @@ class ProgressPage:
         PARALLEL = max(1, min(3, len(band_items)))
 
         # Phase 0 — shared sdir capture (one SSH session, reused by all bands)
-        self._log_queue.put_nowait("__STATUS__:Phase 0/3: take sdir command")
+        self._log_queue.put_nowait("__STATUS__:Phase 0/4: take sdir command")
         self._log_queue.put_nowait("__MODE__:Running sdir once (up to 15 min) — result is shared across all bands.")
         self._log_message("[sdir] Taking sdir command (shared across all bands)...")
         try:
@@ -686,7 +774,7 @@ class ProgressPage:
             return
 
         # Phase 1 — SSH parallel (all bands concurrently)
-        self._log_queue.put_nowait(f"__STATUS__:Phase 1/3: moshell SSH (parallel x{PARALLEL})")
+        self._log_queue.put_nowait(f"__STATUS__:Phase 1/4: moshell SSH (parallel x{PARALLEL})")
         self._log_queue.put_nowait(f"__MODE__:Processing {len(band_items)} bands — each opens its own SSH session.")
         for band, _ in band_items:
             self._update_band_status(band, "running")
@@ -728,7 +816,7 @@ class ProgressPage:
         # Wrap in a thread with a hard timeout so a Playwright hang never
         # blocks the entire run indefinitely.
         ENM_TIMEOUT_SECONDS = 180  # 3 minutes max for all ENM captures
-        self._log_queue.put_nowait("__STATUS__:Phase 2/3: shared ENM capture")
+        self._log_queue.put_nowait("__STATUS__:Phase 2/4: shared ENM capture")
         self._log_queue.put_nowait("__MODE__:Checking Chromium browser...")
         # Auto-install Chromium if missing (first run on a new machine)
         from enm_capture import ensure_chromium_installed
@@ -771,9 +859,62 @@ class ProgressPage:
         if self.cancelled:
             return
 
+        # Phase 2b — SRS browser capture (Edge CDP, user authenticates via Azure SSO)
+        srs_screenshots: dict[str, str] = {}  # category -> path
+        edge_exe = _find_edge_exe()
+        if edge_exe:
+            self._log_queue.put_nowait("__STATUS__:Phase 2b: SRS screenshot capture")
+            self._log_queue.put_nowait("__MODE__:Launching Edge for SRS — user must log in via Azure SSO.")
+            self._log_message("[SRS] Microsoft Edge found, starting SRS capture flow...")
+
+            # Launch Edge with debug port (non-blocking)
+            edge_proc = launch_edge_with_debug_port(SRS_BASE_URL, CDP_PORT)
+            if edge_proc:
+                # Show dialog and wait for user to confirm they're logged in
+                user_ready = self._srs_login_dialog()
+                if user_ready and not self.cancelled:
+                    if is_edge_debug_port_open(CDP_PORT):
+                        self._log_message("[SRS] CDP port open, connecting via Playwright...")
+                        try:
+                            screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
+                            srs_save_path = os.path.join(screenshots_dir, "SRS_overview.png")
+                            with SrsBrowserSession(port=CDP_PORT, debug_dir=screenshots_dir) as srs:
+                                if srs.check_logged_in():
+                                    self._log_message("[SRS] User is authenticated, capturing pages...")
+                                    result = srs.capture_page(
+                                        SRS_BASE_URL,
+                                        srs_save_path,
+                                        wait_ms=5000,
+                                    )
+                                    if result:
+                                        srs_screenshots["SRS"] = result
+                                        self._log_message(f"[SRS] Screenshot saved: {result}")
+                                    else:
+                                        self._log_message("[SRS] Screenshot capture failed")
+                                else:
+                                    self._log_message("[SRS] User does not appear logged in — skipping SRS capture")
+                        except Exception as exc:
+                            self._log_message(f"[SRS] Capture failed: {exc}")
+                            logging.getLogger(__name__).exception("SRS capture failed")
+                    else:
+                        self._log_message("[SRS] CDP port not reachable — skipping SRS capture")
+                else:
+                    self._log_message("[SRS] User skipped SRS login — no SRS screenshots")
+            else:
+                self._log_message("[SRS] Failed to launch Edge — skipping SRS capture")
+        else:
+            self._log_message("[SRS] Microsoft Edge not found — skipping SRS capture")
+
+        self._log_message(
+            f"[SRS] Capture complete: {len(srs_screenshots)} screenshot(s)"
+        )
+
+        if self.cancelled:
+            return
+
         # Phase 3 — insert everything into Excel per-band
-        self._log_queue.put_nowait("__STATUS__:Phase 3/3: building Excel reports")
-        self._log_queue.put_nowait("__MODE__:Merging moshell + ENM screenshots per band.")
+        self._log_queue.put_nowait("__STATUS__:Phase 3/4: building Excel reports")
+        self._log_queue.put_nowait("__MODE__:Merging moshell + ENM + SRS screenshots per band.")
 
         for band, (excel_path, moshell) in phase1.items():
             if self.cancelled:
@@ -784,7 +925,7 @@ class ProgressPage:
                 enm_for_band = build_enm_screenshots_for_band(
                     band, categories, shared_enm, config
                 )
-                all_screenshots = {**moshell, **enm_for_band}
+                all_screenshots = {**moshell, **enm_for_band, **srs_screenshots}
 
                 if not os.path.exists(excel_path):
                     self._log_message(f"[{band}] Excel missing — re-creating from template")
