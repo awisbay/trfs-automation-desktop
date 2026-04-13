@@ -54,16 +54,24 @@ class FormPage:
         # repo root. Walk upward from this file so we find it regardless of
         # how the app was launched (CWD, frozen bundle, etc.).
         import logging as _logging
+        from app_path import get_app_dir
         _log = _logging.getLogger(__name__)
         config_path = ""
-        here = os.path.dirname(os.path.abspath(__file__))
-        for up in range(4):
-            candidate = os.path.normpath(
-                os.path.join(here, *([".."] * up), "config.yaml")
-            )
-            if os.path.isfile(candidate):
-                config_path = candidate
-                break
+        # First check the app root (exe directory when frozen)
+        app_root = get_app_dir()
+        candidate = os.path.join(app_root, "config.yaml")
+        if os.path.isfile(candidate):
+            config_path = candidate
+        else:
+            # Fallback: walk upward from this source file
+            here = os.path.dirname(os.path.abspath(__file__))
+            for up in range(4):
+                candidate = os.path.normpath(
+                    os.path.join(here, *([".."] * up), "config.yaml")
+                )
+                if os.path.isfile(candidate):
+                    config_path = candidate
+                    break
         _log.info("[form] __file__=%s", os.path.abspath(__file__))
         _log.info("[form] resolved config_path=%r (exists=%s)",
                   config_path, bool(config_path))

@@ -30,6 +30,7 @@ class ResultPage:
 
     def build(self) -> ft.View:
         generated_files = getattr(self.page, "trfs_generated_files", []) or []
+        duration = getattr(self.page, "trfs_duration", "—")
 
         file_cards: list[ft.Control] = []
         for fpath in generated_files:
@@ -84,7 +85,26 @@ class ResultPage:
         hero = panel(
             ft.Column(
                 [
-                    badge("Run Complete", SUCCESS, ft.Icons.CHECK_CIRCLE),
+                    ft.Row(
+                        [
+                            badge("Run Complete", SUCCESS, ft.Icons.CHECK_CIRCLE),
+                            ft.Container(expand=True),
+                            ft.ElevatedButton(
+                                "Run Another Site",
+                                icon=ft.Icons.ARROW_BACK,
+                                style=primary_button_style(),
+                                on_click=lambda _: asyncio.create_task(self.page.push_route("/")),
+                            ),
+                            ft.ElevatedButton(
+                                "Close",
+                                icon=ft.Icons.CLOSE_ROUNDED,
+                                style=secondary_button_style(),
+                                on_click=lambda _: self.page.window.destroy(),
+                            ),
+                        ],
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                     ft.Text("Reports are ready", size=34, weight=ft.FontWeight.BOLD, color=TEXT),
                     ft.Text(
                         "Your TRFS output has been assembled and the generated files are ready for review.",
@@ -94,7 +114,8 @@ class ResultPage:
                     ft.Row(
                         [
                             self._metric("Files", str(len(generated_files)), SUCCESS),
-                            self._metric("State", "Success" if generated_files else "Review needed", INFO),
+                            self._metric("Duration", duration, INFO),
+                            self._metric("State", "Success" if generated_files else "Review needed", ACCENT),
                         ],
                         spacing=14,
                         wrap=True,
@@ -116,23 +137,6 @@ class ResultPage:
                         color=TEXT_MUTED,
                     ),
                     *file_cards,
-                    ft.Row(
-                        [
-                            ft.ElevatedButton(
-                                "Run Another Site",
-                                icon=ft.Icons.ARROW_BACK,
-                                style=primary_button_style(),
-                                on_click=lambda _: asyncio.create_task(self.page.push_route("/")),
-                            ),
-                            ft.ElevatedButton(
-                                "Close",
-                                icon=ft.Icons.CLOSE_ROUNDED,
-                                style=secondary_button_style(),
-                                on_click=lambda _: self.page.window.destroy(),
-                            ),
-                        ],
-                        spacing=12,
-                    ),
                 ],
                 spacing=16,
             ),
@@ -144,9 +148,9 @@ class ResultPage:
             route="/result",
             padding=0,
             spacing=0,
+            scroll=ft.ScrollMode.AUTO,
             controls=[
                 ft.Container(
-                    expand=True,
                     gradient=background_gradient(),
                     padding=ft.Padding.symmetric(horizontal=28, vertical=24),
                     content=ft.Column(

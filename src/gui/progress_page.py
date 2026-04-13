@@ -5,6 +5,7 @@ import asyncio
 import gc
 import logging
 import os
+import queue
 import re
 import shutil
 import sys
@@ -47,12 +48,16 @@ from gui.theme import (
 
 
 class FletLogHandler(logging.Handler):
-    def __init__(self, log_callback):
+    def __init__(self, log_queue):
         super().__init__()
-        self.log_callback = log_callback
+        self._queue = log_queue
 
     def emit(self, record):
-        self.log_callback(self.format(record))
+        # Thread-safe: just push to the queue, never touch UI
+        try:
+            self._queue.put_nowait(self.format(record))
+        except Exception:
+            pass
 
 
 class ProgressPage:
@@ -60,6 +65,8 @@ class ProgressPage:
         self.page = page
         self.cancelled = False
         self._log_handler = None
+        self._log_queue = queue.Queue()
+        self._run_finished = False
         self.back_button = ft.ElevatedButton(
             "Back to Form",
             icon=ft.Icons.ARROW_BACK,
@@ -99,11 +106,14 @@ class ProgressPage:
         self.band_current_step = {band: 0 for band in band_names}
 
         self.band_cards = {}
+        self.band_start_times = {}
+        self.band_elapsed = {}
         band_grid_controls = []
         for band in band_names:
             label = ft.Text(band, size=14, weight=ft.FontWeight.BOLD, color=TEXT)
             pct_text = ft.Text("0%", size=11, color=TEXT_MUTED)
             state = ft.Text("Queued", size=11, color=TEXT_MUTED)
+            timer_text = ft.Text("", size=11, color=TEXT_MUTED)
             progress_bar = ft.ProgressBar(
                 value=0,
                 bgcolor=ft.Colors.with_opacity(0.15, "#36556E"),
@@ -115,7 +125,7 @@ class ProgressPage:
                 content=ft.Column(
                     [
                         ft.Row(
-                            [label, ft.Row([pct_text, state], spacing=6)],
+                            [label, ft.Row([timer_text, pct_text, state], spacing=6)],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         ),
                         progress_bar,
@@ -131,6 +141,7 @@ class ProgressPage:
                 "container": chip,
                 "state": state,
                 "pct_text": pct_text,
+                "timer_text": timer_text,
                 "progress_bar": progress_bar,
             }
             band_grid_controls.append(chip)
@@ -299,26 +310,69 @@ class ProgressPage:
         )
 
     def _log_message(self, msg: str):
-        # Track per-band progress from log messages like "  [L900] VSWR: Running..."
-        for m in re.finditer(r"\[(\w+)\]", msg):
-            band_candidate = m.group(1)
-            if band_candidate in self.band_cards:
-                self._update_band_progress(band_candidate)
+        """Thread-safe: push message to queue for the UI timer to pick up."""
+        self._log_queue.put_nowait(msg)
+
+    def _flush_log_queue(self):
+        """Called on the main/UI thread by a periodic timer. Drains the
+        queue and batch-updates the log list so the user sees real-time output."""
+        dirty = False
+        while True:
+            try:
+                msg = self._log_queue.get_nowait()
+            except queue.Empty:
                 break
 
-        color = TEXT_MUTED
-        if "[WARNING]" in msg:
-            color = "#FFD27A"
-        elif "[ERROR]" in msg or "FATAL ERROR" in msg:
-            color = "#FF9D9D"
-        elif "[INFO]" in msg:
-            color = INFO
-        elif "Completed" in msg or "[OK]" in msg:
-            color = SUCCESS
+            # Handle band status updates pushed from worker threads
+            if msg.startswith("__BAND_STATUS__:"):
+                _, band, status = msg.split(":", 2)
+                self._apply_band_status(band, status)
+                dirty = True
+                continue
 
-        self.log_list.controls.append(
-            ft.Text(msg, size=12, color=color, selectable=True, font_family="Consolas")
-        )
+            # Handle status text updates pushed from worker threads
+            if msg.startswith("__STATUS__:"):
+                _, text = msg.split(":", 1)
+                self.status_text.value = text
+                dirty = True
+                continue
+            if msg.startswith("__MODE__:"):
+                _, text = msg.split(":", 1)
+                self.mode_text.value = text
+                dirty = True
+                continue
+
+            # Track per-band progress
+            for m in re.finditer(r"\[(\w+)\]", msg):
+                band_candidate = m.group(1)
+                if band_candidate in self.band_cards:
+                    self._update_band_progress(band_candidate)
+                    break
+
+            color = TEXT_MUTED
+            if "[WARNING]" in msg:
+                color = "#FFD27A"
+            elif "[ERROR]" in msg or "FATAL ERROR" in msg:
+                color = "#FF9D9D"
+            elif "[INFO]" in msg:
+                color = INFO
+            elif "Completed" in msg or "[OK]" in msg:
+                color = SUCCESS
+
+            self.log_list.controls.append(
+                ft.Text(msg, size=12, color=color, selectable=True, font_family="Consolas")
+            )
+            dirty = True
+
+        # Always tick running band timers and elapsed
+        now = datetime.now()
+        for band, start in self.band_start_times.items():
+            if band not in self.band_elapsed:  # still running
+                card = self.band_cards.get(band)
+                if card:
+                    card["timer_text"].value = str(now - start).split(".")[0]
+        self.elapsed_text.value = f"Elapsed {str(now - self.start_time).split('.')[0]}"
+
         if len(self.log_list.controls) > 600:
             self.log_list.controls = self.log_list.controls[-600:]
         try:
@@ -415,7 +469,8 @@ class ProgressPage:
         return result["path"]
 
     def _update_band_progress(self, band: str):
-        """Increment band progress by one step and update the bar."""
+        """Increment band progress by one step and update the bar.
+        Called from _flush_log_queue on the UI thread — safe to mutate controls."""
         card = self.band_cards.get(band)
         if not card:
             return
@@ -425,13 +480,14 @@ class ProgressPage:
         pct = self.band_current_step[band] / self.band_total_steps[band]
         card["pct_text"].value = f"{int(pct * 100)}%"
         card["progress_bar"].value = pct
-        try:
-            card["progress_bar"].update()
-            card["pct_text"].update()
-        except Exception:
-            pass
+        # No individual update() here — _flush_log_queue does one batch page.update()
 
     def _update_band_status(self, band: str, status: str):
+        """Thread-safe: push a status change that the UI timer will apply."""
+        self._log_queue.put_nowait(f"__BAND_STATUS__:{band}:{status}")
+
+    def _apply_band_status(self, band: str, status: str):
+        """Apply band card visual state. Called on the UI thread only."""
         card = self.band_cards.get(band)
         if not card:
             return
@@ -439,18 +495,27 @@ class ProgressPage:
         container: ft.Container = card["container"]
         state_text: ft.Text = card["state"]
         pct_text: ft.Text = card["pct_text"]
+        timer_text: ft.Text = card["timer_text"]
         progress_bar: ft.ProgressBar = card["progress_bar"]
 
         if status == "running":
+            self.band_start_times[band] = datetime.now()
             container.bgcolor = ft.Colors.with_opacity(0.16, INFO)
             container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, INFO))
             state_text.value = "Running"
             state_text.color = INFO
             pct_text.color = INFO
             pct_text.value = "0%"
+            timer_text.color = INFO
             progress_bar.color = INFO
             progress_bar.value = 0
         elif status == "done":
+            # Freeze the final elapsed time
+            if band in self.band_start_times:
+                elapsed = datetime.now() - self.band_start_times[band]
+                self.band_elapsed[band] = elapsed
+                timer_text.value = str(elapsed).split(".")[0]
+            timer_text.color = SUCCESS
             container.bgcolor = ft.Colors.with_opacity(0.16, SUCCESS)
             container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, SUCCESS))
             state_text.value = "Complete"
@@ -460,6 +525,11 @@ class ProgressPage:
             progress_bar.color = SUCCESS
             progress_bar.value = 1.0
         elif status == "error":
+            if band in self.band_start_times:
+                elapsed = datetime.now() - self.band_start_times[band]
+                self.band_elapsed[band] = elapsed
+                timer_text.value = str(elapsed).split(".")[0]
+            timer_text.color = DANGER
             container.bgcolor = ft.Colors.with_opacity(0.16, DANGER)
             container.border = ft.Border.all(1, ft.Colors.with_opacity(0.38, DANGER))
             state_text.value = "Failed"
@@ -473,20 +543,27 @@ class ProgressPage:
             state_text.color = TEXT_MUTED
             pct_text.value = "-"
             pct_text.color = TEXT_MUTED
+            timer_text.value = ""
             progress_bar.color = TEXT_MUTED
             progress_bar.value = 0
 
-        try:
-            container.update()
-        except Exception:
-            pass
-
     def _start_run(self, config, demo_mode, all_commands):
-        handler = FletLogHandler(self._log_message)
+        handler = FletLogHandler(self._log_queue)
         handler.setLevel(logging.INFO)
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
         logging.getLogger().addHandler(handler)
         self._log_handler = handler
+
+        # Start a periodic timer on the UI thread to flush the log queue
+        # every 500ms so the user sees real-time output.
+        async def _poll_logs():
+            while not self._run_finished:
+                self._flush_log_queue()
+                await asyncio.sleep(0.5)
+            # Final flush after worker finishes
+            self._flush_log_queue()
+
+        self.page.run_task(_poll_logs)
 
         # Non-daemon so Python waits for this thread on shutdown instead of
         # killing it mid-Excel-write when the Flet session is GC'd.
@@ -519,6 +596,7 @@ class ProgressPage:
 
         self.page.trfs_generated_files = generated_files
         duration = datetime.now() - self.start_time
+        self.page.trfs_duration = str(duration).split(".")[0]
         self.status_text.value = "Automation complete"
         self.mode_text.value = f"Run finished in {duration}."
         self.elapsed_text.value = ""
@@ -526,6 +604,9 @@ class ProgressPage:
 
         if self._log_handler:
             logging.getLogger().removeHandler(self._log_handler)
+
+        # Signal the UI poll loop to stop after one final flush
+        self._run_finished = True
 
         try:
             self.page.update()
@@ -557,13 +638,8 @@ class ProgressPage:
                 self._update_band_status(band, "skipped")
                 continue
             self._update_band_status(band, "running")
-            self.status_text.value = f"Simulating {band}"
-            self.mode_text.value = "Generating sample screenshots and Excel output."
-            self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
-            try:
-                self.page.update()
-            except Exception:
-                pass
+            self._log_queue.put_nowait(f"__STATUS__:Simulating {band}")
+            self._log_queue.put_nowait("__MODE__:Generating sample screenshots and Excel output.")
             try:
                 excel_path = process_band_demo(config, band, categories, is_first_band=(idx == 0))
                 generated_files.append(excel_path)
@@ -592,12 +668,8 @@ class ProgressPage:
         PARALLEL = max(1, min(3, len(band_items)))
 
         # Phase 0 — shared sdir capture (one SSH session, reused by all bands)
-        self.status_text.value = "Phase 0/3: take sdir command"
-        self.mode_text.value = "Running sdir once (up to 15 min) — result is shared across all bands."
-        try:
-            self.page.update()
-        except Exception:
-            pass
+        self._log_queue.put_nowait("__STATUS__:Phase 0/3: take sdir command")
+        self._log_queue.put_nowait("__MODE__:Running sdir once (up to 15 min) — result is shared across all bands.")
         self._log_message("[sdir] Taking sdir command (shared across all bands)...")
         try:
             shared_sdir_path = capture_shared_sdir_screenshot(config)
@@ -614,14 +686,10 @@ class ProgressPage:
             return
 
         # Phase 1 — SSH parallel (all bands concurrently)
-        self.status_text.value = f"Phase 1/3: moshell SSH (parallel x{PARALLEL})"
-        self.mode_text.value = f"Processing {len(band_items)} bands — each opens its own SSH session."
+        self._log_queue.put_nowait(f"__STATUS__:Phase 1/3: moshell SSH (parallel x{PARALLEL})")
+        self._log_queue.put_nowait(f"__MODE__:Processing {len(band_items)} bands — each opens its own SSH session.")
         for band, _ in band_items:
             self._update_band_status(band, "running")
-        try:
-            self.page.update()
-        except Exception:
-            pass
 
         phase1: dict = {}  # band -> (excel_path, moshell_screenshots)
         lock = threading.Lock()
@@ -653,22 +721,23 @@ class ProgressPage:
                     self._log_message(f"[{band}] Moshell phase error: {exc}")
                     self._update_band_status(band, "error")
 
-                self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
-                try:
-                    self.page.update()
-                except Exception:
-                    pass
-
         if self.cancelled:
             return
 
         # Phase 2 — shared ENM (one browser session, four captures max)
-        self.status_text.value = "Phase 2/3: shared ENM capture"
-        self.mode_text.value = "Opening one Chromium session — SHM, Alarm, Cell Management (NR + LTE)."
-        try:
-            self.page.update()
-        except Exception:
-            pass
+        # Wrap in a thread with a hard timeout so a Playwright hang never
+        # blocks the entire run indefinitely.
+        ENM_TIMEOUT_SECONDS = 180  # 3 minutes max for all ENM captures
+        self._log_queue.put_nowait("__STATUS__:Phase 2/3: shared ENM capture")
+        self._log_queue.put_nowait("__MODE__:Checking Chromium browser...")
+        # Auto-install Chromium if missing (first run on a new machine)
+        from enm_capture import ensure_chromium_installed
+        chromium_ok = ensure_chromium_installed()
+        if chromium_ok:
+            self._log_message("[ENM] Chromium browser is ready.")
+        else:
+            self._log_message("[ENM] Chromium not available — ENM screenshots will be skipped.")
+        self._log_queue.put_nowait("__MODE__:Opening one Chromium session — SHM, Alarm, Cell Management (NR + LTE).")
         self._log_message("[ENM] Starting shared ENM capture phase.")
         debug_msg = (
             f"[ENM][debug] config.enm is {'set' if config.enm else 'None'}"
@@ -676,12 +745,21 @@ class ProgressPage:
         )
         self._log_message(debug_msg)
         logging.getLogger(__name__).info(debug_msg)
-        try:
-            shared_enm = capture_enm_shared_artifacts(config)
-        except Exception as exc:
-            self._log_message(f"[ENM] Shared capture raised: {exc}")
-            logging.getLogger(__name__).exception("Shared ENM capture failed")
-            shared_enm = {"shm": None, "alarm": None, "cellmgmt_nr": None, "cellmgmt_lte": None}
+        shared_enm = {"shm": None, "alarm": None, "cellmgmt_nr": None, "cellmgmt_lte": None}
+        if not chromium_ok:
+            self._log_message("[ENM] Skipping browser capture (no Chromium).")
+        else:
+            try:
+                enm_future = ThreadPoolExecutor(max_workers=1).submit(
+                    capture_enm_shared_artifacts, config
+                )
+                shared_enm = enm_future.result(timeout=ENM_TIMEOUT_SECONDS)
+            except TimeoutError:
+                self._log_message(f"[ENM] Timed out after {ENM_TIMEOUT_SECONDS}s — skipping ENM screenshots")
+                logging.getLogger(__name__).warning("ENM capture timed out after %ds", ENM_TIMEOUT_SECONDS)
+            except Exception as exc:
+                self._log_message(f"[ENM] Shared capture raised: {exc}")
+                logging.getLogger(__name__).exception("Shared ENM capture failed")
         self._log_message(
             f"[ENM] Shared capture complete: "
             f"SHM={'ok' if shared_enm['shm'] else 'FAIL'}, "
@@ -694,12 +772,8 @@ class ProgressPage:
             return
 
         # Phase 3 — insert everything into Excel per-band
-        self.status_text.value = "Phase 3/3: building Excel reports"
-        self.mode_text.value = "Merging moshell + ENM screenshots per band."
-        try:
-            self.page.update()
-        except Exception:
-            pass
+        self._log_queue.put_nowait("__STATUS__:Phase 3/3: building Excel reports")
+        self._log_queue.put_nowait("__MODE__:Merging moshell + ENM screenshots per band.")
 
         for band, (excel_path, moshell) in phase1.items():
             if self.cancelled:
@@ -741,9 +815,3 @@ class ProgressPage:
                 # Release openpyxl/PIL image buffers between bands so we
                 # don't accumulate hundreds of PNGs in memory across 8 bands.
                 gc.collect()
-
-            self.elapsed_text.value = f"Elapsed {datetime.now() - self.start_time}"
-            try:
-                self.page.update()
-            except Exception:
-                pass

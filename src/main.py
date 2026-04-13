@@ -14,6 +14,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from app_path import get_app_dir
 from config_loader import load_config, get_full_path, AppConfig, _apply_shortcode_paths
 from command_parser import parse_commands_file, get_moshell_categories
 from ssh_runner import MoshellSession
@@ -30,12 +31,13 @@ from enm_capture import (
 from sdir_capture import capture_shared_sdir_screenshot
 
 # Setup logging
+os.makedirs(os.path.join(get_app_dir(), "logs"), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("trfs_automation.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(get_app_dir(), "logs", "trfs_automation.log"), encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)

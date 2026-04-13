@@ -15,12 +15,83 @@ from config_loader import AppConfig
 
 logger = logging.getLogger(__name__)
 
+import sys
+
+# When running as a PyInstaller frozen exe, Playwright's PipeTransport
+# auto-sets PLAYWRIGHT_BROWSERS_PATH=0, which makes it look for browsers
+# inside the bundle directory.  We don't bundle browsers (too large ~500MB),
+# so we pre-set the env var to the default system cache so Playwright finds
+# the normally-installed Chromium.
+if getattr(sys, "frozen", False) and "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+    if os.name == "nt":
+        _default = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+    else:
+        _default = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _default
+
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logger.info("playwright not available - ENM browser capture will be manual only")
+
+
+def ensure_chromium_installed() -> bool:
+    """Check if Playwright Chromium is installed; auto-install if missing.
+
+    Returns True if Chromium is ready to use, False otherwise.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return False
+
+    import subprocess
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    node_exe, cli_js = compute_driver_executable()
+    env = get_driver_env()
+
+    # Quick check: ask Playwright for the browser path
+    try:
+        result = subprocess.run(
+            [node_exe, cli_js, "install", "--dry-run", "chromium"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        # If dry-run shows "browser is already installed" there's nothing to do.
+        if result.returncode == 0 and "already installed" in result.stdout.lower():
+            return True
+    except Exception:
+        pass
+
+    # Try launching chromium directly — fastest real check
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        browser.close()
+        pw.stop()
+        return True
+    except Exception:
+        pass
+
+    # Chromium not found — install it
+    logger.info("[ENM] Chromium not found, installing automatically...")
+    try:
+        result = subprocess.run(
+            [node_exe, cli_js, "install", "chromium"],
+            env=env, capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            logger.info("[ENM] Chromium installed successfully")
+            return True
+        else:
+            logger.warning(f"[ENM] Chromium install failed: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("[ENM] Chromium install timed out after 5 minutes")
+        return False
+    except Exception as exc:
+        logger.warning(f"[ENM] Chromium install error: {exc}")
+        return False
 
 try:
     import pyautogui

@@ -4,7 +4,9 @@ Persist last-used SSH session to disk so values survive app restarts.
 import json
 import os
 
-_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session.json")
+from app_path import get_app_dir
+
+_SESSION_FILE = os.path.join(get_app_dir(), ".session.json")
 
 _SESSION_KEYS = ("host", "port", "username", "password")
 
