@@ -30,6 +30,7 @@ from sdir_capture import capture_shared_sdir_screenshot
 from srs_capture import (
     launch_edge_with_debug_port,
     is_edge_debug_port_open,
+    wait_for_cdp_ready,
     SrsBrowserSession,
     CDP_PORT,
     SRS_BASE_URL,

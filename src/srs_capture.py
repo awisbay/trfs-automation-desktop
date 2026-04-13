@@ -285,18 +285,22 @@ class SrsBrowserSession:
         monitoring_url: str = "https://srs.connected-operations.ericsson.net/MeasurementMonitoring/Index/3cdbda8f-eaa4-462d-9243-86720c5a72b9",
         viewport_width: int = 1920,
         viewport_height: int = 1080,
-    ) -> Optional[str]:
+    ) -> Optional[dict[str, str]]:
         """Navigate the SRS Measurement Monitoring page, filter by segment,
-        select MEASUREMENT_OK status, and click into the first result's detail view.
+        select MEASUREMENT_OK status, click into the first result's detail view,
+        and capture screenshots of the map, measurement details, and full page.
 
         Steps:
           1. Navigate to the monitoring URL
           2. Expand "Segment" accordion and fill in segment_name
           3. Expand "Status" accordion and check MEASUREMENT_OK
           4. Click the zoom/details button on the first result row
-          5. Screenshot the detail page
+          5. Wait for detail page to load
+          6. Capture the canvas/map element
+          7. Expand collapsed accordions and capture measurement details
+          8. Capture full-page screenshot
 
-        Returns the save_path on success, None on failure.
+        Returns a dict of {name: filepath} on success, None on failure.
         """
         if not self._browser or not self._browser.contexts:
             logger.error("[SRS] No browser context available")
@@ -401,11 +405,78 @@ class SrsBrowserSession:
                 logger.warning("[SRS] Taking screenshot of the filtered table view instead")
                 self._save_debug(page, "04_no_results")
 
-            # --- Step 5: Take the final screenshot ---
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            page.screenshot(path=save_path, full_page=True)
-            logger.info(f"[SRS] Measurement monitoring screenshot saved: {save_path}")
-            return save_path
+            # --- Step 5: Wait for detail page content to fully load ---
+            try:
+                page.locator(".measurementDetailsWrapper").first.wait_for(
+                    state="visible", timeout=15000
+                )
+                logger.info("[SRS] Detail page measurement details loaded")
+            except Exception:
+                logger.warning("[SRS] Measurement details wrapper not found — page may still be loading")
+            self._save_debug(page, "05_detail_content_loaded")
+
+            results: dict[str, str] = {}
+            save_dir = os.path.dirname(save_path)
+            os.makedirs(save_dir, exist_ok=True)
+
+            # --- Step 6: Capture canvas/map element ---
+            try:
+                # The map may be inside an iframe or dynamically loaded — wait a moment
+                page.wait_for_timeout(2000)
+                canvas = page.locator("canvas").first
+                if canvas.count() > 0 and canvas.is_visible():
+                    canvas_path = os.path.join(save_dir, f"SRS_map_{segment_name}.png")
+                    canvas.screenshot(path=canvas_path)
+                    results["map"] = canvas_path
+                    logger.info(f"[SRS] Map (canvas) screenshot saved: {canvas_path}")
+                else:
+                    logger.warning("[SRS] Canvas element not visible on detail page")
+            except Exception as exc:
+                logger.warning(f"[SRS] Map (canvas) capture failed: {exc}")
+            self._save_debug(page, "06_map_capture_attempted")
+
+            # --- Step 7: Expand collapsed accordions and capture measurement details ---
+            try:
+                closed_accordions = page.locator(
+                    ".measurementDetailsWrapper .accordion:not(.accordion-opened) .accordion-header"
+                )
+                count = closed_accordions.count()
+                for i in range(count):
+                    try:
+                        closed_accordions.nth(i).click()
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                if count > 0:
+                    logger.info(f"[SRS] Expanded {count} collapsed accordion(s) in measurement details")
+                    page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            try:
+                details = page.locator(".measurementDetailsWrapper").first
+                if details.is_visible():
+                    details_path = os.path.join(
+                        save_dir, f"SRS_measurement_details_{segment_name}.png"
+                    )
+                    details.screenshot(path=details_path)
+                    results["measurement_details"] = details_path
+                    logger.info(f"[SRS] Measurement details screenshot saved: {details_path}")
+                else:
+                    logger.warning("[SRS] Measurement details wrapper not visible")
+            except Exception as exc:
+                logger.warning(f"[SRS] Measurement details capture failed: {exc}")
+            self._save_debug(page, "07_details_capture_attempted")
+
+            # --- Step 8: Full-page screenshot ---
+            try:
+                page.screenshot(path=save_path, full_page=True)
+                results["full_page"] = save_path
+                logger.info(f"[SRS] Full page screenshot saved: {save_path}")
+            except Exception as exc:
+                logger.error(f"[SRS] Full page screenshot failed: {exc}")
+
+            return results if results else None
 
         except Exception as exc:
             logger.error(f"[SRS] Measurement monitoring capture failed: {exc}")
