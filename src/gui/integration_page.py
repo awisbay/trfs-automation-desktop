@@ -509,25 +509,17 @@ class IntegrationRunPage:
 
     # ── Logging ──────────────────────────────────────────────────
     def _ui_log(self, msg: str):
-        """High-level log shown in the UI panel."""
+        """High-level log shown in the UI panel only (not saved to file)."""
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         self._log_queue.put_nowait(line)
 
     def _detail_log(self, msg: str):
-        """Full-detail log saved to file only (not shown in UI)."""
+        """Full-detail log saved to step log files only (not shown in UI)."""
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         with self._session_log_lock:
             self._session_log.append(line)
-
-    def _log_both(self, msg: str):
-        """Log to both UI and session file."""
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        with self._session_log_lock:
-            self._session_log.append(line)
-        self._log_queue.put_nowait(line)
 
     def _save_step_log(self, step_number: int, node_name: str, log_suffix: str):
         """Save full session log snapshot to LOG/<SHORTCODE>/NN_NODE_SUFFIX.txt."""
@@ -707,10 +699,10 @@ class IntegrationRunPage:
     def _run_workflow(self):
         from concurrent.futures import ThreadPoolExecutor
 
-        self._log_both("Starting integration workflow...")
-        self._log_both(f"Shortcode: {self.shortcode}")
-        self._log_both(f"Log directory: {self.log_dir}")
-        self._log_both(
+        self._ui_log("Starting integration workflow...")
+        self._ui_log(f"Shortcode: {self.shortcode}")
+        self._ui_log(f"Log directory: {self.log_dir}")
+        self._ui_log(
             f"LTE/NR: {self.lte_name}  IP: {self.lte_ip}  "
             f"Subnet: {self.lte_subnet}")
 
@@ -718,17 +710,17 @@ class IntegrationRunPage:
         for key, label, _, _ in INTEGRATION_STEPS:
             if key in self.selected_steps:
                 selected_names.append(label)
-        self._log_both(f"Selected steps: {', '.join(selected_names)}")
+        self._ui_log(f"Selected steps: {', '.join(selected_names)}")
 
         if self.has_gsm:
-            self._log_both(
+            self._ui_log(
                 f"GSM: {self.gsm_name}  IP: {self.gsm_ip}  "
                 f"Subnet: {self.gsm_subnet}")
         else:
             for key, label, applies_to, _ in INTEGRATION_STEPS:
                 if applies_to in ("both", "gsm"):
                     self._set_step("gsm", key, "skip", "No GSM node")
-        self._log_both("")
+        self._ui_log("")
 
         futures = {}
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -755,7 +747,7 @@ class IntegrationRunPage:
                     future.result()
                 except Exception as exc:
                     lbl = "LTE/NR" if fkey == "lte" else "GSM"
-                    self._log_both(f"[{lbl}] Node workflow failed: {exc}")
+                    self._ui_log(f"[{lbl}] Node workflow failed: {exc}")
                     logger.exception(f"Integration {lbl} failed")
 
         self._timer_running = False
@@ -763,8 +755,8 @@ class IntegrationRunPage:
         self.status_text.value = "Integration complete"
         self.cancel_button.visible = False
         self.back_button.visible = True
-        self._log_both("")
-        self._log_both(f"All steps finished. Logs saved to: {self.log_dir}")
+        self._ui_log("")
+        self._ui_log(f"All steps finished. Logs saved to: {self.log_dir}")
         try:
             self.page.update()
         except Exception:
@@ -798,7 +790,7 @@ class IntegrationRunPage:
 
         def ui_cb(msg: str):
             """High-level — shown in UI log panel."""
-            self._log_both(f"[{label}] {msg}")
+            self._ui_log(f"[{label}] {msg}")
 
         # Connect SSH
         try:
