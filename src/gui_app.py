@@ -9,9 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flet as ft
 from gui.form_page import FormPage
 from gui.integration_page import IntegrationPage, IntegrationRunPage
+from gui.license_page import LicensePage
 from gui.progress_page import ProgressPage
 from gui.result_page import ResultPage
 from gui.theme import BG_TOP
+from license_manager import load_saved_license
 
 
 def main(page: ft.Page):
@@ -50,7 +52,9 @@ def main(page: ft.Page):
     page.window.frameless = False
 
     def build_view(route: str) -> ft.View:
-        if route in ("", "/", "/form"):
+        if route == "/license":
+            return LicensePage(page).build()
+        elif route in ("", "/", "/form"):
             return FormPage(page).build()
         elif route == "/progress":
             return ProgressPage(page).build()
@@ -80,10 +84,19 @@ def main(page: ft.Page):
     page.on_route_change = route_change
     page.on_view_pop = view_pop
 
-    # Initial render
+    # Initial render — check license first
+    license_result = load_saved_license()
+    start_route = "/form" if license_result["valid"] else "/license"
+
+    if license_result["valid"]:
+        p = license_result["payload"]
+        print(f"[LICENSE] Valid — user={p.get('user')}, expires={p.get('expires')}")
+    else:
+        print(f"[LICENSE] {license_result['error']} — showing activation screen")
+
     print(f"[INIT] Initial views={len(page.views)}, route={page.route}")
     page.views.clear()
-    page.views.append(build_view("/form"))
+    page.views.append(build_view(start_route))
     print(f"[INIT] After append views={len(page.views)}")
     page.update()
     print(f"[INIT] After update views={len(page.views)}")

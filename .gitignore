@@ -14,3 +14,5 @@ config.yaml
 .session.json
 src/.session.json
 logs/
+nodecraft_keygen.py
+license.key
