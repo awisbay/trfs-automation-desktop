@@ -418,13 +418,42 @@ def run_create_arne(
         (success: bool, full_output: str)
     """
     log_cb(f"Running create_arne.py for {node_name}...")
+    log_cb(f"  Node: {node_name}  IP: {node_ip}  Subnetwork: {subnetwork}")
 
-    # Step 1: Run the ARNE creation script
+    # Step 0: Ping the node IP to verify reachability
+    log_cb(f"Pinging {node_ip}...")
+    ping_out = ssh.run_command(f"ping -c 3 -W 5 {node_ip}", timeout=30)
+    log_cb(f"Ping output:\n{ping_out}")
+
+    if "0 received" in ping_out or "100% packet loss" in ping_out \
+            or "unreachable" in ping_out.lower():
+        msg = (
+            f"Node IP {node_ip} is not reachable (ping failed).\n\n"
+            f"Please check the IP address and network connectivity."
+        )
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(msg)
+            if not retry:
+                return False, ping_out
+            # Retry ping
+            ping_out2 = ssh.run_command(f"ping -c 3 -W 5 {node_ip}", timeout=30)
+            log_cb(f"Retry ping:\n{ping_out2}")
+            if "0 received" in ping_out2 or "100% packet loss" in ping_out2 \
+                    or "unreachable" in ping_out2.lower():
+                log_cb("✗ Ping still failed after retry.")
+                return False, ping_out + "\n" + ping_out2
+        else:
+            return False, ping_out
+
+    log_cb(f"✓ Node IP {node_ip} is reachable.")
+
+    # Step 1: Run the ARNE creation script (interactive prompts)
     output = ssh.run_interactive(
         command=f"python {SCRIPTS_PATH}/{_CREATE_ARNE}",
         prompts=[
             ("nodename",   node_name),
-            ("ipaddress",  node_ip),
+            ("ip address", node_ip),
             ("subnetwork", subnetwork),
         ],
         final_timeout=120,
