@@ -1210,29 +1210,25 @@ def run_relation(
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
 ) -> tuple[bool, str]:
-    """Upload relation zip, unzip, find node folder, run each txt file.
+    """Upload relation file and run it on the node.
 
-    Sub-steps:
-      1. SFTP upload zip to /home/shared/<user>/RELATION/<SHORTCODE>/
-      2. Unzip on server
-      3. Find folder matching node_name inside the extracted content
-      4. List all .txt files in that folder
-      5. Run each file one by one with ``run <filepath>``
-      6. Save a separate log per relation file
-      7. Summarize errors (grep placeholder for later)
+    Supports two input types:
+      - **.xml** → upload, run ``netconf /path/file.xml``, check for <ok/> or </error-message>
+      - **.zip** → upload, unzip, find node folder, run each .txt with ``run <filepath>``
 
     Returns:
         (success: bool, full_output: str)
     """
     all_output = ""
-    zip_filename = os.path.basename(relation_local_path)
+    filename = os.path.basename(relation_local_path)
+    is_xml = filename.lower().endswith(".xml")
 
-    # ── 1. Upload relation zip via SFTP ──────────────────────────
+    # ── 1. Upload relation file via SFTP ─────────────────────────
     remote_dir = f"/home/shared/{ssh.username}/RELATION/{shortcode}"
-    log_cb(f"Uploading relation file: {zip_filename} → {remote_dir}/")
+    log_cb(f"Uploading relation file: {filename} → {remote_dir}/")
     try:
         ssh.sftp_upload(relation_local_path, remote_dir)
-        all_output += f"[SFTP] Uploaded {zip_filename} → {remote_dir}/{zip_filename}\n"
+        all_output += f"[SFTP] Uploaded {filename} → {remote_dir}/{filename}\n"
         log_cb(f"✓ Relation file uploaded.")
     except Exception as exc:
         msg = f"SFTP upload failed: {exc}"
@@ -1247,6 +1243,93 @@ def run_relation(
                 return False, all_output
         else:
             return False, all_output
+
+    if is_xml:
+        return _run_relation_xml(
+            ssh, node_name, remote_dir, filename, log_dir, log_cb, all_output,
+            wait_for_user,
+        )
+    else:
+        return _run_relation_zip(
+            ssh, node_name, shortcode, remote_dir, filename, log_dir, log_cb,
+            all_output, wait_for_user,
+        )
+
+
+def _run_relation_xml(
+    ssh: IntegrationSSH,
+    node_name: str,
+    remote_dir: str,
+    filename: str,
+    log_dir: str,
+    log_cb: Callable[[str], None],
+    all_output: str,
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Run a single relation XML via ``netconf`` in AMOS."""
+    remote_path = f"{remote_dir}/{filename}"
+    log_cb(f"Running netconf: {filename}...")
+
+    out = ssh.run_amos_command_safe(
+        f"netconf {remote_path}",
+        node_name, timeout=900,
+    )
+    all_output += out
+
+    # ── Check result ─────────────────────────────────────────────
+    has_error = "</error-message>" in out
+    has_ok = "<ok/>" in out
+
+    if has_error:
+        status = "FAILED — </error-message> detected, check manually"
+        log_cb(f"✗ {status}")
+    elif has_ok:
+        status = "OK — <ok/> received"
+        log_cb(f"✓ {status}")
+    else:
+        status = "UNKNOWN — no <ok/> or </error-message> found, check manually"
+        log_cb(f"⚠ {status}")
+
+    # ── Save log ─────────────────────────────────────────────────
+    rel_log_name = f"RELATION_{node_name}_NETCONF.txt"
+    rel_log_path = os.path.join(log_dir, rel_log_name)
+    try:
+        with open(rel_log_path, "w", encoding="utf-8") as f:
+            f.write(f"Relation NETCONF Log — {node_name}\n")
+            f.write(f"File: {filename}\n")
+            f.write(f"Remote: {remote_path}\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Status: {status}\n")
+            f.write("=" * 72 + "\n\n")
+            f.write(out)
+        log_cb(f"Log saved: {rel_log_name}")
+    except Exception as exc:
+        log_cb(f"Failed to save log: {exc}")
+
+    if has_error:
+        if wait_for_user:
+            wait_for_user(
+                f"Relation NETCONF failed with errors.\n"
+                f"Please check the log: {rel_log_name}\n\n"
+                f"Click OK to continue."
+            )
+        return False, all_output
+
+    return True, all_output
+
+
+def _run_relation_zip(
+    ssh: IntegrationSSH,
+    node_name: str,
+    shortcode: str,
+    remote_dir: str,
+    zip_filename: str,
+    log_dir: str,
+    log_cb: Callable[[str], None],
+    all_output: str,
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Unzip relation zip, find node folder, run each .txt file."""
 
     # ── 2. Unzip on server ───────────────────────────────────────
     log_cb(f"Unzipping {zip_filename} on server...")
@@ -1381,7 +1464,6 @@ def run_relation(
             log_cb(f"Failed to save log {rel_log_name}: {exc}")
 
     # ── Overall summary ─────────────────────────────────────────
-    # Save a combined summary file
     summary_log_path = os.path.join(log_dir, f"RELATION_{node_name}_SUMMARY.txt")
     try:
         with open(summary_log_path, "w", encoding="utf-8") as f:
