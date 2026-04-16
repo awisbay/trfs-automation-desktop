@@ -56,6 +56,8 @@ def main(page: ft.Page):
             return ProgressPage(page).build()
         elif route == "/integration":
             return IntegrationPage(page).build()
+        elif route == "/integration_run":
+            return IntegrationRunPage(page).build()
         elif route == "/result":
             return ResultPage(page).build()
         return FormPage(page).build()
