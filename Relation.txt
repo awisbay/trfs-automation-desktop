@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hello
+	xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+	<capabilities>
+		<capability>urn:ietf:params:netconf:base:1.0</capability>
+	</capabilities></hello>
+]]>]]>
+	<rpc message-id="1"
+		xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+		<edit-config>
+			<target>
+				<running />
+			</target>
+			<config xmlns:xc="urn:ietf:params:xml:ns:netconf:base:1.0">
+				<ManagedElement xmlns="urn:com:ericsson:ecim:ComTop">
+					<managedElementId>$NODENAME</managedElementId>
+					<ENodeBFunction xmlns="urn:com:ericsson:ecim:Lrat">
+						<eNodeBFunctionId>1</eNodeBFunctionId>
+						<!-- 13_Eutran_CellRelation Start -->
+						<EUtranCellFDD>
+							<eUtranCellFDDId>$CELLNAMELTECIQ</eUtranCellFDDId>
+							<EUtranFreqRelation>
+								<eUtranFreqRelationId>$TARGETARFCNLTE</eUtranFreqRelationId>
+								<EUtranCellRelation>
+									<eUtranCellRelationId>$TARGETCELLNAMELTE</eUtranCellRelationId>
+									<cellIndividualOffsetEUtran>0</cellIndividualOffsetEUtran>
+									<neighborCellRef>ManagedElement=1,ENodeBFunction=1,EUtranCellFDD=$TARGETCELLNAMELTE</neighborCellRef>
+									<loadBalancing>ALLOWED</loadBalancing>
+									<sCellCandidate>ALLOWED</sCellCandidate>
+									<lbBnrAllowed>false</lbBnrAllowed>
+									<isHoAllowedBr>false</isHoAllowedBr>
+								</EUtranCellRelation>
+							</EUtranFreqRelation>
+						</EUtranCellFDD>
+						<!-- 13_Eutran_CellRelation End -->
+						<!-- 04_External_ENodeBFunction Start -->
+						<EUtraNetwork>
+							<eUtraNetworkId>1</eUtraNetworkId>
+							<ExternalENodeBFunction>
+								<externalENodeBFunctionId>$NODEUSERLABELEXT</externalENodeBFunctionId>
+								<eNBId>$NODEIDEXT</eNBId>
+								<eNodeBPlmnId>
+									<mcc>515</mcc>
+									<mnc>2</mnc>
+									<mncLength>2</mncLength>
+								</eNodeBPlmnId>
+								<!-- 05_TermpointtoENB Start -->
+								<TermPointToENB>
+									<termPointToENBId>5152-$NODEIDEXT</termPointToENBId>
+									<ipAddress>$CUPINIPV4</ipAddress>
+									<administrativeState>UNLOCKED</administrativeState>
+								</TermPointToENB>
+								<!-- 05_TermpointtoENB End -->
+								<!-- 06_External_Eutrancell Start -->
+								<ExternalEUtranCellFDD>
+									<externalEUtranCellFDDId>5152-$NODEIDEXT-$CELLIDLTECIQ</externalEUtranCellFDDId>
+									<localCellId>$CELLIDLTECIQ</localCellId>
+									<physicalLayerCellIdGroup>$PCIGLTECIQ</physicalLayerCellIdGroup>
+									<physicalLayerSubCellId>$PSCILTECIQ</physicalLayerSubCellId>
+									<tac>$TACLTECIQ</tac>
+									<isRemoveAllowed>false</isRemoveAllowed>
+									<eutranFrequencyRef>ManagedElement=1,ENodeBFunction=1,EUtraNetwork=1,EUtranFrequency=$ARFCNDLLTECIQ</eutranFrequencyRef>
+									<lbEUtranCellOffloadCapacity>1000</lbEUtranCellOffloadCapacity>
+									<noOfTxAntennas>2</noOfTxAntennas>
+									<activePlmnList>
+										<mcc>515</mcc>
+										<mnc>2</mnc>
+										<mncLength>2</mncLength>
+									</activePlmnList>
+								</ExternalEUtranCellFDD>
+								<!-- 06_External_Eutrancell End -->
+							</ExternalENodeBFunction>
+						</EUtraNetwork>
+						<!-- 04_External_ENodeBFunction End -->
+						<!-- 07_External_Eutrancell_relation Start -->
+						<EUtranCellFDD>
+							<eUtranCellFDDId>$CELLNAMELTECIQ</eUtranCellFDDId>
+							<EUtranFreqRelation>
+								<eUtranFreqRelationId>$TARGETARFCNLTE</eUtranFreqRelationId>
+								<EUtranCellRelation>
+									<eUtranCellRelationId>$TARGETCELLNAMELTE</eUtranCellRelationId>
+									<cellIndividualOffsetEUtran>0</cellIndividualOffsetEUtran>
+									<neighborCellRef>ManagedElement=1,ENodeBFunction=1,EUtraNetwork=1,ExternalENodeBFunction=$NODEUSERLABELEXT,ExternalEUtranCellFDD=5152-$NODEIDEXT-$CELLIDLTECIQ</neighborCellRef>
+									<loadBalancing>ALLOWED</loadBalancing>
+									<sCellCandidate>ALLOWED</sCellCandidate>
+									<lbBnrAllowed>false</lbBnrAllowed>
+									<isHoAllowedBr>false</isHoAllowedBr>
+								</EUtranCellRelation>
+							</EUtranFreqRelation>
+						</EUtranCellFDD>
+						<!-- 07_External_Eutrancell_relation End -->
+						<!-- 01_External_GNodeBFunction Start -->
+						<GUtraNetwork>
+							<gUtraNetworkId>1</gUtraNetworkId>
+							<ExternalGNodeBFunction>
+								<externalGNodeBFunctionId>$NODEUSERLABEL</externalGNodeBFunctionId> 
+								<gNodeBIdLength>22</gNodeBIdLength>
+								<gNodeBId>$NODEID</gNodeBId>
+								<gNodeBPlmnId>
+									<mcc>515</mcc>
+									<mnc>2</mnc>
+									<mncLength>2</mncLength>
+								</gNodeBPlmnId>
+								<TermPointToGNB>
+									<termPointToGNBId>$NODEUSERLABEL</termPointToGNBId>
+									<administrativeState>UNLOCKED</administrativeState>
+									<ipAddress>$CUPINIPV4</ipAddress>
+								</TermPointToGNB>
+							</ExternalGNodeBFunction>
+						</GUtraNetwork>
+						<!-- 01_External_GNodeBFunction End -->
+						<!-- 02_External_GutraCell Start -->
+						<GUtraNetwork>
+							<gUtraNetworkId>1</gUtraNetworkId>
+							<ExternalGNodeBFunction>
+								<externalGNodeBFunctionId>$NODEUSERLABEL</externalGNodeBFunctionId>
+								<ExternalGUtranCell>
+									<externalGUtranCellId>$NREXTERNALCELLID</externalGUtranCellId> 
+									<gUtranSyncSignalFrequencyRef>ManagedElement=1,ENodeBFunction=1,GUtraNetwork=1,GUtranSyncSignalFrequency=$GUTRANSYNCFREQID</gUtranSyncSignalFrequencyRef>
+									<physicalLayerCellIdGroup>$PCIGNRCIQ</physicalLayerCellIdGroup> 
+									<physicalLayerSubCellId>$PSCINRCIQ</physicalLayerSubCellId> 
+									<localCellId>$CELLIDNRCIQ</localCellId>
+									<plmnIdList>
+										<mcc>515</mcc>
+										<mnc>2</mnc>
+										<mncLength>2</mncLength>
+									</plmnIdList>
+								</ExternalGUtranCell>
+							</ExternalGNodeBFunction>
+						</GUtraNetwork>
+						<!-- 02_External_GutraCell End -->
+						<!-- 03_GUtran_CellRelation Start --> 
+						<EUtranCellFDD>
+							<eUtranCellFDDId>$CELLNAMELTECIQ</eUtranCellFDDId>
+							<GUtranFreqRelation>
+								<gUtranFreqRelationId>$TARGETARFCNNR</gUtranFreqRelationId> <!-- Refer to Colocation NR -->
+								<GUtranCellRelation>
+									<gUtranCellRelationId>$NREXTERNALCELLID</gUtranCellRelationId> <!-- Refer to Colocation NR -->
+									<isRemoveAllowed>false</isRemoveAllowed>
+									<neighborCellRef>ManagedElement=1,ENodeBFunction=1,GUtraNetwork=1,ExternalGNodeBFunction=$NODEUSERLABEL,ExternalGUtranCell=$NREXTERNALCELLID</neighborCellRef> <!-- Refer to Colocation NR -->
+									<essEnabled>false</essEnabled>
+									<isHoAllowed>true</isHoAllowed>
+									<isVoiceHoAllowed>true</isVoiceHoAllowed>
+									<isEndcAllowed>true</isEndcAllowed>
+									<coverageIndicator>NONE</coverageIndicator>
+								</GUtranCellRelation>
+							</GUtranFreqRelation>
+						</EUtranCellFDD>
+						<!-- 03_GUtran_CellRelation End --> 
+						<!-- 11_External_Grancell Start --> 
+						<GeraNetwork>
+							<geraNetworkId>1</geraNetworkId>
+							<ExternalGeranCell>
+							  <externalGeranCellId>$GERANID</externalGeranCellId>
+							  <lac>$GERANLAC</lac>
+							  <cellIdentity>$GERANCELLID</cellIdentity>
+							  <bcc>$GERANBCC</bcc>
+							  <ncc>$GERANNCC</ncc>
+							  <isRemoveAllowed>true</isRemoveAllowed>
+							  <rac>$GERANRAC</rac>
+							  <geranFrequencyRef>ManagedElement=1,ENodeBFunction=1,GeraNetwork=1,GeranFrequency=$GERANFREQ</geranFrequencyRef>
+							  <plmnIdentity>
+								<mcc>515</mcc>
+								<mnc>2</mnc>
+								<mncLength>2</mncLength>
+							  </plmnIdentity>
+							</ExternalGeranCell>
+						</GeraNetwork>
+						<!-- 11_External_Grancell End -->
+						<!-- 12_Geran_CellRelation Start --> 
+						<EUtranCellFDD>
+							<eUtranCellFDDId>$CELLNAMELTECIQ</eUtranCellFDDId>
+							<GeranCellRelation>
+								<geranCellRelationId>$GERANID</geranCellRelationId>
+								<coverageIndicator>NONE</coverageIndicator>
+								<isRemoveAllowed>true</isRemoveAllowed>
+								<isHoAllowed>true</isHoAllowed>
+								<extGeranCellRef>ManagedElement=1,ENodeBFunction=1,GeraNetwork=1,ExternalGeranCell=$GERANID</extGeranCellRef>
+							</GeranCellRelation>
+						</EUtranCellFDD>
+						<!-- 12_Geran_CellRelation End --> 
+					</ENodeBFunction>
+					<GNBCUCPFunction xmlns="urn:com:ericsson:ecim:GNBCUCP">
+						<gNBCUCPFunctionId>1</gNBCUCPFunctionId>
+						<!-- 15_ExternalENodeBFunction Start -->
+						<EUtraNetwork>
+							<eUtraNetworkId>1</eUtraNetworkId>
+							<ExternalENodeBFunction>
+								<externalENodeBFunctionId>$NODEUSERLABEL</externalENodeBFunctionId>
+								<eNodeBId>$NODEID</eNodeBId>
+								<independentGapConfigSupported>true</independentGapConfigSupported>
+								<isRemoveAllowed>false</isRemoveAllowed>
+								<pLMNId>
+									<mcc>515</mcc>
+									<mnc>02</mnc>
+								</pLMNId>
+								<TermPointToENodeB>
+									<termPointToENodeBId>auto1</termPointToENodeBId>
+									<administrativeState>UNLOCKED</administrativeState>
+								</TermPointToENodeB>
+							</ExternalENodeBFunction>
+						</EUtraNetwork>
+						<!-- 15_ExternalENodeBFunction End -->
+						<!-- 16_ExternalEUtranCell Start -->
+						<EUtraNetwork>
+							<eUtraNetworkId>1</eUtraNetworkId>
+							<ExternalENodeBFunction>
+								<externalENodeBFunctionId>$NODEUSERLABEL</externalENodeBFunctionId>
+								<ExternalEUtranCell>
+									<externalEUtranCellId>$EXTERNALEUTRANCELLLTE</externalEUtranCellId>
+									<cellLocalId>$CELLIDLTECIQ</cellLocalId>
+									<eUtranFrequencyRef>ManagedElement=1,GNBCUCPFunction=1,EUtraNetwork=1,EUtranFrequency=$TARGETARFCNESS</eUtranFrequencyRef>
+									<physicalLayerCellId>$PCILTECIQ</physicalLayerCellId>
+									<tac>$TACLTECIQ</tac>
+								</ExternalEUtranCell>
+							</ExternalENodeBFunction>
+						</EUtraNetwork>
+						<!--  16_ExternalEUtranCell End -->
+						<!--  17_EUtranCellRelation Start -->
+						<NRCellCU>
+							<nRCellCUId>$CELLNAMENRCIQ</nRCellCUId>
+							<EUtranCellRelation>
+								<eUtranCellRelationId>$EXTERNALEUTRANCELLLTE</eUtranCellRelationId>
+								<cellIndividualOffset>0</cellIndividualOffset>
+								<essEnabled>true</essEnabled>
+								<isHoAllowed>true</isHoAllowed>
+								<isRemoveAllowed>false</isRemoveAllowed>
+								<neighborCellRef>ManagedElement=1,GNBCUCPFunction=1,EUtraNetwork=1,ExternalENodeBFunction=$NODEUSERLABEL,ExternalEUtranCell=$EXTERNALEUTRANCELLLTE</neighborCellRef>
+							</EUtranCellRelation>
+						</NRCellCU>
+						<!--  17_EUtranCellRelation End -->
+						<!-- 14_Internal_NRCellRelation Start -->
+						<NRCellCU>
+							<nRCellCUId>$CELLNAMENRCIQ</nRCellCUId>
+							<NRCellRelation>
+								<nRCellRelationId>$TARGETCELLNAMENR</nRCellRelationId>
+								<cellIndividualOffsetNR>0</cellIndividualOffsetNR>
+								<coverageIndicator>NONE</coverageIndicator>
+								<isHoAllowed>true</isHoAllowed>
+								<sCellCandidate>ALLOWED</sCellCandidate>
+								<isRemoveAllowed>false</isRemoveAllowed>
+								<nRCellRef>ManagedElement=1,GNBCUCPFunction=1,NRCellCU=$TARGETCELLNAMENR</nRCellRef>
+								<nRFreqRelationRef>ManagedElement=1,GNBCUCPFunction=1,NRCellCU=$CELLNAMENRCIQ,NRFreqRelation=$TARGETARFCNNR</nRFreqRelationRef>
+							</NRCellRelation>
+						</NRCellCU>
+						<!-- 14_Internal_NRCellRelation End -->
+						<!-- 08_External_GNBCUCPfunction Start -->
+						<NRNetwork>
+							<nRNetworkId>1</nRNetworkId>
+							<ExternalGNBCUCPFunction>
+								<externalGNBCUCPFunctionId>$NODEUSERLABELEXT</externalGNBCUCPFunctionId>
+								<gNBId>$NODEIDEXT</gNBId>
+								<gNBIdLength>25</gNBIdLength>
+								<isRemoveAllowed>false</isRemoveAllowed>
+								<pLMNId>
+									<mcc>515</mcc>
+									<mnc>02</mnc>
+								</pLMNId>
+								<TermPointToGNodeB>
+									<termPointToGNodeBId>$NODEUSERLABELEXT</termPointToGNodeBId>
+									<administrativeState>UNLOCKED</administrativeState>
+								</TermPointToGNodeB>
+							</ExternalGNBCUCPFunction>
+						</NRNetwork>
+						<!-- 08_External_GNBCUCPfunction End -->
+						<!-- 09_External_NRCellCU Start -->
+						<NRNetwork>
+							<nRNetworkId>1</nRNetworkId>
+							<ExternalGNBCUCPFunction>
+								<externalGNBCUCPFunctionId>$NODEUSERLABELEXT</externalGNBCUCPFunctionId>
+								<ExternalNRCellCU>
+									<externalNRCellCUId>$CELLINAMENR</externalNRCellCUId>
+									<cellLocalId>$CELLIDNRCIQ</cellLocalId>
+									<nRFrequencyRef>ManagedElement=1,GNBCUCPFunction=1,NRNetwork=1,NRFrequency=$GUTRANSYNCFREQID</nRFrequencyRef>
+									<nRPCI>$PCINRCIQ</nRPCI>
+									<nRTAC>$TACNRCIQ</nRTAC>
+									<plmnIdList>
+										<mcc>515</mcc>
+										<mnc>02</mnc>
+									</plmnIdList>
+								</ExternalNRCellCU>
+							</ExternalGNBCUCPFunction>
+						</NRNetwork>
+						<!-- 09_External_NRCellCU End -->
+						<!-- 10_ExternalNRCellRelation Start -->
+						<NRCellCU>
+							<nRCellCUId>$CELLNAMENRCIQ</nRCellCUId>
+							<NRCellRelation>
+								<nRCellRelationId>$TARGETCELLNAMENR</nRCellRelationId>
+								<cellIndividualOffsetNR>0</cellIndividualOffsetNR>
+								<coverageIndicator>NONE</coverageIndicator>
+								<isHoAllowed>true</isHoAllowed>
+								<isRemoveAllowed>false</isRemoveAllowed>
+								<nRCellRef>ManagedElement=1,GNBCUCPFunction=1,NRNetwork=1,ExternalGNBCUCPFunction=$NODEUSERLABELEXT,ExternalNRCellCU=$NCI</nRCellRef>
+								<nRFreqRelationRef>ManagedElement=1,GNBCUCPFunction=1,NRCellCU=$CELLNAMENRCIQ,NRFreqRelation=$TARGETARFCNNR</nRFreqRelationRef>
+								<sCellCandidate>NOT_ALLOWED</sCellCandidate>
+							</NRCellRelation>
+						</NRCellCU>
+						<!-- 10_ExternalNRCellRelation End -->
+					</GNBCUCPFunction>
+				</ManagedElement>
+			</config>
+		</edit-config>
+	</rpc>
+]]>]]>
+		<rpc message-id="Closing" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+			<close-session></close-session></rpc>
+]]>]]>

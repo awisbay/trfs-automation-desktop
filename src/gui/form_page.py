@@ -1,7 +1,6 @@
 """
 NodeCraft GUI - Elevated configuration workspace.
 """
-import asyncio
 import os
 import sys
 
@@ -223,6 +222,20 @@ class FormPage:
         if self.commands_field.value.strip():
             self._validate_commands()
 
+        # --- Relation zip browse in hero panel ---
+        self.relation_zip_field = self._text_field(
+            "Relation Zip File",
+            "",
+            expand=True,
+        )
+        self.relation_zip_browse = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=ACCENT,
+            tooltip="Browse for Relation ZIP file",
+            on_click=self._on_browse_relation_zip,
+        )
+        self.relation_zip_status = ft.Text("", size=12, color=TEXT_MUTED, visible=False)
+
         hero = panel(
             ft.Column(
                 [
@@ -244,25 +257,35 @@ class FormPage:
                         size=15,
                         color=TEXT_MUTED,
                     ),
-                    ft.Row(
-                        [
-                            badge("SSH + Moshell", INFO, ft.Icons.TERMINAL),
-                            badge("ENM Browser Capture", ACCENT_WARM, ft.Icons.CAMERA_ALT),
-                            badge("Excel Output", SUCCESS, ft.Icons.GRID_ON),
-                            badge("Integration", "#9C7CFF", ft.Icons.INTEGRATION_INSTRUCTIONS),
-                        ],
-                        wrap=True,
-                        spacing=10,
-                    ),
                     ft.Container(height=10),
-                    ft.Row(
-                        [
-                            self._metric_card("Bands Ready", self.band_count_text, INFO),
-                            self._metric_card("Categories", self.category_count_text, ACCENT),
-                        ],
-                        spacing=14,
-                        wrap=True,
+                    panel(
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Relation ZIP → XML Converter",
+                                    size=13,
+                                    color=TEXT,
+                                    weight=ft.FontWeight.W_600,
+                                ),
+                                ft.Text(
+                                    "Browse a relation ZIP file to auto-convert to XML format.",
+                                    size=11,
+                                    color=TEXT_MUTED,
+                                ),
+                                ft.Row(
+                                    [self.relation_zip_field, self.relation_zip_browse],
+                                    spacing=8,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                                self.relation_zip_status,
+                            ],
+                            spacing=8,
+                        ),
+                        bgcolor=PANEL_RAISED,
+                        padding=18,
+                        border_color="#3A5F7C",
                     ),
+                    ft.Container(height=6),
                     panel(
                         ft.Column(
                             [
@@ -470,6 +493,87 @@ class FormPage:
             self.relation_field.value = files[0].path
             self.page.update()
 
+    async def _on_browse_relation_zip(self, e):
+        files = await self.file_picker.pick_files(
+            dialog_title="Select Relation ZIP File",
+            allowed_extensions=["zip"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allow_multiple=False,
+        )
+        if files:
+            zip_path = files[0].path
+            self.relation_zip_field.value = zip_path
+            self.relation_zip_status.value = "Converting..."
+            self.relation_zip_status.color = ACCENT
+            self.relation_zip_status.visible = True
+            self.page.update()
+
+            node_name = self.node_name_field.value.strip()
+            if not node_name:
+                self.relation_zip_status.value = "⚠ Please fill Node Name (LTE/NR) first."
+                self.relation_zip_status.color = "#FFB4B4"
+                self.page.update()
+                return
+
+            try:
+                # Locate template and converter
+                src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                repo_root = os.path.dirname(src_dir)
+                template_path = os.path.join(repo_root, "Relation.txt")
+                if not os.path.isfile(template_path):
+                    # Try next to the zip
+                    template_path = os.path.join(os.path.dirname(zip_path), "Relation.txt")
+                if not os.path.isfile(template_path):
+                    self.relation_zip_status.value = "⚠ Template Relation.txt not found."
+                    self.relation_zip_status.color = "#FFB4B4"
+                    self.page.update()
+                    return
+
+                # Import converter
+                converter_path = os.path.join(repo_root, "txt_to_xml_converter.py")
+                if not os.path.isfile(converter_path):
+                    self.relation_zip_status.value = "⚠ txt_to_xml_converter.py not found."
+                    self.relation_zip_status.color = "#FFB4B4"
+                    self.page.update()
+                    return
+
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("txt_to_xml_converter", converter_path)
+                converter_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(converter_mod)
+
+                output_name = f"LTE_{node_name}_Relation.xml"
+
+                # Ask user where to save the XML
+                save_path = await self.file_picker.save_file(
+                    dialog_title="Save Relation XML",
+                    file_name=output_name,
+                    allowed_extensions=["xml"],
+                    file_type=ft.FilePickerFileType.CUSTOM,
+                )
+                if not save_path:
+                    self.relation_zip_status.value = "Cancelled."
+                    self.relation_zip_status.color = TEXT_MUTED
+                    self.page.update()
+                    return
+
+                converter_mod.convert_txt_to_xml(
+                    template_path=template_path,
+                    zip_path=zip_path,
+                    output_path=save_path,
+                    site_name=node_name,
+                )
+
+                self.relation_field.value = save_path
+                self.relation_zip_status.value = f"✓ Saved → {os.path.basename(save_path)}"
+                self.relation_zip_status.color = SUCCESS
+                self.page.update()
+
+            except Exception as ex:
+                self.relation_zip_status.value = f"✗ Conversion failed: {ex}"
+                self.relation_zip_status.color = "#FFB4B4"
+                self.page.update()
+
     def _validate_commands(self):
         path = self.commands_field.value.strip()
         if not path or not os.path.isfile(path):
@@ -576,7 +680,7 @@ class FormPage:
         self.page.trfs_demo_mode = False
         self.page.trfs_commands_file = f["commands_file"]
 
-        asyncio.create_task(self.page.push_route("/progress"))
+        self.page.go("/progress")
 
     def _on_integration(self, e):
         f = self._collect_form()
@@ -603,4 +707,4 @@ class FormPage:
 
         # Store integration form data for the integration workflow
         self.page.integration_form = f
-        asyncio.create_task(self.page.push_route("/integration"))
+        self.page.go("/integration")
