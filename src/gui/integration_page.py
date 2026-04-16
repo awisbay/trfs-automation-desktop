@@ -46,9 +46,10 @@ INTEGRATION_STEPS = [
     ("create_arne",      "Create ARNE",              "both",    "ARNE"),
     ("enrollment",       "Enrollment",               "both",    "ENROLLMENT"),
     ("install_lkf",      "Install LKF",              "both",    "LKF"),
+    ("relation",         "Relation",                 "lte_nr",  "RELATION"),
     ("baseline",         "Baseline Running",         "lte_nr",  "BASELINE"),
     ("ret_scripts",      "RET Scripts",              "both",    "RET"),
-    ("relation",         "Relation",                 "lte_nr",  "RELATION"),
+    ("uri_setting",      "URI Setting",              "lte_nr",  "URI"),
     ("verify_mme",       "Verify MME",               "both",    "MME"),
     ("gsm_cell_define",  "GSM Cell Define in BSC",   "gsm",     "GSM_CELL_DEFINE"),
     ("take_dump",        "Take Dump",                "both",    "DUMP"),
@@ -776,6 +777,7 @@ class IntegrationRunPage:
             IntegrationSSH, run_create_arne, run_enrollment,
             run_install_lkf, run_baseline, run_relation, run_verify_mme,
             run_take_dump, run_gsm_cell_define, run_take_cm_dump,
+            run_uri_setting,
         )
 
         label = "LTE/NR" if node_tag == "lte" else "GSM"
@@ -915,6 +917,22 @@ class IntegrationRunPage:
                     elif key == "ret_scripts":
                         self._set_step(node_tag, key, "skip", "Coming soon")
                         ui_cb(f"{step_label} — skipped (coming soon).")
+
+                    elif key == "uri_setting":
+                        success, output = run_uri_setting(
+                            ssh, node_name, username, password,
+                            detail_cb,
+                            wait_for_user=self._ask_user_retry,
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done",
+                                           "SUCCESS")
+                            ui_cb(f"{step_label} — SUCCESS.")
+                        else:
+                            self._set_step(node_tag, key, "error",
+                                           "Failed")
+                            ui_cb(f"{step_label} — failed.")
+                            stopped = True
 
                     elif key == "verify_mme":
                         success, output = run_verify_mme(

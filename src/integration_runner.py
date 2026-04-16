@@ -927,6 +927,129 @@ def run_baseline(
             return True, all_output
 
 
+# ── URI Setting step ─────────────────────────────────────────────
+ENM_LOGIN_URL = "https://lhgenm1.globetel.com/login"
+ENM_URI_UPDATE_URL = (
+    "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/"
+    "updateUpMoFtpServerDetails"
+)
+
+
+def run_uri_setting(
+    ssh: IntegrationSSH,
+    node_name: str,
+    enm_username: str,
+    enm_password: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Configure URI on the node and update FTP server details via ENM REST API.
+
+    AMOS commands:
+      1. set SwM=1 defaultUri
+      2. set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 uri
+      3. set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05
+         password cleartext=true,password=
+
+    Bash commands (via ! prefix in AMOS):
+      4. curl login to get cookie
+      5. curl POST to updateUpMoFtpServerDetails with node name
+
+    Both curl commands must return "SUCCESS" to pass.
+
+    Returns:
+        (success: bool, full_output: str)
+    """
+    all_output = ""
+
+    # ── 1-3. AMOS set commands ──────────────────────────────────
+    amos_cmds = [
+        "set SwM=1 defaultUri",
+        "set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 uri",
+        "set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 "
+        "password cleartext=true,password=",
+    ]
+
+    for cmd in amos_cmds:
+        log_cb(f"Running: {cmd}")
+        out = ssh.run_amos_command_safe(cmd, node_name, timeout=30)
+        all_output += out
+        log_cb(f"Output:\n{out}")
+
+    # ── 4. curl login to get cookie ─────────────────────────────
+    login_cmd = (
+        f'!curl --insecure --request POST '
+        f'--data "IDToken1={enm_username}" '
+        f'--data "IDToken2={enm_password}" '
+        f'--cookie-jar ./cookie.txt {ENM_LOGIN_URL}'
+    )
+    log_cb("Logging in to ENM (curl)...")
+    out = ssh.run_amos_command_safe(login_cmd, node_name, timeout=60)
+    all_output += out
+    log_cb(f"Login output:\n{out}")
+
+    # Check for "Authentication Successful"
+    if "Authentication Successful" not in out and "SUCCESS" not in out.upper():
+        msg = f"ENM login failed for URI setting.\nOutput: {out[:300]}"
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(
+                f"{msg}\n\nCheck credentials and click Retry."
+            )
+            if not retry:
+                return False, all_output
+            # Retry login
+            out = ssh.run_amos_command_safe(login_cmd, node_name, timeout=60)
+            all_output += out
+            if "Authentication Successful" not in out and \
+                    "SUCCESS" not in out.upper():
+                log_cb("✗ Login still failed after retry.")
+                return False, all_output
+        else:
+            return False, all_output
+
+    log_cb("✓ ENM login successful.")
+
+    # ── 5. curl POST to update URI FTP server details ───────────
+    update_cmd = (
+        f"!curl --insecure --request POST "
+        f"'{ENM_URI_UPDATE_URL}' "
+        f"--cookie cookie.txt "
+        f'-H "Content-Type: application/json" '
+        f"-d '[\"{{nodeName}}\"]'"
+    ).replace("{nodeName}", node_name)
+
+    log_cb(f"Updating URI FTP server details for {node_name}...")
+    out = ssh.run_amos_command_safe(update_cmd, node_name, timeout=60)
+    all_output += out
+    log_cb(f"Update output:\n{out}")
+
+    # Check for SUCCESS in the response
+    if "SUCCESS" in out.upper():
+        log_cb(f"✓ URI setting completed for {node_name}.")
+        return True, all_output
+    else:
+        msg = f"URI setting failed for {node_name}.\nOutput: {out[:300]}"
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(
+                f"{msg}\n\nCheck the output and click Retry."
+            )
+            if not retry:
+                return False, all_output
+            # Retry the update
+            out = ssh.run_amos_command_safe(update_cmd, node_name, timeout=60)
+            all_output += out
+            if "SUCCESS" in out.upper():
+                log_cb(f"✓ URI setting completed on retry for {node_name}.")
+                return True, all_output
+            else:
+                log_cb("✗ URI setting still failed after retry.")
+                return False, all_output
+        else:
+            return False, all_output
+
+
 # ── Relation step ────────────────────────────────────────────────
 def run_relation(
     ssh: IntegrationSSH,
