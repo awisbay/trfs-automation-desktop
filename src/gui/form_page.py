@@ -371,6 +371,7 @@ class FormPage:
                     ),
                 ],
                 spacing=16,
+                scroll=ft.ScrollMode.AUTO,
             ),
             bgcolor="#0F2132",
             padding=28,
