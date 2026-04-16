@@ -526,11 +526,7 @@ def run_enrollment(
     """
     all_output = ""
 
-    # ── 1. Enter AMOS ────────────────────────────────────────────
-    log_cb(f"Entering AMOS for {node_name}...")
-    out = ssh.enter_amos(node_name, timeout=90)
-    all_output += out
-    log_cb("AMOS session ready.")
+    # ── 1. AMOS assumed to be already entered by caller ────────
 
     # ── 2. Ensure ~/INOC/SCRIPTS/NS/ folder exists ──────────────
     log_cb("Ensuring ~/INOC/SCRIPTS/NS/ directory exists...")
@@ -564,7 +560,6 @@ def run_enrollment(
             )
             if not retry:
                 log_cb("User chose to stop.")
-                ssh.exit_amos()
                 return False, all_output
             check_out2 = ssh.run_amos_command(
                 f"!ls ~/INOC/SCRIPTS/NS/{node_name}.xml", timeout=15,
@@ -572,10 +567,8 @@ def run_enrollment(
             all_output += check_out2
             if f"{node_name}.xml" not in check_out2 or "No such file" in check_out2:
                 log_cb("✗ XML still not found after retry.")
-                ssh.exit_amos()
                 return False, all_output
         else:
-            ssh.exit_amos()
             return False, all_output
     log_cb(f"✓ {node_name}.xml confirmed.")
 
@@ -605,10 +598,8 @@ def run_enrollment(
             )
             if not retry:
                 log_cb("User chose to stop.")
-                ssh.exit_amos()
                 return False, all_output
         else:
-            ssh.exit_amos()
             return False, all_output
     log_cb("✓ Entity upload confirmed.")
 
@@ -639,7 +630,6 @@ def run_enrollment(
         log_cb(f"✗ {msg}")
         while not enroll_success:
             if not wait_for_user:
-                ssh.exit_amos()
                 return False, all_output
             retry = wait_for_user(
                 f"{msg}\n\nCheck the enrollment output for errors.\n"
@@ -647,7 +637,6 @@ def run_enrollment(
             )
             if not retry:
                 log_cb("User chose to stop.")
-                ssh.exit_amos()
                 return False, all_output
             log_cb("Re-checking enrollment status...")
             out = ssh.run_amos_command_safe(
@@ -1132,7 +1121,7 @@ def _parse_relation_output(output: str, filename: str) -> dict:
     no_change = 0       # lines with "-No Change-"
     total_error = 0     # lines with "!!!!" or "ERROR"
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
 
         if re.search(r'Total:\s+1\s+MOs\s+attempted,\s+0\s+MOs\s+set', stripped):
@@ -1145,7 +1134,6 @@ def _parse_relation_output(output: str, filename: str) -> dict:
             mo_total += 1
         if re.search(r'Total:\s+1\s+MOs\s*$', stripped):
             # Check previous lines for "Proxy  MO"
-            idx = lines.index(line)
             context = "\n".join(lines[max(0, idx - 8):idx + 1])
             if 'Proxy  MO' in context:
                 mo_exist += 1

@@ -305,10 +305,10 @@ class IntegrationPage:
             return
         # Store selected steps on the page for the progress page
         self.page.integration_selected_steps = selected
-        asyncio.create_task(self.page.push_route("/integration_run"))
+        self.page.go("/integration_run")
 
     def _go_back(self, e):
-        asyncio.create_task(self.page.push_route("/form"))
+        self.page.go("/form")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -342,8 +342,9 @@ class IntegrationRunPage:
         self.log_dir = os.path.join(get_app_dir(), "LOG", self.shortcode)
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # Session log buffer — full detail for file saving
-        self._session_log: list[str] = []
+        # Per-node session log buffers — full detail for file saving
+        # Keyed by node_tag ("lte" or "gsm") to avoid cross-contamination
+        self._session_logs: dict[str, list[str]] = {"lte": [], "gsm": []}
         self._session_log_lock = threading.Lock()
 
     # ── Build ────────────────────────────────────────────────────
@@ -515,19 +516,20 @@ class IntegrationRunPage:
         line = f"[{ts}] {msg}"
         self._log_queue.put_nowait(line)
 
-    def _detail_log(self, msg: str):
+    def _detail_log(self, msg: str, node_tag: str = "lte"):
         """Full-detail log saved to step log files only (not shown in UI)."""
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         with self._session_log_lock:
-            self._session_log.append(line)
+            self._session_logs[node_tag].append(line)
 
-    def _save_step_log(self, step_number: int, node_name: str, log_suffix: str):
-        """Save full session log snapshot to LOG/<SHORTCODE>/NN_NODE_SUFFIX.txt."""
+    def _save_step_log(self, step_number: int, node_name: str,
+                       log_suffix: str, node_tag: str = "lte"):
+        """Save per-node session log snapshot to LOG/<SHORTCODE>/NN_NODE_SUFFIX.txt."""
         filename = f"{step_number:02d}_{node_name}_{log_suffix}.txt"
         filepath = os.path.join(self.log_dir, filename)
         with self._session_log_lock:
-            snapshot = list(self._session_log)
+            snapshot = list(self._session_logs.get(node_tag, []))
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(f"Integration Log — {self.shortcode}\n")
@@ -788,7 +790,7 @@ class IntegrationRunPage:
 
         def detail_cb(msg: str):
             """Full detail — saved to log file only."""
-            self._detail_log(f"[{label}] {msg}")
+            self._detail_log(f"[{label}] {msg}", node_tag=node_tag)
 
         def ui_cb(msg: str):
             """High-level — shown in UI log panel."""
@@ -811,6 +813,14 @@ class IntegrationRunPage:
                     self._set_step(node_tag, key, "error", "SSH failed")
             return
 
+        # Steps that need an active AMOS session
+        amos_steps = {
+            "enrollment", "install_lkf", "baseline", "ret_scripts",
+            "relation", "uri_setting", "verify_mme", "take_dump",
+            "take_cm_dump", "gsm_cell_define",
+        }
+        in_amos = False
+
         try:
             step_num = 1
             for key, step_label, applies_to, log_suffix in INTEGRATION_STEPS:
@@ -822,6 +832,29 @@ class IntegrationRunPage:
                 # Skip if not selected
                 if key not in self.selected_steps:
                     continue
+
+                # Enter AMOS lazily before the first step that needs it
+                if not in_amos and key in amos_steps:
+                    ui_cb(f"Entering AMOS for {node_name}...")
+                    try:
+                        ssh.enter_amos(node_name, timeout=90)
+                        in_amos = True
+                        ui_cb("AMOS session ready.")
+                    except Exception as exc:
+                        ui_cb(f"Failed to enter AMOS: {exc}")
+                        # Mark remaining selected steps as error
+                        remaining = False
+                        for rk, _, ra, _ in INTEGRATION_STEPS:
+                            if ra not in ("both", node_type):
+                                continue
+                            if rk not in self.selected_steps:
+                                continue
+                            if rk == key:
+                                remaining = True
+                            if remaining:
+                                self._set_step(node_tag, rk, "error",
+                                               "AMOS failed")
+                        break
 
                 self._set_step(node_tag, key, "running")
                 ui_cb(f"Running {step_label}...")
@@ -1006,7 +1039,8 @@ class IntegrationRunPage:
                     ui_cb(f"{step_label} — FAILED: {exc}")
                     stopped = True
 
-                self._save_step_log(step_num, node_name, log_suffix)
+                self._save_step_log(step_num, node_name, log_suffix,
+                                    node_tag=node_tag)
                 step_num += 1
 
                 if stopped:
@@ -1025,6 +1059,11 @@ class IntegrationRunPage:
                             remaining = True
                     break
         finally:
+            if in_amos:
+                try:
+                    ssh.exit_amos()
+                except Exception:
+                    pass
             ssh.disconnect()
             ui_cb("SSH disconnected.")
 
@@ -1042,7 +1081,7 @@ class IntegrationRunPage:
         self.cancelled = True
         self._timer_running = False
         self._run_finished = True
-        asyncio.create_task(self.page.push_route("/form"))
+        self.page.go("/form")
 
 
 # ── Step row widget ──────────────────────────────────────────────
