@@ -419,56 +419,385 @@ class SrsBrowserSession:
             save_dir = os.path.dirname(save_path)
             os.makedirs(save_dir, exist_ok=True)
 
-            # --- Step 6: Capture canvas/map element ---
+            # --- Step 6: Capture the map canvas (OpenLayers) ---
+            # The map is rendered on a <canvas> inside the OL viewport.
+            # We screenshot just that canvas so the output shows only the
+            # antenna sectors / map content (no surrounding filter panel).
             try:
-                # The map may be inside an iframe or dynamically loaded — wait a moment
-                page.wait_for_timeout(2000)
-                canvas = page.locator("canvas").first
-                if canvas.count() > 0 and canvas.is_visible():
-                    canvas_path = os.path.join(save_dir, f"SRS_map_{segment_name}.png")
-                    canvas.screenshot(path=canvas_path)
-                    results["map"] = canvas_path
-                    logger.info(f"[SRS] Map (canvas) screenshot saved: {canvas_path}")
-                else:
-                    logger.warning("[SRS] Canvas element not visible on detail page")
+                map_accordion = page.locator("#tabGeneralDev_MapAndFeaturesAccordion")
+                if map_accordion.count() > 0:
+                    map_accordion.scroll_into_view_if_needed(timeout=3000)
+                    page.wait_for_timeout(4000)
+
+                # Compute a tight crop around the OL viewport (map area),
+                # using the viewport's actual on-screen bounding box so we
+                # don't capture the off-screen canvas buffer (black area).
+                map_path = os.path.join(save_dir, f"SRS_map_{segment_name}.png")
+                saved = False
+
+                # Approach: read the canvas pixel data via toDataURL. This
+                # returns only the rendered canvas content (no black padding
+                # from Playwright's element-screenshot quirks with large
+                # absolutely-positioned canvases inside scrolled containers).
+                try:
+                    data_url = page.evaluate("""() => {
+                        const sels = [
+                            '#tabGeneralDev_panelMap_amapMap canvas',
+                            '#tabGeneralDev_panelMap .ol-viewport canvas',
+                            '#tabGeneralDev_MapAndFeaturesAccordion canvas',
+                        ];
+                        for (const s of sels) {
+                            const cvs = document.querySelectorAll(s);
+                            let best = null, bestArea = 0;
+                            for (const c of cvs) {
+                                const r = c.getBoundingClientRect();
+                                const area = (r.width || c.width) * (r.height || c.height);
+                                if (area > bestArea) { best = c; bestArea = area; }
+                            }
+                            if (best) {
+                                try { return best.toDataURL('image/png'); }
+                                catch (e) { return null; }
+                            }
+                        }
+                        return null;
+                    }""")
+                    if data_url and data_url.startswith("data:image/png;base64,"):
+                        import base64
+                        png_bytes = base64.b64decode(
+                            data_url[len("data:image/png;base64,"):]
+                        )
+                        with open(map_path, "wb") as f:
+                            f.write(png_bytes)
+                        results["map"] = map_path
+                        logger.info(f"[SRS] Map canvas (toDataURL) saved: {map_path}")
+                        saved = True
+                except Exception as exc:
+                    logger.warning(f"[SRS] canvas toDataURL failed: {exc}")
+
+                if not saved and map_accordion.count() > 0:
+                    map_accordion.screenshot(path=map_path)
+                    results["map"] = map_path
+                    logger.info(f"[SRS] Map (accordion fallback) saved: {map_path}")
             except Exception as exc:
-                logger.warning(f"[SRS] Map (canvas) capture failed: {exc}")
+                logger.warning(f"[SRS] Map capture failed: {exc}")
             self._save_debug(page, "06_map_capture_attempted")
 
-            # --- Step 7: Expand collapsed accordions and capture measurement details ---
+            # --- Step 7: Capture the measurement-details panel ---
+            # This is the 3-column area containing User Information,
+            # Measurement Validation, and Summary accordions.
             try:
                 closed_accordions = page.locator(
-                    ".measurementDetailsWrapper .accordion:not(.accordion-opened) .accordion-header"
+                    "#generalMeasurementDetails .accordion:not(.accordion-opened) .accordion-header"
                 )
                 count = closed_accordions.count()
                 for i in range(count):
                     try:
                         closed_accordions.nth(i).click()
-                        page.wait_for_timeout(500)
+                        page.wait_for_timeout(300)
                     except Exception:
                         pass
                 if count > 0:
-                    logger.info(f"[SRS] Expanded {count} collapsed accordion(s) in measurement details")
+                    logger.info(f"[SRS] Expanded {count} collapsed accordion(s)")
                     page.wait_for_timeout(1000)
             except Exception:
                 pass
 
             try:
-                details = page.locator(".measurementDetailsWrapper").first
-                if details.is_visible():
+                box = page.evaluate("""() => {
+                    const ids = ['userInformationAccordion', 'measurementValidationAccordion', 'measurementSummaryAccordion'];
+                    const els = ids.map(id => document.getElementById(id)).filter(Boolean);
+                    if (els.length === 0) return null;
+                    els[0].scrollIntoView({block: 'start'});
+                    const rects = els.map(el => el.getBoundingClientRect());
+                    const left = Math.min(...rects.map(r => r.left));
+                    const right = Math.max(...rects.map(r => r.right));
+                    const top = Math.min(...rects.map(r => r.top));
+                    const bot = Math.max(...rects.map(r => r.bottom));
+                    return {x: left, y: top, w: right - left, h: bot - top};
+                }""")
+                if box and box["w"] > 0 and box["h"] > 0:
+                    page.wait_for_timeout(800)
+                    box2 = page.evaluate("""() => {
+                        const ids = ['userInformationAccordion', 'measurementValidationAccordion', 'measurementSummaryAccordion'];
+                        const rects = ids.map(id => document.getElementById(id))
+                            .filter(Boolean).map(el => el.getBoundingClientRect());
+                        const left = Math.min(...rects.map(r => r.left));
+                        const right = Math.max(...rects.map(r => r.right));
+                        const top = Math.min(...rects.map(r => r.top));
+                        const bot = Math.max(...rects.map(r => r.bottom));
+                        return {x: left + window.scrollX, y: top + window.scrollY,
+                                w: right - left, h: bot - top};
+                    }""")
                     details_path = os.path.join(
                         save_dir, f"SRS_measurement_details_{segment_name}.png"
                     )
-                    details.screenshot(path=details_path)
+                    page.screenshot(path=details_path, full_page=True, clip={
+                        "x": max(0, box2["x"]),
+                        "y": max(0, box2["y"]),
+                        "width": box2["w"],
+                        "height": box2["h"],
+                    })
                     results["measurement_details"] = details_path
                     logger.info(f"[SRS] Measurement details screenshot saved: {details_path}")
                 else:
-                    logger.warning("[SRS] Measurement details wrapper not visible")
+                    logger.warning("[SRS] #generalMeasurementDetails not found or not sized")
             except Exception as exc:
                 logger.warning(f"[SRS] Measurement details capture failed: {exc}")
             self._save_debug(page, "07_details_capture_attempted")
 
-            # --- Step 8: Full-page screenshot ---
+            # --- Step 8: Click "Test result" tab and capture SMS + Voice call ---
+            try:
+                # Click the Test result tab
+                test_result_tab = page.locator("div.title[hash='testResult']").first
+                if test_result_tab.count() == 0:
+                    test_result_tab = page.locator("div.title").filter(has_text="Test result").first
+                test_result_tab.click()
+                page.wait_for_timeout(2000)
+                logger.info("[SRS] Clicked Test result tab")
+
+                # Reset any horizontal scroll before clipping so left=0 is the true left edge
+                page.evaluate("window.scrollTo(0, window.scrollY)")
+
+                # 8a: SMS test result — scroll element into view, use Playwright's
+                #     bounding_box() (viewport-relative) and screenshot without full_page
+                def _capture_testresult_table(keyword, path):
+                    """Scroll testResultTable for keyword into view and screenshot.
+                    Temporarily shrinks the viewport height so only this table is
+                    visible, preventing adjacent sections from bleeding in."""
+                    # Scroll the table to viewport top and reset X
+                    page.evaluate(f"""() => {{
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {{
+                            if (!w.innerText.includes('{keyword}')) continue;
+                            const t = w.querySelector('table.testResultTable');
+                            if (t) {{
+                                t.scrollIntoView({{block: 'start'}});
+                                window.scrollTo(0, window.scrollY);
+                                return;
+                            }}
+                        }}
+                    }}""")
+                    page.wait_for_timeout(600)
+                    # Measure the table's actual content height (direct children)
+                    info = page.evaluate(f"""() => {{
+                        let tbl = null;
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {{
+                            if (!w.innerText.includes('{keyword}')) continue;
+                            tbl = w.querySelector('table.testResultTable');
+                            if (tbl) break;
+                        }}
+                        if (!tbl) return null;
+                        const tbody = tbl.tBodies[0] || tbl;
+                        const rows = Array.from(tbody.children).filter(e=>e.tagName==='TR');
+                        if (!rows.length) return null;
+                        const fr = rows[0].getBoundingClientRect();
+                        // Last row with non-empty text (skip empty hrDouble separators)
+                        let lastRow = rows[rows.length - 1];
+                        for (let i = rows.length - 1; i >= 0; i--) {{
+                            const t = (rows[i].innerText || '').trim();
+                            if (t.length > 0) {{ lastRow = rows[i]; break; }}
+                        }}
+                        const lr = lastRow.getBoundingClientRect();
+                        const tr = tbl.getBoundingClientRect();
+                        return {{
+                            x: Math.max(0, tr.left), y: Math.max(0, fr.top),
+                            w: tr.right - tr.left,
+                            contentH: lr.bottom - fr.top,
+                            lastText: (lastRow.innerText || '').trim().slice(0, 30),
+                        }};
+                    }}""")
+                    if not info or info["contentH"] <= 0:
+                        logger.warning(f"[SRS] No table info for '{keyword}'")
+                        return False
+                    # Shrink viewport to just fit the content (+ small padding)
+                    snap_h = int(info["contentH"]) + 20
+                    page.set_viewport_size({"width": viewport_width, "height": snap_h})
+                    page.wait_for_timeout(300)
+                    # Re-scroll to ensure table is at top after resize
+                    page.evaluate(f"""() => {{
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {{
+                            if (!w.innerText.includes('{keyword}')) continue;
+                            const t = w.querySelector('table.testResultTable');
+                            if (t) {{ t.scrollIntoView({{block: 'start'}}); return; }}
+                        }}
+                    }}""")
+                    page.wait_for_timeout(300)
+                    info2 = page.evaluate(f"""() => {{
+                        let tbl = null;
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {{
+                            if (!w.innerText.includes('{keyword}')) continue;
+                            tbl = w.querySelector('table.testResultTable');
+                            if (tbl) break;
+                        }}
+                        if (!tbl) return null;
+                        const tbody = tbl.tBodies[0] || tbl;
+                        const rows = Array.from(tbody.children).filter(e=>e.tagName==='TR');
+                        if (!rows.length) return null;
+                        const fr = rows[0].getBoundingClientRect();
+                        let lastRow = rows[rows.length-1];
+                        for (let i = rows.length-1; i >= 0; i--) {{
+                            if ((rows[i].innerText||'').trim().length > 0) {{
+                                lastRow = rows[i]; break;
+                            }}
+                        }}
+                        const lr = lastRow.getBoundingClientRect();
+                        const tr = tbl.getBoundingClientRect();
+                        return {{x:Math.max(0,tr.left), y:Math.max(0,fr.top),
+                                 w:tr.right-tr.left, h:lr.bottom-fr.top+4}};
+                    }}""")
+                    if info2 and info2["h"] > 0:
+                        page.screenshot(path=path, clip={
+                            "x": info2["x"], "y": info2["y"],
+                            "width": info2["w"], "height": info2["h"],
+                        })
+                    else:
+                        page.screenshot(path=path)
+                    # Restore original viewport height
+                    page.set_viewport_size({"width": viewport_width, "height": viewport_height})
+                    page.wait_for_timeout(200)
+                    logger.info(f"[SRS] Captured '{keyword}' clip: {info2}")
+                    return True
+
+                try:
+                    sms_path = os.path.join(save_dir, f"SRS_sms_result_{segment_name}.png")
+                    if _capture_testresult_table("Sms test result", sms_path):
+                        results["sms_result"] = sms_path
+                        logger.info(f"[SRS] SMS result screenshot saved: {sms_path}")
+                    else:
+                        logger.warning("[SRS] SMS test result table not found")
+                except Exception as exc:
+                    logger.warning(f"[SRS] SMS screenshot failed: {exc}")
+                self._save_debug(page, "08a_sms_result")
+
+                # 8b: Voice Call result — summary table + voiceCallTable + pagination,
+                #     stopping before the BROWSER section.
+                #     Uses same viewport-shrink approach as SMS to avoid black padding.
+                try:
+                    voice_path = os.path.join(save_dir, f"SRS_voice_result_{segment_name}.png")
+                    # Step 1: scroll Voice Call wrapper into view
+                    page.evaluate("""() => {
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {
+                            if ((w.innerText||'').includes('Voice Call test result')) {
+                                w.scrollIntoView({block: 'start'});
+                                window.scrollTo(window.scrollX, window.scrollY);
+                                return;
+                            }
+                        }
+                    }""")
+                    page.wait_for_timeout(600)
+                    # Step 2: measure viewport-relative bounds of all voice elements
+                    vinfo = page.evaluate("""() => {
+                        let wrap = null;
+                        for (const w of document.querySelectorAll('.table-flex-wrapper')) {
+                            if ((w.innerText||'').includes('Voice Call test result')) {
+                                wrap = w; break;
+                            }
+                        }
+                        if (!wrap) return null;
+                        const dataTbl = document.querySelector('[data-testid="voiceCallTable"]');
+                        // Pagination is a direct next sibling of dataTbl
+                        const pag = dataTbl?.nextElementSibling || null;
+                        const items = [wrap, dataTbl, pag].filter(Boolean);
+                        const tops  = items.map(e => e.getBoundingClientRect().top);
+                        const bots  = items.map(e => e.getBoundingClientRect().bottom);
+                        const lefts = items.map(e => e.getBoundingClientRect().left);
+                        const rights= items.map(e => e.getBoundingClientRect().right);
+                        const top   = Math.min(...tops);
+                        const bot   = Math.max(...bots);
+                        const left  = Math.min(...lefts);
+                        const right = Math.max(...rights);
+                        return {
+                            x: Math.max(0, left), y: Math.max(0, top),
+                            w: right - left, contentH: bot - top,
+                            items: items.length,
+                        };
+                    }""")
+                    if vinfo and vinfo["contentH"] > 0:
+                        # Step 3: scroll Voice Call wrap to top of viewport (no resize yet)
+                        page.wait_for_timeout(300)
+                        # Step 4: measure BROWSER top in the current (full) viewport
+                        # Use document-absolute scrollY to find BROWSER, then compute
+                        # how many px from wrap.top to just before BROWSER.
+                        vinfo2 = page.evaluate("""() => {
+                            let wrap = null;
+                            for (const w of document.querySelectorAll('.table-flex-wrapper')) {
+                                if ((w.innerText||'').includes('Voice Call test result')) {
+                                    wrap = w; break;
+                                }
+                            }
+                            if (!wrap) return null;
+                            const dataTbl = document.querySelector('[data-testid="voiceCallTable"]');
+                            // Pagination is direct next sibling of dataTbl
+                            const pag = dataTbl?.nextElementSibling || null;
+                            const items = [wrap, dataTbl, pag].filter(Boolean);
+                            const tops  = items.map(e => e.getBoundingClientRect().top);
+                            const bots  = items.map(e => e.getBoundingClientRect().bottom);
+                            const lefts = items.map(e => e.getBoundingClientRect().left);
+                            const rights= items.map(e => e.getBoundingClientRect().right);
+                            const wrapTop   = Math.min(...tops);
+                            const contentBot = Math.max(...bots);
+                            const left  = Math.min(...lefts);
+                            const right = Math.max(...rights);
+                            // BROWSER: walk DOM upward from dataTbl to find its
+                            // container, then the next major sibling accordion
+                            let browserTop = contentBot + 300;
+                            // Walk siblings after the pagination
+                            if (pag) {
+                                let sib = pag.nextElementSibling;
+                                for (let i = 0; sib && i < 8; i++, sib = sib.nextElementSibling) {
+                                    const r = sib.getBoundingClientRect();
+                                    if (r.top > wrapTop) {
+                                        // first sibling below voice content = next section
+                                        browserTop = r.top;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Also search parent container's siblings for next accordion
+                            const container = dataTbl?.parentElement?.parentElement;
+                            if (container) {
+                                let sib = container.nextElementSibling;
+                                for (let i = 0; sib && i < 5; i++, sib = sib.nextElementSibling) {
+                                    const r = sib.getBoundingClientRect();
+                                    if (r.top > wrapTop && r.top < browserTop) {
+                                        browserTop = r.top;
+                                        break;
+                                    }
+                                }
+                            }
+                            const clipH = Math.min(contentBot, browserTop - 8) - wrapTop + 4;
+                            return {
+                                x: Math.max(0, left),
+                                y: Math.max(0, wrapTop),
+                                w: right - left,
+                                h: Math.max(clipH, 10),
+                                dbg: {wrapTop, contentBot, browserTop, clipH},
+                            };
+                        }""")
+                        logger.warning(f"[SRS] vinfo2={vinfo2}")
+                        if vinfo2 and vinfo2["h"] > 0:
+                            page.screenshot(path=voice_path, clip={
+                                "x": vinfo2["x"], "y": vinfo2["y"],
+                                "width": vinfo2["w"], "height": vinfo2["h"],
+                            })
+                        else:
+                            page.screenshot(path=voice_path)
+                        page.wait_for_timeout(200)
+                        results["voice_result"] = voice_path
+                        logger.warning(
+                            f"[SRS] Voice call result saved: {voice_path}"
+                        )
+                    else:
+                        logger.warning("[SRS] Voice Call test result section not found")
+                except Exception as exc:
+                    logger.warning(f"[SRS] Voice screenshot failed: {exc}")
+                    page.set_viewport_size({"width": viewport_width,
+                                            "height": viewport_height})
+                self._save_debug(page, "08b_voice_result")
+
+            except Exception as exc:
+                logger.warning(f"[SRS] Test result tab capture failed: {exc}")
+
+            # --- Step 9: Full-page screenshot ---
             try:
                 page.screenshot(path=save_path, full_page=True)
                 results["full_page"] = save_path

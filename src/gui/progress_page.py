@@ -860,55 +860,11 @@ class ProgressPage:
         if self.cancelled:
             return
 
-        # Phase 2b — SRS browser capture (Edge CDP, user authenticates via Azure SSO)
+        # Phase 2b — SRS (placeholder: feature still in development)
         srs_screenshots: dict[str, str] = {}  # category -> path
-        edge_exe = _find_edge_exe()
-        if edge_exe:
-            self._log_queue.put_nowait("__STATUS__:Phase 2b: SRS screenshot capture")
-            self._log_queue.put_nowait("__MODE__:Launching Edge for SRS — user must log in via Azure SSO.")
-            self._log_message("[SRS] Microsoft Edge found, starting SRS capture flow...")
-
-            # Launch Edge with debug port (non-blocking)
-            edge_proc = launch_edge_with_debug_port(SRS_BASE_URL, CDP_PORT)
-            if edge_proc:
-                # Show dialog and wait for user to confirm they're logged in
-                user_ready = self._srs_login_dialog()
-                if user_ready and not self.cancelled:
-                    if is_edge_debug_port_open(CDP_PORT):
-                        self._log_message("[SRS] CDP port open, connecting via Playwright...")
-                        try:
-                            screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
-                            srs_save_path = os.path.join(screenshots_dir, "SRS_overview.png")
-                            with SrsBrowserSession(port=CDP_PORT, debug_dir=screenshots_dir) as srs:
-                                if srs.check_logged_in():
-                                    self._log_message("[SRS] User is authenticated, capturing pages...")
-                                    result = srs.capture_page(
-                                        SRS_BASE_URL,
-                                        srs_save_path,
-                                        wait_ms=5000,
-                                    )
-                                    if result:
-                                        srs_screenshots["SRS"] = result
-                                        self._log_message(f"[SRS] Screenshot saved: {result}")
-                                    else:
-                                        self._log_message("[SRS] Screenshot capture failed")
-                                else:
-                                    self._log_message("[SRS] User does not appear logged in — skipping SRS capture")
-                        except Exception as exc:
-                            self._log_message(f"[SRS] Capture failed: {exc}")
-                            logging.getLogger(__name__).exception("SRS capture failed")
-                    else:
-                        self._log_message("[SRS] CDP port not reachable — skipping SRS capture")
-                else:
-                    self._log_message("[SRS] User skipped SRS login — no SRS screenshots")
-            else:
-                self._log_message("[SRS] Failed to launch Edge — skipping SRS capture")
-        else:
-            self._log_message("[SRS] Microsoft Edge not found — skipping SRS capture")
-
-        self._log_message(
-            f"[SRS] Capture complete: {len(srs_screenshots)} screenshot(s)"
-        )
+        self._log_queue.put_nowait("__STATUS__:Phase 2b: SRS screenshot")
+        self._log_queue.put_nowait("__MODE__:SRS screenshot is being developed, not finish yet.")
+        self._log_message("[SRS] SRS screenshot is being developed, not finish yet — skipping.")
 
         if self.cancelled:
             return

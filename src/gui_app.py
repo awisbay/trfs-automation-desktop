@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import flet as ft
 from gui.form_page import FormPage
+from gui.integration_page import IntegrationPage, IntegrationRunPage
 from gui.progress_page import ProgressPage
 from gui.result_page import ResultPage
 from gui.theme import BG_TOP
@@ -53,6 +54,8 @@ def main(page: ft.Page):
             return FormPage(page).build()
         elif route == "/progress":
             return ProgressPage(page).build()
+        elif route == "/integration":
+            return IntegrationPage(page).build()
         elif route == "/result":
             return ResultPage(page).build()
         return FormPage(page).build()

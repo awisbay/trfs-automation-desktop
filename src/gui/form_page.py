@@ -41,8 +41,12 @@ class FormPage:
         self.defaults = {
             "shortcode": "",
             "node_name": "",
+            "node_ip": "",
+            "subnetwork": "",
             "gsm_node_name": "",
             "bsc_name": "",
+            "gsm_node_ip": "",
+            "gsm_subnetwork": "",
             "host": "",
             "port": 5023,
             "username": "",
@@ -113,19 +117,41 @@ class FormPage:
             expand=1,
             autofocus=True,
         )
+        # --- Node 1: LTE/NR ---
         self.node_name_field = self._text_field(
             "Node Name (LTE/NR)",
             self.defaults["node_name"],
             expand=2,
         )
+        self.node_ip_field = self._text_field(
+            "Node IP",
+            self.defaults["node_ip"],
+            expand=1,
+        )
+        self.subnetwork_field = self._text_field(
+            "Subnetwork",
+            self.defaults["subnetwork"],
+            expand=1,
+        )
+        # --- Node 2: GSM ---
         self.gsm_node_name_field = self._text_field(
             "Node Name (GSM)",
             self.defaults["gsm_node_name"],
-            expand=1,
+            expand=2,
         )
         self.bsc_name_field = self._text_field(
             "BSC Name",
             self.defaults["bsc_name"],
+            expand=1,
+        )
+        self.gsm_node_ip_field = self._text_field(
+            "Node IP (GSM)",
+            self.defaults["gsm_node_ip"],
+            expand=1,
+        )
+        self.gsm_subnetwork_field = self._text_field(
+            "Subnetwork (GSM)",
+            self.defaults["gsm_subnetwork"],
             expand=1,
         )
         self.host_field = self._text_field("ENM IP", self.defaults["host"], expand=2)
@@ -152,13 +178,30 @@ class FormPage:
             on_click=self._on_browse,
         )
 
-        self.demo_switch = ft.Switch(
-            label="Demo mode",
-            value=False,
-            active_color=ACCENT,
-            inactive_thumb_color=TEXT_MUTED,
-            inactive_track_color="#314C61",
+        # --- Integration files ---
+        self.lkf_field = self._text_field(
+            "LKF File",
+            self.defaults.get("lkf_file", ""),
+            expand=True,
         )
+        self.lkf_browse = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=ACCENT,
+            tooltip="Browse for LKF file",
+            on_click=self._on_browse_lkf,
+        )
+        self.relation_field = self._text_field(
+            "Relation File",
+            self.defaults.get("relation_file", ""),
+            expand=True,
+        )
+        self.relation_browse = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=ACCENT,
+            tooltip="Browse for Relation file",
+            on_click=self._on_browse_relation,
+        )
+
         self.error_text = ft.Text("", color="#FFB4B4", visible=False, size=12)
         self.error_box = ft.Container(
             content=self.error_text,
@@ -191,7 +234,7 @@ class FormPage:
                         color=TEXT,
                     ),
                     ft.Text(
-                        "A sharper control room for SSH execution, ENM capture, and Excel report generation.",
+                        "Control room for SSH execution, ENM capture, Excel reports, and Integration testing.",
                         size=15,
                         color=TEXT_MUTED,
                     ),
@@ -200,6 +243,7 @@ class FormPage:
                             badge("SSH + Moshell", INFO, ft.Icons.TERMINAL),
                             badge("ENM Browser Capture", ACCENT_WARM, ft.Icons.CAMERA_ALT),
                             badge("Excel Output", SUCCESS, ft.Icons.GRID_ON),
+                            badge("Integration", "#9C7CFF", ft.Icons.INTEGRATION_INSTRUCTIONS),
                         ],
                         wrap=True,
                         spacing=10,
@@ -264,11 +308,17 @@ class FormPage:
                     ),
                     self._section_label("Site Identity"),
                     ft.Row(
-                        [self.shortcode_field, self.node_name_field],
+                        [self.shortcode_field],
                         spacing=14,
                     ),
+                    self._section_label("Node 1 — LTE / NR"),
                     ft.Row(
-                        [self.gsm_node_name_field, self.bsc_name_field],
+                        [self.node_name_field, self.node_ip_field, self.subnetwork_field],
+                        spacing=14,
+                    ),
+                    self._section_label("Node 2 — GSM"),
+                    ft.Row(
+                        [self.gsm_node_name_field, self.bsc_name_field, self.gsm_node_ip_field, self.gsm_subnetwork_field],
                         spacing=14,
                     ),
                     self._section_label("Access"),
@@ -287,14 +337,30 @@ class FormPage:
                         size=11,
                         color=TEXT_MUTED,
                     ),
+                    self._section_label("Integration Files"),
+                    ft.Row(
+                        [self.lkf_field, self.lkf_browse],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [self.relation_field, self.relation_browse],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                     self.error_box,
                     ft.Container(height=8),
                     ft.Row(
                         [
-                            self.demo_switch,
                             ft.Container(expand=True),
                             ft.ElevatedButton(
-                                "Launch Run",
+                                "Integration Launch",
+                                icon=ft.Icons.INTEGRATION_INSTRUCTIONS,
+                                style=secondary_button_style(),
+                                on_click=self._on_integration,
+                            ),
+                            ft.ElevatedButton(
+                                "TRFS Launch",
                                 icon=ft.Icons.PLAY_CIRCLE_FILL_ROUNDED,
                                 style=primary_button_style(),
                                 on_click=self._on_start,
@@ -379,6 +445,24 @@ class FormPage:
             self.page.update()
             self._validate_commands()
 
+    async def _on_browse_lkf(self, e):
+        files = await self.file_picker.pick_files(
+            dialog_title="Select LKF File",
+            allow_multiple=False,
+        )
+        if files:
+            self.lkf_field.value = files[0].path
+            self.page.update()
+
+    async def _on_browse_relation(self, e):
+        files = await self.file_picker.pick_files(
+            dialog_title="Select Relation File",
+            allow_multiple=False,
+        )
+        if files:
+            self.relation_field.value = files[0].path
+            self.page.update()
+
     def _validate_commands(self):
         path = self.commands_field.value.strip()
         if not path or not os.path.isfile(path):
@@ -413,61 +497,103 @@ class FormPage:
         except Exception:
             pass
 
+    def _collect_form(self):
+        """Gather all form values and return as dict."""
+        return {
+            "shortcode": self.shortcode_field.value.strip(),
+            "node_name": self.node_name_field.value.strip(),
+            "node_ip": self.node_ip_field.value.strip(),
+            "subnetwork": self.subnetwork_field.value.strip(),
+            "gsm_node_name": self.gsm_node_name_field.value.strip(),
+            "bsc_name": self.bsc_name_field.value.strip(),
+            "gsm_node_ip": self.gsm_node_ip_field.value.strip(),
+            "gsm_subnetwork": self.gsm_subnetwork_field.value.strip(),
+            "host": self.host_field.value.strip(),
+            "port": int(self.port_field.value.strip()) if self.port_field.value.strip() else 5023,
+            "username": self.username_field.value.strip(),
+            "password": self.password_field.value.strip(),
+            "commands_file": self.commands_field.value.strip(),
+            "lkf_file": self.lkf_field.value.strip(),
+            "relation_file": self.relation_field.value.strip(),
+        }
+
+    def _show_errors(self, errors: list[str]):
+        self.error_text.value = " ".join(errors)
+        self.error_text.visible = True
+        self.error_box.visible = True
+        self.page.update()
+
     def _on_start(self, e):
-        shortcode = self.shortcode_field.value.strip()
-        node_name = self.node_name_field.value.strip()
-        gsm_node_name = self.gsm_node_name_field.value.strip()
-        bsc_name = self.bsc_name_field.value.strip()
-        host = self.host_field.value.strip()
-        port = int(self.port_field.value.strip()) if self.port_field.value.strip() else 5023
-        username = self.username_field.value.strip()
-        password = self.password_field.value.strip()
-        commands_file = self.commands_field.value.strip()
-        demo_mode = self.demo_switch.value
+        f = self._collect_form()
 
         errors = []
-        if not shortcode:
+        if not f["shortcode"]:
             errors.append("Shortcode is required.")
-        if not node_name:
+        if not f["node_name"]:
             errors.append("Node name is required.")
-        if not host and not demo_mode:
-            errors.append("ENM IP is required unless demo mode is enabled.")
-        if not username and not demo_mode:
-            errors.append("Username is required unless demo mode is enabled.")
-        if not password and not demo_mode:
-            errors.append("Password is required unless demo mode is enabled.")
-        if not commands_file:
+        if not f["host"]:
+            errors.append("ENM IP is required.")
+        if not f["username"]:
+            errors.append("Username is required.")
+        if not f["password"]:
+            errors.append("Password is required.")
+        if not f["commands_file"]:
             errors.append("Commands file is required.")
-        elif not os.path.isfile(commands_file):
-            errors.append(f"Commands file not found: {commands_file}")
+        elif not os.path.isfile(f["commands_file"]):
+            errors.append(f"Commands file not found: {f['commands_file']}")
 
         if errors:
-            self.error_text.value = " ".join(errors)
-            self.error_text.visible = True
-            self.error_box.visible = True
-            self.page.update()
+            self._show_errors(errors)
             return
 
         self.error_text.visible = False
         self.error_box.visible = False
 
-        save_session(host=host, port=port, username=username, password=password)
+        save_session(host=f["host"], port=f["port"],
+                     username=f["username"], password=f["password"])
 
         config = build_config_from_form(
-            shortcode=shortcode,
-            node_name=node_name,
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            commands_file=commands_file,
+            shortcode=f["shortcode"],
+            node_name=f["node_name"],
+            host=f["host"],
+            port=f["port"],
+            username=f["username"],
+            password=f["password"],
+            commands_file=f["commands_file"],
             config_path=self.defaults.get("config_path") or None,
-            gsm_node_name=gsm_node_name,
-            bsc_name=bsc_name,
+            gsm_node_name=f["gsm_node_name"],
+            bsc_name=f["bsc_name"],
         )
 
         self.page.trfs_config = config
-        self.page.trfs_demo_mode = demo_mode
-        self.page.trfs_commands_file = commands_file
+        self.page.trfs_demo_mode = False
+        self.page.trfs_commands_file = f["commands_file"]
 
         asyncio.create_task(self.page.push_route("/progress"))
+
+    def _on_integration(self, e):
+        f = self._collect_form()
+
+        errors = []
+        if not f["node_name"]:
+            errors.append("Node name (LTE/NR) is required.")
+        if not f["host"]:
+            errors.append("ENM IP is required.")
+        if not f["username"]:
+            errors.append("Username is required.")
+        if not f["password"]:
+            errors.append("Password is required.")
+
+        if errors:
+            self._show_errors(errors)
+            return
+
+        self.error_text.visible = False
+        self.error_box.visible = False
+
+        save_session(host=f["host"], port=f["port"],
+                     username=f["username"], password=f["password"])
+
+        # Store integration form data for the integration workflow
+        self.page.integration_form = f
+        asyncio.create_task(self.page.push_route("/integration"))
