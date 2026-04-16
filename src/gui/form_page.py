@@ -1,5 +1,5 @@
 """
-TRFS GUI - Elevated configuration workspace.
+NodeCraft GUI - Elevated configuration workspace.
 """
 import asyncio
 import os
@@ -228,10 +228,16 @@ class FormPage:
                 [
                     badge("Desktop Workflow", ACCENT, ft.Icons.DESKTOP_WINDOWS),
                     ft.Text(
-                        "TRFS Generator",
+                        "NodeCraft",
                         size=42,
                         weight=ft.FontWeight.BOLD,
                         color=TEXT,
+                    ),
+                    ft.Text(
+                        "v1.0 — by ewisbay",
+                        size=14,
+                        color=ACCENT,
+                        weight=ft.FontWeight.W_500,
                     ),
                     ft.Text(
                         "Control room for SSH execution, ENM capture, Excel reports, and Integration testing.",
@@ -302,7 +308,7 @@ class FormPage:
                 [
                     ft.Text("Run Configuration", size=26, weight=ft.FontWeight.BOLD, color=TEXT),
                     ft.Text(
-                        "Set the site, access, and source file once, then launch the full TRFS flow from one place.",
+                        "Control room for SSH execution, ENM capture, Excel reports, and Integration testing.",
                         size=14,
                         color=TEXT_MUTED,
                     ),
@@ -326,7 +332,7 @@ class FormPage:
                         [self.host_field, self.port_field, self.username_field, self.password_field],
                         spacing=14,
                     ),
-                    self._section_label("Command Source"),
+                    self._section_label("TRFS Script"),
                     ft.Row(
                         [self.commands_field, self.browse_button],
                         spacing=8,

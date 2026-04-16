@@ -1,0 +1,27 @@
+{
+    "_comment": "NodeCraft dynamic configuration — edit values here instead of changing code.",
+
+    "scripts_path": "/home/shared/ESETARI/INOC/SCRIPTS",
+    "cli_py": "/home/shared/ESETARI/INOC/SCRIPTS/cli.py",
+
+    "create_arne_script": "ES/create_arne.py",
+    "entity_maker_script": "ES/entity_maker.sh",
+    "exe_entity_script": "ES/exe_entity.py",
+    "enrollment_mos": "ES/enroll/lhgenm1.mos",
+
+    "lkf_import_script": "lkfimport.py",
+    "lkf_install_script": "lkfinstall.py",
+    "lkf_status_script": "lkfstatus.py",
+
+    "baseline_files": {
+        "L":  "Globe_Baseline_L_NonModular_Rev_15042026.mos",
+        "LN": "Globe_Baseline_LN_NonModular_Rev_15042026.mos",
+        "N":  "Globe_Baseline_LN_NonModular_Rev_15042026.mos"
+    },
+
+    "uri_setting": {
+        "enm_login_url": "https://lhgenm1.globetel.com/login",
+        "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
+        "upgrade_package_id": "CXP2010174/2-R42H05"
+    }
+}

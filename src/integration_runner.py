@@ -3,6 +3,7 @@ Integration workflow — SSH session for running integration scripts.
 Provides an interactive shell that can handle prompted inputs and
 verification commands.
 """
+import json
 import logging
 import os
 import re
@@ -12,6 +13,49 @@ from typing import Callable, Optional
 import paramiko
 
 logger = logging.getLogger(__name__)
+
+# ── Load dynamic config ─────────────────────────────────────────
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _load_config() -> dict:
+    """Load config.json. Returns defaults if file is missing."""
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("config.json not found, using built-in defaults.")
+        return {}
+
+
+_CFG = _load_config()
+
+SCRIPTS_PATH = _CFG.get("scripts_path", "/home/shared/ESETARI/INOC/SCRIPTS")
+CLI_PY = _CFG.get("cli_py", f"{SCRIPTS_PATH}/cli.py")
+
+_CREATE_ARNE = _CFG.get("create_arne_script", "ES/create_arne.py")
+_ENTITY_MAKER = _CFG.get("entity_maker_script", "ES/entity_maker.sh")
+_EXE_ENTITY = _CFG.get("exe_entity_script", "ES/exe_entity.py")
+_ENROLLMENT_MOS = _CFG.get("enrollment_mos", "ES/enroll/lhgenm1.mos")
+
+_LKF_IMPORT = _CFG.get("lkf_import_script", "lkfimport.py")
+_LKF_INSTALL = _CFG.get("lkf_install_script", "lkfinstall.py")
+_LKF_STATUS = _CFG.get("lkf_status_script", "lkfstatus.py")
+
+_BASELINE_FILES = _CFG.get("baseline_files", {
+    "L":  "Globe_Baseline_L_NonModular_Rev_15042026.mos",
+    "LN": "Globe_Baseline_LN_NonModular_Rev_15042026.mos",
+    "N":  "Globe_Baseline_LN_NonModular_Rev_15042026.mos",
+})
+
+_URI_CFG = _CFG.get("uri_setting", {})
+ENM_LOGIN_URL = _URI_CFG.get(
+    "enm_login_url", "https://lhgenm1.globetel.com/login")
+ENM_URI_UPDATE_URL = _URI_CFG.get(
+    "enm_uri_update_url",
+    "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/"
+    "updateUpMoFtpServerDetails")
+_UPGRADE_PKG_ID = _URI_CFG.get("upgrade_package_id", "CXP2010174/2-R42H05")
 
 ANSI_ESCAPE = re.compile(
     r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]|\x1b\(B"
@@ -346,7 +390,7 @@ def verify_arne(ssh: IntegrationSSH, node_name: str, log_cb: Callable[[str], Non
     """Run cli.py to verify the node exists. Returns (success, output)."""
     log_cb(f"Verifying ARNE for {node_name}...")
     verify_cmd = (
-        f'python /home/shared/ESETARI/INOC/SCRIPTS/cli.py '
+        f'python {CLI_PY} '
         f'"cmedit get {node_name}"'
     )
     verify_output = ssh.run_command(verify_cmd, timeout=60)
@@ -377,7 +421,7 @@ def run_create_arne(
 
     # Step 1: Run the ARNE creation script
     output = ssh.run_interactive(
-        command="python /home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne.py",
+        command=f"python {SCRIPTS_PATH}/{_CREATE_ARNE}",
         prompts=[
             ("nodename",   node_name),
             ("ipaddress",  node_ip),
@@ -424,9 +468,6 @@ def run_create_arne(
     return True, all_output
 
 
-# Path to shared CLI script (accessible by all users)
-CLI_PY = "/home/shared/ESETARI/INOC/SCRIPTS/cli.py"
-
 
 # ── Enrollment step ──────────────────────────────────────────────
 def run_enrollment(
@@ -471,7 +512,7 @@ def run_enrollment(
     # ── 3. Create entity XML ─────────────────────────────────────
     log_cb(f"Creating entity XML for {node_name}...")
     out = ssh.run_amos_command_safe(
-        f"!bash /home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh {node_name}",
+        f"!bash {SCRIPTS_PATH}/{_ENTITY_MAKER} {node_name}",
         node_name, timeout=60,
     )
     all_output += out
@@ -512,7 +553,7 @@ def run_enrollment(
     # ── 4. Upload entity file ────────────────────────────────────
     log_cb(f"Uploading entity file for {node_name}...")
     out = ssh.run_amos_command_safe(
-        f"!python /home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py "
+        f"!python {SCRIPTS_PATH}/{_EXE_ENTITY} "
         f"~/INOC/SCRIPTS/NS/{node_name}.xml",
         node_name, timeout=300,
     )
@@ -545,7 +586,7 @@ def run_enrollment(
     # ── 5. Run enrollment MOS script ─────────────────────────────
     log_cb("Running enrollment script (lhgenm1.mos)...")
     out = ssh.run_amos_command_safe(
-        "run /home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos",
+        f"run {SCRIPTS_PATH}/{_ENROLLMENT_MOS}",
         node_name, timeout=600,
     )
     all_output += out
@@ -645,9 +686,6 @@ def run_enrollment(
 
 
 # ── LKF step ─────────────────────────────────────────────────────
-SCRIPTS_PATH = "/home/shared/ESETARI/INOC/SCRIPTS"
-
-
 def run_install_lkf(
     ssh: IntegrationSSH,
     node_name: str,
@@ -697,7 +735,7 @@ def run_install_lkf(
     # ── 2. Import LKF ────────────────────────────────────────────
     log_cb(f"Importing LKF: {zip_filename}...")
     out = ssh.run_amos_command_safe(
-        f"!python {SCRIPTS_PATH}/lkfimport.py /home/shared/{ssh.username}/LKF/{zip_filename}",
+        f"!python {SCRIPTS_PATH}/{_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
         node_name, timeout=300,
     )
     all_output += out
@@ -706,7 +744,7 @@ def run_install_lkf(
     # ── 3. Install LKF — extract job name ────────────────────────
     log_cb(f"Installing LKF for {node_name}...")
     out = ssh.run_amos_command_safe(
-        f"!python {SCRIPTS_PATH}/lkfinstall.py {node_name}",
+        f"!python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
         node_name, timeout=300,
     )
     all_output += out
@@ -737,7 +775,7 @@ def run_install_lkf(
                 return False, all_output
             # Ask again — maybe user can provide it or it appeared
             out2 = ssh.run_amos_command_safe(
-                f"!python {SCRIPTS_PATH}/lkfinstall.py {node_name}",
+                f"!python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
                 node_name, timeout=120,
             )
             all_output += out2
@@ -757,7 +795,7 @@ def run_install_lkf(
 
     # ── 4. Poll status until COMPLETED ───────────────────────────
     log_cb(f"Checking LKF installation status for job: {job_name}...")
-    status_cmd = f"!python {SCRIPTS_PATH}/lkfstatus.py {job_name}"
+    status_cmd = f"!python {SCRIPTS_PATH}/{_LKF_STATUS} {job_name}"
     max_attempts = 10
     completed = False
 
@@ -790,12 +828,7 @@ def run_install_lkf(
 
 
 # ── Baseline step ────────────────────────────────────────────────
-# Mapping from $rats value to baseline MOS file
-BASELINE_MAP = {
-    "L":  "Globe_Baseline_L_NonModular_Rev_15042026.mos",
-    "LN": "Globe_Baseline_LN_NonModular_Rev_15042026.mos",
-    "N":  "Globe_Baseline_LN_NonModular_Rev_15042026.mos",  # NR-only uses LN baseline
-}
+BASELINE_MAP = _BASELINE_FILES
 
 
 def run_baseline(
@@ -928,13 +961,6 @@ def run_baseline(
 
 
 # ── URI Setting step ─────────────────────────────────────────────
-ENM_LOGIN_URL = "https://lhgenm1.globetel.com/login"
-ENM_URI_UPDATE_URL = (
-    "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/"
-    "updateUpMoFtpServerDetails"
-)
-
-
 def run_uri_setting(
     ssh: IntegrationSSH,
     node_name: str,
@@ -947,8 +973,8 @@ def run_uri_setting(
 
     AMOS commands:
       1. set SwM=1 defaultUri
-      2. set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 uri
-      3. set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05
+      2. set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} uri
+      3. set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID}
          password cleartext=true,password=
 
     Bash commands (via ! prefix in AMOS):
@@ -965,8 +991,8 @@ def run_uri_setting(
     # ── 1-3. AMOS set commands ──────────────────────────────────
     amos_cmds = [
         "set SwM=1 defaultUri",
-        "set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 uri",
-        "set SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42H05 "
+        f"set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} uri",
+        f"set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} "
         "password cleartext=true,password=",
     ]
 

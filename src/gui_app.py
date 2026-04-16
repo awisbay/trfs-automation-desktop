@@ -1,5 +1,5 @@
 """
-TRFS Automation Tool - Flet Desktop GUI Entry Point
+NodeCraft - Flet Desktop GUI Entry Point
 """
 import sys
 import os
@@ -15,7 +15,7 @@ from gui.theme import BG_TOP
 
 
 def main(page: ft.Page):
-    page.title = "TRFS Generator — by ewisbay"
+    page.title = "NodeCraft v1.0 — ewisbay"
     from app_path import get_app_dir
     _icon_path = os.path.join(get_app_dir(), "snapshot.ico")
     if os.path.exists(_icon_path):
