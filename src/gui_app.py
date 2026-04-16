@@ -28,7 +28,6 @@ def main(page: ft.Page):
     page.padding = 0
     page.spacing = 0
     page.bgcolor = BG_TOP
-    page.window.bgcolor = BG_TOP
     page.theme = ft.Theme(
         color_scheme_seed="#39C0BA",
         color_scheme=ft.ColorScheme(
@@ -47,6 +46,7 @@ def main(page: ft.Page):
         ),
     )
     page.window.title_bar_hidden = False
+    page.window.title_bar_button_color = "#39C0BA"
     page.window.frameless = False
 
     def build_view(route: str) -> ft.View:
