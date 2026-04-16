@@ -1051,6 +1051,113 @@ def run_uri_setting(
 
 
 # ── Relation step ────────────────────────────────────────────────
+def _parse_relation_output(output: str, filename: str) -> dict:
+    """Parse AMOS relation script output and extract summary metrics.
+
+    Replicates the logic of the bash validation script:
+      - For Relation/Definition files: MO_TOTAL, MO_EXIST, MO_CRE, FAILED, TOTALERROR
+      - For other (set) files: CMD_SET, SUCCEED, FAILED, WRONG_MO
+
+    Returns a dict with all metrics and a formatted summary string.
+    """
+    import re
+
+    lines = output.split("\n")
+
+    # Count metrics by grepping output lines (same patterns as the bash script)
+    failed = 0          # "Total: 1 MOs attempted, 0 MOs set"
+    no_att = 0          # "Total: 0 MOs attempted, 0 MOs set"
+    l_set = 0           # lines containing "MOs set"
+    mo_total = 0        # lines with "> pr"
+    mo_exist = 0        # "Total: 1 MOs$" preceded by "Proxy  MO"
+    mo_cre = 0          # lines with "[Proxy ID"
+    tot_failed = 0      # lines with "0 MOs set"
+    att = 0             # "Total: N MOs attempted, N MOs set" where N > 0
+    cmd_set = 0         # lines with "> set"
+    no_change = 0       # lines with "-No Change-"
+    total_error = 0     # lines with "!!!!" or "ERROR"
+
+    for line in lines:
+        stripped = line.strip()
+
+        if re.search(r'Total:\s+1\s+MOs\s+attempted,\s+0\s+MOs\s+set', stripped):
+            failed += 1
+        if re.search(r'Total:\s+0\s+MOs\s+attempted,\s+0\s+MOs\s+set', stripped):
+            no_att += 1
+        if 'MOs set' in stripped:
+            l_set += 1
+        if '> pr' in stripped:
+            mo_total += 1
+        if re.search(r'Total:\s+1\s+MOs\s*$', stripped):
+            # Check previous lines for "Proxy  MO"
+            idx = lines.index(line)
+            context = "\n".join(lines[max(0, idx - 8):idx + 1])
+            if 'Proxy  MO' in context:
+                mo_exist += 1
+        if '[Proxy ID' in stripped:
+            mo_cre += 1
+        if '0 MOs set' in stripped:
+            tot_failed += 1
+        if re.search(
+            r'Total:\s+[1-9]\d?\s+MOs\s+attempted,\s+[1-9]\d?\s+MOs\s+set',
+            stripped
+        ):
+            att += 1
+        if '> set' in stripped:
+            cmd_set += 1
+        if '-No Change-' in stripped:
+            no_change += 1
+        if '!!!!' in stripped or 'ERROR' in stripped:
+            total_error += 1
+
+    # Determine file type for display format
+    is_relation = any(
+        kw in filename for kw in ("Relation", "Definition", "RNC")
+    )
+
+    if is_relation:
+        summary_line = (
+            f"MO_TOTAL={mo_total}  MO_EXIST={mo_exist}  "
+            f"MO_CREATED={mo_cre}  FAILED={tot_failed}  "
+            f"MO_N/A={no_att}  ERROR={total_error}"
+        )
+        has_issues = (total_error > 0 or tot_failed > 0 or no_att > 0)
+    else:
+        summary_line = (
+            f"CMD_SET={cmd_set}  SUCCEED={att}  "
+            f"FAILED={failed}  WRONG_MO={no_att}  "
+            f"NO_CHANGE={no_change}  ERROR={total_error}"
+        )
+        has_issues = (total_error > 0 or failed > 0 or no_att > 0)
+
+    # Collect error details
+    error_lines = []
+    for i, line in enumerate(lines):
+        if '!!!!' in line or 'ERROR' in line:
+            # Include context line before the error if available
+            if i > 0 and '>' in lines[i - 1]:
+                error_lines.append(lines[i - 1].strip())
+            error_lines.append(line.strip())
+
+    return {
+        "is_relation": is_relation,
+        "failed": failed if not is_relation else tot_failed,
+        "no_att": no_att,
+        "l_set": l_set,
+        "mo_total": mo_total,
+        "mo_exist": mo_exist,
+        "mo_cre": mo_cre,
+        "tot_failed": tot_failed,
+        "att": att,
+        "cmd_set": cmd_set,
+        "no_change": no_change,
+        "total_error": total_error,
+        "summary_line": summary_line,
+        "has_issues": has_issues,
+        "error_lines": error_lines,
+    }
+
+
 def run_relation(
     ssh: IntegrationSSH,
     node_name: str,
@@ -1180,6 +1287,7 @@ def run_relation(
 
     # ── 5. Run each relation file ────────────────────────────────
     errors_summary: list[str] = []
+    file_summaries: list[str] = []
     for i, txt_path in enumerate(sorted(txt_files), 1):
         txt_name = os.path.basename(txt_path)
         log_cb(f"[{i}/{len(txt_files)}] Running: {txt_name}...")
@@ -1191,7 +1299,16 @@ def run_relation(
         all_output += out
         log_cb(f"Output for {txt_name}:\n{out}")
 
-        # ── 6. Save separate log for this relation file ──────────
+        # ── 6. Parse output and build summary ────────────────────
+        parsed = _parse_relation_output(out, txt_name)
+        file_summary = f"{txt_name.replace('.txt', '')}  {parsed['summary_line']}"
+        file_summaries.append(file_summary)
+        log_cb(f"  → {parsed['summary_line']}")
+
+        if parsed["has_issues"]:
+            errors_summary.append(file_summary)
+
+        # ── 7. Save separate log with summary appended ──────────
         rel_log_name = f"RELATION_{node_name}_{txt_name.replace('.txt', '')}.txt"
         rel_log_path = os.path.join(log_dir, rel_log_name)
         try:
@@ -1202,23 +1319,61 @@ def run_relation(
                 f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 72 + "\n\n")
                 f.write(out)
-                f.write("\n")
+                f.write("\n\n")
+                f.write("=" * 72 + "\n")
+                f.write("SUMMARY\n")
+                f.write("=" * 72 + "\n")
+                f.write(f"{parsed['summary_line']}\n")
+                if parsed["has_issues"]:
+                    f.write(f"\nStatus: NEEDS REVIEW\n")
+                    if parsed["error_lines"]:
+                        f.write(f"\nErrors found:\n")
+                        f.write("-" * 40 + "\n")
+                        for err_line in parsed["error_lines"]:
+                            f.write(f"  {err_line}\n")
+                else:
+                    f.write(f"\nStatus: OK\n")
             log_cb(f"Log saved: {rel_log_name}")
         except Exception as exc:
             log_cb(f"Failed to save log {rel_log_name}: {exc}")
 
-        # ── 7. Check for errors (placeholder — grep pattern TBD) ─
-        # TODO: replace with actual grep pattern when provided
-        if "error" in out.lower() and "0 error" not in out.lower():
-            errors_summary.append(f"{txt_name}: errors detected (check log)")
+    # ── Overall summary ─────────────────────────────────────────
+    # Save a combined summary file
+    summary_log_path = os.path.join(log_dir, f"RELATION_{node_name}_SUMMARY.txt")
+    try:
+        with open(summary_log_path, "w", encoding="utf-8") as f:
+            f.write(f"Relation Summary — {node_name}\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total files: {len(txt_files)}\n")
+            f.write("=" * 90 + "\n\n")
+            f.write(f"{'File':<55s} {'Summary'}\n")
+            f.write("-" * 90 + "\n")
+            for s in file_summaries:
+                f.write(f"{s}\n")
+            f.write("\n" + "=" * 90 + "\n")
+            if errors_summary:
+                f.write(f"\nFILES WITH ISSUES ({len(errors_summary)}):\n")
+                f.write("-" * 90 + "\n")
+                for s in errors_summary:
+                    f.write(f"  {s}\n")
+            else:
+                f.write("\nAll files OK — no errors detected.\n")
+        log_cb(f"Summary saved: RELATION_{node_name}_SUMMARY.txt")
+    except Exception as exc:
+        log_cb(f"Failed to save summary: {exc}")
 
-    # ── Summary ──────────────────────────────────────────────────
     if errors_summary:
-        summary = "\n".join(errors_summary)
-        log_cb(f"⚠ Relation completed with errors:\n{summary}")
-        all_output += f"\n[RELATION ERRORS]\n{summary}\n"
+        summary_text = "\n".join(errors_summary)
+        log_cb(
+            f"⚠ Relation completed with {len(errors_summary)} file(s) "
+            f"having issues:\n{summary_text}"
+        )
+        all_output += f"\n[RELATION SUMMARY — ISSUES]\n{summary_text}\n"
     else:
-        log_cb(f"✓ All {len(txt_files)} relation file(s) executed for {node_name}.")
+        log_cb(
+            f"✓ All {len(txt_files)} relation file(s) executed OK for "
+            f"{node_name}."
+        )
 
     # Relation completes even with errors — user reviews logs later
     return True, all_output
