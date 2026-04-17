@@ -4,19 +4,20 @@
     "scripts_path": "/home/shared/ESETARI/INOC/SCRIPTS",
     "cli_py": "/home/shared/ESETARI/INOC/SCRIPTS/cli.py",
 
-    "create_arne_script": "ES/create_arne.py",
+    "create_arne_script": "ES/create_arne_2.py",
     "entity_maker_script": "ES/entity_maker.sh",
     "exe_entity_script": "ES/exe_entity.py",
     "enrollment_mos": "ES/enroll/lhgenm1.mos",
+    "sgw_check_mos": "SGW_Check.mos",
 
     "lkf_import_script": "lkfimport.py",
     "lkf_install_script": "lkfinstall.py",
     "lkf_status_script": "lkfstatus.py",
 
     "baseline_files": {
-        "L":  "Globe_Baseline_L_NonModular_Rev_15042026.mos",
-        "LN": "Globe_Baseline_LN_NonModular_Rev_15042026.mos",
-        "N":  "Globe_Baseline_LN_NonModular_Rev_15042026.mos"
+        "L":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
+        "LN": "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
+        "N":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt"
     },
 
     "uri_setting": {

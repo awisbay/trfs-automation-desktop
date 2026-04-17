@@ -170,13 +170,16 @@
 						<!-- 12_Geran_CellRelation Start --> 
 						<EUtranCellFDD>
 							<eUtranCellFDDId>$CELLNAMELTECIQ</eUtranCellFDDId>
-							<GeranCellRelation>
+							<GeranFreqGroupRelation>
+							  <geranFreqGroupRelationId>$GERANFREQID</geranFreqGroupRelationId>
+							  <GeranCellRelation>
 								<geranCellRelationId>$GERANID</geranCellRelationId>
 								<coverageIndicator>NONE</coverageIndicator>
 								<isRemoveAllowed>true</isRemoveAllowed>
 								<isHoAllowed>true</isHoAllowed>
-								<extGeranCellRef>ManagedElement=1,ENodeBFunction=1,GeraNetwork=1,ExternalGeranCell=$GERANID</extGeranCellRef>
-							</GeranCellRelation>
+								<extGeranCellRef>ManagedElement=DM1R39,ENodeBFunction=1,GeraNetwork=1,ExternalGeranCell=$GERANID</extGeranCellRef>
+							  </GeranCellRelation>
+							</GeranFreqGroupRelation>
 						</EUtranCellFDD>
 						<!-- 12_Geran_CellRelation End --> 
 					</ENodeBFunction>

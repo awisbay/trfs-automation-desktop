@@ -24,6 +24,28 @@ import argparse
 import tempfile
 
 
+SECTION_PARENT = {
+    '00_NRFreqRelation': 'gnbcucp',
+    '01_External_GNodeBFunction': 'enodeb',
+    '02_External_GutraCell': 'enodeb',
+    '03_GUtran_CellRelation': 'enodeb',
+    '04_External_ENodeBFunction': 'enodeb',
+    '05_TermpointtoENB': 'enodeb',
+    '06_External_Eutrancell': 'enodeb',
+    '07_External_Eutrancell_relation': 'enodeb',
+    '08_External_GNBCUCPfunction': 'gnbcucp',
+    '09_External_NRCellCU': 'gnbcucp',
+    '10_ExternalNRCellRelation': 'gnbcucp',
+    '11_External_Grancell': 'enodeb',
+    '12_Geran_CellRelation': 'enodeb',
+    '13_Eutran_CellRelation': 'enodeb',
+    '14_Internal_NRCellRelation': 'gnbcucp',
+    '15_ExternalENodeBFunction': 'gnbcucp',
+    '16_ExternalEUtranCell': 'gnbcucp',
+    '17_EUtranCellRelation': 'gnbcucp',
+}
+
+
 def parse_crn_line(crn_line):
     """Parse a CRN line into a dict of key=value pairs."""
     result = {}
@@ -149,7 +171,7 @@ def resolve_placeholder(placeholder, record, section_name, all_data, nodename):
         return field_val(record, 'physicalLayerCellIdGroup')
     if p == '$PSCINRCIQ':
         return field_val(record, 'physicalLayerSubCellId')
-    if p == '$CELLIDNRCIQ':
+    if p == '$CELLIDNRCIQ' and section_name != '09_External_NRCellCU':
         return field_val(record, 'localCellId')
 
     # === Section 03: GUtran_CellRelation ===
@@ -381,6 +403,10 @@ def resolve_placeholder(placeholder, record, section_name, all_data, nodename):
                 val = crn_val(record, key)
                 if val:
                     return val
+        if p == '$GERANFREQID':
+            val = crn_val(record, 'GeranFreqGroupRelation')
+            if val:
+                return val
         if p == '$GERANID':
             val = crn_val(record, 'GeranCellRelation')
             if val:
@@ -494,13 +520,35 @@ def resolve_placeholder(placeholder, record, section_name, all_data, nodename):
 
 
 def substitute_placeholders(text, record, section_name, all_data, nodename):
-    """Replace all $VARIABLE placeholders in text with values from record."""
     placeholders = set(re.findall(r'\$[A-Z][A-Z0-9_]*', text))
     result = text
     for ph in placeholders:
         value = resolve_placeholder(ph, record, section_name, all_data, nodename)
         result = result.replace(ph, str(value))
     return result
+
+
+def _is_tdd_record(record):
+    crn = record.get('_crn', {})
+    for key in crn:
+        if 'EUtranCellTDD' in key or 'ExternalEUtranCellTDD' in key:
+            return True
+    return False
+
+
+def _apply_cell_type(block, record):
+    if _is_tdd_record(record):
+        block = block.replace('<EUtranCellFDD>', '<EUtranCellTDD>')
+        block = block.replace('</EUtranCellFDD>', '</EUtranCellTDD>')
+        block = block.replace('<eUtranCellFDDId>', '<eUtranCellTDDId>')
+        block = block.replace('</eUtranCellFDDId>', '</eUtranCellTDDId>')
+        block = block.replace('EUtranCellFDD=', 'EUtranCellTDD=')
+        block = block.replace('<ExternalEUtranCellFDD>', '<ExternalEUtranCellTDD>')
+        block = block.replace('</ExternalEUtranCellFDD>', '</ExternalEUtranCellTDD>')
+        block = block.replace('<externalEUtranCellFDDId>', '<externalEUtranCellTDDId>')
+        block = block.replace('</externalEUtranCellFDDId>', '</externalEUtranCellTDDId>')
+        block = block.replace('ExternalEUtranCellFDD=', 'ExternalEUtranCellTDD=')
+    return block
 
 
 def convert_txt_to_xml(template_path, zip_path, output_path, site_name=None):
@@ -729,7 +777,6 @@ def process_section_01(section_content, records, all_data, nodename):
 
 
 def process_section_02(section_content, records, all_data, nodename):
-    """Process section 02: External_GutraCell."""
     cell_records = [r for r in records if r.get('_type') == 'ExternalGUtranCell']
     blocks = []
     for rec in cell_records:
@@ -756,6 +803,7 @@ def process_section_03(section_content, records, all_data, nodename):
         block = substitute_placeholders(
             section_content, rec, '03_GUtran_CellRelation', all_data, nodename
         )
+        block = _apply_cell_type(block, rec)
 
         # Update boolean fields from source data
         if ess_enabled:
@@ -846,6 +894,7 @@ def process_section_04(section_content, records, all_data, nodename):
                 )
                 cell_xml = cell_xml.replace('$NODEUSERLABELEXT', enb_id)
                 cell_xml = cell_xml.replace('$NODEIDEXT', field_val(enb_rec, 'eNBId'))
+                cell_xml = _apply_cell_type(cell_xml, cell_rec)
                 cell_xml_parts.append(cell_xml)
 
             full_06 = section_06_match.group(0)
@@ -888,6 +937,34 @@ def process_section_07(section_content, records, all_data, nodename):
         block = substitute_placeholders(
             section_content, rec, '07_External_Eutrancell_relation', all_data, nodename
         )
+        block = _apply_cell_type(block, rec)
+        load_bal = field_val(rec, 'loadBalancing')
+        if load_bal:
+            lb_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'OFFLOAD', '3': 'IFO_AND_IFLB'}.get(load_bal, 'NOT_ALLOWED' if load_bal.upper() == 'FALSE' else 'ALLOWED' if load_bal.upper() == 'TRUE' else load_bal)
+            block = block.replace('<loadBalancing>ALLOWED</loadBalancing>',
+                                   f'<loadBalancing>{lb_val}</loadBalancing>', 1)
+        s_cell = field_val(rec, 'sCellCandidate')
+        if s_cell:
+            sc_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'AUTO'}.get(s_cell, 'NOT_ALLOWED' if s_cell.upper() == 'FALSE' else 'ALLOWED' if s_cell.upper() == 'TRUE' else s_cell)
+            block = block.replace('<sCellCandidate>ALLOWED</sCellCandidate>',
+                                   f'<sCellCandidate>{sc_val}</sCellCandidate>', 1)
+        lb_bnr = field_val(rec, 'lbBnrAllowed')
+        if lb_bnr:
+            lb_bnr_val = 'true' if lb_bnr.upper() == 'TRUE' else 'false'
+            block = block.replace('<lbBnrAllowed>false</lbBnrAllowed>',
+                                   f'<lbBnrAllowed>{lb_bnr_val}</lbBnrAllowed>', 1)
+        is_ho = field_val(rec, 'isHoAllowed')
+        if is_ho:
+            ho_val = 'true' if is_ho.upper() == 'TRUE' else 'false'
+            block = block.replace('<isHoAllowedBr>false</isHoAllowedBr>',
+                                   f'<isHoAllowedBr>{ho_val}</isHoAllowedBr>', 1)
+        is_remove = field_val(rec, 'isRemoveAllowed')
+        if is_remove:
+            remove_val = 'true' if is_remove.upper() == 'TRUE' else 'false'
+            block = block.replace('<isRemoveAllowed>false</isRemoveAllowed>',
+                                   f'<isRemoveAllowed>{remove_val}</isRemoveAllowed>', 1)
+            block = block.replace('<isRemoveAllowed>true</isRemoveAllowed>',
+                                   f'<isRemoveAllowed>{remove_val}</isRemoveAllowed>', 1)
         blocks.append(block)
     return blocks
 
@@ -902,8 +979,7 @@ def process_section_13(section_content, records, all_data, nodename):
         block = substitute_placeholders(
             section_content, rec, '13_Eutran_CellRelation', all_data, nodename
         )
-
-        # Update fields from source data
+        block = _apply_cell_type(block, rec)
         cell_offset = field_val(rec, 'cellIndividualOffsetEUtran')
         load_bal = field_val(rec, 'loadBalancing')
         lb_bnr = field_val(rec, 'lbBnrAllowed')
@@ -916,9 +992,8 @@ def process_section_13(section_content, records, all_data, nodename):
                 f'<cellIndividualOffsetEUtran>{cell_offset}</cellIndividualOffsetEUtran>', 1
             )
 
-        # Update loadBalancing: 0 = NOT_ALLOWED, 1 = ALLOWED
         if load_bal:
-            lb_val = 'ALLOWED' if load_bal.upper() == '1' or load_bal == 'TRUE' else 'NOT_ALLOWED'
+            lb_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'OFFLOAD', '3': 'IFO_AND_IFLB'}.get(load_bal, 'NOT_ALLOWED' if load_bal.upper() == 'FALSE' else 'ALLOWED' if load_bal.upper() == 'TRUE' else load_bal)
             block = block.replace(
                 '<loadBalancing>ALLOWED</loadBalancing>',
                 f'<loadBalancing>{lb_val}</loadBalancing>', 1
@@ -932,9 +1007,8 @@ def process_section_13(section_content, records, all_data, nodename):
                 f'<lbBnrAllowed>{lb_bnr_val}</lbBnrAllowed>', 1
             )
 
-        # Update sCellCandidate: 0=NOT_ALLOWED, 1=ALLOWED, 2=NOT_ALLOWED
         if s_cell:
-            sc_val = 'ALLOWED' if s_cell in ('1', 'TRUE') else 'NOT_ALLOWED'
+            sc_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'AUTO'}.get(s_cell, 'NOT_ALLOWED' if s_cell.upper() == 'FALSE' else 'ALLOWED' if s_cell.upper() == 'TRUE' else s_cell)
             block = block.replace(
                 '<sCellCandidate>ALLOWED</sCellCandidate>',
                 f'<sCellCandidate>{sc_val}</sCellCandidate>', 1
@@ -1022,7 +1096,9 @@ def process_section_10(section_content, records, all_data, nodename):
                                    f'<cellIndividualOffsetNR>{cell_offset}</cellIndividualOffsetNR>', 1)
         cov = field_val(rec, 'coverageIndicator')
         if cov:
-            cov_val = 'NOT_ALLOWED' if cov == '0' or cov.upper() == 'FALSE' else ('ALLOWED' if cov == '1' else cov)
+            cov_val = {'0': 'NONE', '1': 'OTHERS', '2': 'OVERLAP', '3': 'CONTAINED_IN'}.get(cov, 'NONE' if cov == '' or cov.upper() == 'FALSE' else cov)
+            block = block.replace('<coverageIndicator>NONE</coverageIndicator>',
+                                   f'<coverageIndicator>{cov_val}</coverageIndicator>', 1)
             # coverageIndicator maps differently
         is_ho = field_val(rec, 'isHoAllowed')
         if is_ho:
@@ -1036,7 +1112,7 @@ def process_section_10(section_content, records, all_data, nodename):
                                    f'<isRemoveAllowed>{remove_val}</isRemoveAllowed>', 1)
         s_cell = field_val(rec, 'sCellCandidate')
         if s_cell:
-            sc_val = 'NOT_ALLOWED' if s_cell in ('0', 'FALSE') else ('ALLOWED' if s_cell == '1' else 'NOT_ALLOWED')
+            sc_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'AUTO'}.get(s_cell, 'NOT_ALLOWED' if s_cell.upper() == 'FALSE' else 'ALLOWED' if s_cell.upper() == 'TRUE' else s_cell)
             block = block.replace('<sCellCandidate>NOT_ALLOWED</sCellCandidate>',
                                    f'<sCellCandidate>{sc_val}</sCellCandidate>', 1)
         blocks.append(block)
@@ -1082,9 +1158,10 @@ def process_section_12(section_content, records, all_data, nodename):
         block = substitute_placeholders(
             section_content, rec, '12_Geran_CellRelation', all_data, nodename
         )
+        block = _apply_cell_type(block, rec)
         cov = field_val(rec, 'coverageIndicator')
         if cov:
-            cov_val = 'NONE' if cov in ('0', '') else cov
+            cov_val = {'0': 'NONE', '1': 'OTHERS', '2': 'OVERLAP', '3': 'CONTAINED_IN'}.get(cov, 'NONE' if cov in ('',) or cov.upper() == 'FALSE' else cov)
             block = block.replace('<coverageIndicator>NONE</coverageIndicator>',
                                    f'<coverageIndicator>{cov_val}</coverageIndicator>', 1)
         is_ho = field_val(rec, 'isHoAllowed')
@@ -1116,7 +1193,7 @@ def process_section_14(section_content, records, all_data, nodename):
                                    f'<cellIndividualOffsetNR>{cell_offset}</cellIndividualOffsetNR>', 1)
         cov = field_val(rec, 'coverageIndicator')
         if cov:
-            cov_val = 'NONE' if cov == '0' else cov
+            cov_val = {'0': 'NONE', '1': 'OTHERS', '2': 'OVERLAP', '3': 'CONTAINED_IN'}.get(cov, 'NONE')
             block = block.replace('<coverageIndicator>NONE</coverageIndicator>',
                                    f'<coverageIndicator>{cov_val}</coverageIndicator>', 1)
         is_ho = field_val(rec, 'isHoAllowed')
@@ -1131,7 +1208,7 @@ def process_section_14(section_content, records, all_data, nodename):
                                    f'<isRemoveAllowed>{remove_val}</isRemoveAllowed>', 1)
         s_cell = field_val(rec, 'sCellCandidate')
         if s_cell:
-            sc_val = 'ALLOWED' if s_cell in ('1', 'TRUE') else 'NOT_ALLOWED'
+            sc_val = {'0': 'NOT_ALLOWED', '1': 'ALLOWED', '2': 'AUTO'}.get(s_cell, 'NOT_ALLOWED' if s_cell.upper() == 'FALSE' else 'ALLOWED' if s_cell.upper() == 'TRUE' else s_cell)
             block = block.replace('<sCellCandidate>ALLOWED</sCellCandidate>',
                                    f'<sCellCandidate>{sc_val}</sCellCandidate>', 1)
         blocks.append(block)
@@ -1211,6 +1288,434 @@ def process_section_17(section_content, records, all_data, nodename):
     return blocks
 
 
+def process_section_00(records, all_data, nodename):
+    blocks = []
+    for rec in records:
+        if '_crn' not in rec:
+            continue
+        cell_name = crn_val(rec, 'NRCellCU')
+        freq_id = crn_val(rec, 'NRFreqRelation')
+        anr_meas = field_val(rec, 'anrMeasOn')
+        cell_reselect = field_val(rec, 'cellReselectionPriority')
+        nr_freq_ref = field_val(rec, 'nRFrequencyRef')
+        q_rx_lev = field_val(rec, 'qRxLevMin')
+
+        nr_freq_val = ''
+        if nr_freq_ref:
+            m = re.search(r'NRFrequency=(\S+)', nr_freq_ref)
+            if m:
+                nr_freq_val = m.group(1).rstrip(',')
+
+        anr_val = 'true' if anr_meas.upper() == 'TRUE' else 'false'
+
+        block = (
+            '<NRCellCU>\n'
+            f'\t<nRCellCUId>{cell_name}</nRCellCUId>\n'
+            '\t<NRFreqRelation>\n'
+            f'\t\t<nRFreqRelationId>{freq_id}</nRFreqRelationId>\n'
+            f'\t\t<anrMeasOn>{anr_val}</anrMeasOn>\n'
+            f'\t\t<cellReselectionPriority>{cell_reselect}</cellReselectionPriority>\n'
+            f'\t\t<nRFrequencyRef>ManagedElement=1,GNBCUCPFunction=1,NRNetwork=1,NRFrequency={nr_freq_val}</nRFrequencyRef>\n'
+            f'\t\t<qRxLevMin>{q_rx_lev}</qRxLevMin>\n'
+            '\t</NRFreqRelation>\n'
+            '</NRCellCU>'
+        )
+        blocks.append(block)
+    return blocks
+
+
+def process_section_05_standalone(records, all_data, nodename):
+    enb_data = all_data.get('04_External_ENodeBFunction', [])
+    enb_lookup = {}
+    for enb_rec in enb_data:
+        enb_id = crn_val(enb_rec, 'ExternalENodeBFunction')
+        if enb_id:
+            enb_lookup[enb_id] = enb_rec
+
+    blocks = []
+    for rec in records:
+        if '_crn' not in rec:
+            continue
+
+        ext_enb_id = crn_val(rec, 'ExternalENodeBFunction')
+        enb_rec = enb_lookup.get(ext_enb_id)
+
+        enb_num = field_val(enb_rec, 'eNBId') if enb_rec else ''
+        if not enb_num and ext_enb_id and '-' in ext_enb_id:
+            enb_num = ext_enb_id.split('-', 1)[1]
+
+        mcc, mnc, mnc_len = '515', '2', '2'
+        if enb_rec:
+            plmn = field_val(enb_rec, 'eNodeBPlmnId')
+            if plmn:
+                for pair in plmn.split(','):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        if k == 'mcc': mcc = v
+                        elif k == 'mnc': mnc = v
+                        elif k == 'mncLength': mnc_len = v
+
+        ip = field_val(rec, 'ipAddress')
+        admin_state = field_val(rec, 'administrativeState')
+        state_str = 'LOCKED' if admin_state == '1' else 'UNLOCKED'
+        tp_id = crn_val(rec, 'TermPointToENB')
+
+        block = (
+            '<EUtraNetwork>\n'
+            '\t<eUtraNetworkId>1</eUtraNetworkId>\n'
+            '\t<ExternalENodeBFunction>\n'
+            f'\t\t<externalENodeBFunctionId>{ext_enb_id}</externalENodeBFunctionId>\n'
+            f'\t\t<eNBId>{enb_num}</eNBId>\n'
+            '\t\t<eNodeBPlmnId>\n'
+            f'\t\t\t<mcc>{mcc}</mcc>\n'
+            f'\t\t\t<mnc>{mnc}</mnc>\n'
+            f'\t\t\t<mncLength>{mnc_len}</mncLength>\n'
+            '\t\t</eNodeBPlmnId>\n'
+            '\t\t<TermPointToENB>\n'
+            f'\t\t\t<termPointToENBId>{tp_id}</termPointToENBId>\n'
+            f'\t\t\t<ipAddress>{ip}</ipAddress>\n'
+            f'\t\t\t<administrativeState>{state_str}</administrativeState>\n'
+            '\t\t</TermPointToENB>\n'
+            '\t</ExternalENodeBFunction>\n'
+            '</EUtraNetwork>'
+        )
+        blocks.append(block)
+    return blocks
+
+
+def process_section_06_standalone(records, all_data, nodename):
+    enb_data = all_data.get('04_External_ENodeBFunction', [])
+    enb_lookup = {}
+    for enb_rec in enb_data:
+        enb_id = crn_val(enb_rec, 'ExternalENodeBFunction')
+        if enb_id:
+            enb_lookup[enb_id] = enb_rec
+
+    cell_groups = {}
+    for rec in records:
+        if '_crn' not in rec:
+            continue
+        ext_enb_id = crn_val(rec, 'ExternalENodeBFunction')
+        if ext_enb_id not in cell_groups:
+            cell_groups[ext_enb_id] = []
+        cell_groups[ext_enb_id].append(rec)
+
+    blocks = []
+    for ext_enb_id, cells in cell_groups.items():
+        enb_rec = enb_lookup.get(ext_enb_id)
+
+        enb_num = field_val(enb_rec, 'eNBId') if enb_rec else ''
+        if not enb_num and ext_enb_id and '-' in ext_enb_id:
+            enb_num = ext_enb_id.split('-', 1)[1]
+
+        mcc, mnc, mnc_len = '515', '2', '2'
+        if enb_rec:
+            plmn = field_val(enb_rec, 'eNodeBPlmnId')
+            if plmn:
+                for pair in plmn.split(','):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        if k == 'mcc': mcc = v
+                        elif k == 'mnc': mnc = v
+                        elif k == 'mncLength': mnc_len = v
+        elif cells:
+            cell_plmn = field_val(cells[0], 'activePlmnList')
+            if cell_plmn:
+                for pair in cell_plmn.split(','):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        if k == 'mcc': mcc = v
+                        elif k == 'mnc': mnc = v
+                        elif k == 'mncLength': mnc_len = v
+
+        cell_xml_parts = []
+        for cell_rec in cells:
+            cell_merged = {
+                '_crn': {**cell_rec['_crn'], 'ExternalENodeBFunction': ext_enb_id},
+                '_type': cell_rec.get('_type', 'ExternalEUtranCellFDD'),
+                '_fields': {**cell_rec['_fields']}
+            }
+            cell_xml = substitute_placeholders(
+                '<ExternalEUtranCellFDD>\n'
+                '\t<externalEUtranCellFDDId>5152-$NODEIDEXT-$CELLIDLTECIQ</externalEUtranCellFDDId>\n'
+                '\t<localCellId>$CELLIDLTECIQ</localCellId>\n'
+                '\t<physicalLayerCellIdGroup>$PCIGLTECIQ</physicalLayerCellIdGroup>\n'
+                '\t<physicalLayerSubCellId>$PSCILTECIQ</physicalLayerSubCellId>\n'
+                '\t<tac>$TACLTECIQ</tac>\n'
+                '\t<isRemoveAllowed>false</isRemoveAllowed>\n'
+                '\t<eutranFrequencyRef>ManagedElement=1,ENodeBFunction=1,EUtraNetwork=1,EUtranFrequency=$ARFCNDLLTECIQ</eutranFrequencyRef>\n'
+                '\t<lbEUtranCellOffloadCapacity>1000</lbEUtranCellOffloadCapacity>\n'
+                '\t<noOfTxAntennas>2</noOfTxAntennas>\n'
+                '\t<activePlmnList>\n'
+                '\t\t<mcc>515</mcc>\n'
+                '\t\t<mnc>2</mnc>\n'
+                '\t\t<mncLength>2</mncLength>\n'
+                '\t</activePlmnList>\n'
+                '</ExternalEUtranCellFDD>',
+                cell_merged, '06_External_Eutrancell', all_data, nodename
+            )
+            cell_xml = cell_xml.replace('$NODEUSERLABELEXT', ext_enb_id)
+            cell_xml = cell_xml.replace('$NODEIDEXT', enb_num)
+            cell_xml = _apply_cell_type(cell_xml, cell_rec)
+
+            is_remove = field_val(cell_rec, 'isRemoveAllowed')
+            if is_remove:
+                remove_val = 'true' if is_remove.upper() == 'TRUE' else 'false'
+                cell_xml = cell_xml.replace('<isRemoveAllowed>false</isRemoveAllowed>',
+                                           f'<isRemoveAllowed>{remove_val}</isRemoveAllowed>', 1)
+
+            cell_plmn = field_val(cell_rec, 'activePlmnList')
+            if cell_plmn:
+                plmn_parts = {}
+                for pair in cell_plmn.split(','):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        plmn_parts[k] = v
+                c_mcc = plmn_parts.get('mcc', mcc)
+                c_mnc = plmn_parts.get('mnc', mnc)
+                c_mnc_len = plmn_parts.get('mncLength', mnc_len)
+                cell_xml = cell_xml.replace(
+                    f'<mcc>515</mcc>\n\t\t<mnc>2</mnc>\n\t\t<mncLength>2</mncLength>',
+                    f'<mcc>{c_mcc}</mcc>\n\t\t<mnc>{c_mnc}</mnc>\n\t\t<mncLength>{c_mnc_len}</mncLength>', 1
+                )
+
+            cell_xml_parts.append(cell_xml)
+
+        cells_joined = '\n'.join(cell_xml_parts)
+        block = (
+            '<EUtraNetwork>\n'
+            '\t<eUtraNetworkId>1</eUtraNetworkId>\n'
+            '\t<ExternalENodeBFunction>\n'
+            f'\t\t<externalENodeBFunctionId>{ext_enb_id}</externalENodeBFunctionId>\n'
+            f'\t\t<eNBId>{enb_num}</eNBId>\n'
+            '\t\t<eNodeBPlmnId>\n'
+            f'\t\t\t<mcc>{mcc}</mcc>\n'
+            f'\t\t\t<mnc>{mnc}</mnc>\n'
+            f'\t\t\t<mncLength>{mnc_len}</mncLength>\n'
+            '\t\t</eNodeBPlmnId>\n'
+            f'{cells_joined}\n'
+            '\t</ExternalENodeBFunction>\n'
+            '</EUtraNetwork>'
+        )
+        blocks.append(block)
+    return blocks
+
+
+def _indent_xml(text, indent='\t\t\t\t\t\t'):
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        if line.strip():
+            result.append(indent + line)
+        else:
+            result.append('')
+    return '\n'.join(result)
+
+
+def _extract_template_parts(template):
+    mei_end = template.index('</managedElementId>') + len('</managedElementId>')
+    common_header = template[:mei_end]
+
+    enodeb_open_m = re.search(
+        r'(\n\s*<ENodeBFunction[^>]*>\s*\n\s*<eNodeBFunctionId>1</eNodeBFunctionId>)',
+        template
+    )
+    enodeb_open = enodeb_open_m.group(1) if enodeb_open_m else ''
+
+    gnbcucp_open_m = re.search(
+        r'(\n\s*<GNBCUCPFunction[^>]*>\s*\n\s*<gNBCUCPFunctionId>1</gNBCUCPFunctionId>)',
+        template
+    )
+    gnbcucp_open = gnbcucp_open_m.group(1) if gnbcucp_open_m else ''
+
+    enodeb_close_m = re.search(r'\n(\s*</ENodeBFunction>)', template)
+    enodeb_close = enodeb_close_m.group(1) if enodeb_close_m else ''
+
+    gnbcucp_close_m = re.search(r'\n(\s*</GNBCUCPFunction>)', template)
+    gnbcucp_close = gnbcucp_close_m.group(1) if gnbcucp_close_m else ''
+
+    gnbcucp_close_end = gnbcucp_close_m.end() if gnbcucp_close_m else len(template)
+    common_footer = template[gnbcucp_close_end:]
+
+    return {
+        'common_header': common_header,
+        'enodeb_open': enodeb_open,
+        'gnbcucp_open': gnbcucp_open,
+        'enodeb_close': enodeb_close,
+        'gnbcucp_close': gnbcucp_close,
+        'common_footer': common_footer,
+    }
+
+
+def _find_zip_root(extract_dir):
+    for item in os.listdir(extract_dir):
+        item_path = os.path.join(extract_dir, item)
+        if os.path.isdir(item_path):
+            return item_path
+    return extract_dir
+
+
+def convert_txt_to_xml_split(template_path, zip_path, output_dir, site_name=None):
+    extract_dir = tempfile.mkdtemp(prefix='nbr_')
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(extract_dir)
+
+    zip_root = _find_zip_root(extract_dir)
+
+    if site_name:
+        site_folder = os.path.join(zip_root, site_name)
+    else:
+        sites = sorted([d for d in os.listdir(zip_root)
+                        if os.path.isdir(os.path.join(zip_root, d))])
+        if not sites:
+            print("No site folders found.")
+            return
+        site_folder = os.path.join(zip_root, sites[0])
+        site_name = sites[0]
+
+    nodename = site_name
+    print(f"Processing site: {site_name}")
+    print(f"Node name: {nodename}")
+
+    with open(template_path, 'r', encoding='utf-8') as f:
+        template = f.read()
+
+    tpl_parts = _extract_template_parts(template)
+    common_header = tpl_parts['common_header'].replace('$NODENAME', nodename)
+
+    all_data = {}
+    source_files = {}
+    source_filenames = {}
+    for filename in os.listdir(site_folder):
+        if not filename.endswith('.txt'):
+            continue
+        filepath = os.path.join(site_folder, filename)
+        prefix = None
+        min_matches = list(re.finditer(r'_MIN\d', filename))
+        if min_matches:
+            raw_prefix = filename[:min_matches[-1].start()]
+            match = re.match(r'^(\d+_[A-Za-z]+(?:_[A-Za-z]+)*)$', raw_prefix)
+            if match:
+                for suffix in ['_GNBCUCP']:
+                    if raw_prefix.endswith(suffix):
+                        raw_prefix = raw_prefix[:-len(suffix)]
+                        break
+            prefix = raw_prefix
+        else:
+            match = re.match(r'^(\d+_[A-Za-z]+(?:_[A-Za-z]+)*)_', filename)
+            if match:
+                prefix = match.group(1)
+            else:
+                parts = filename.rsplit('_', 2)
+                if len(parts) >= 3:
+                    prefix = '_'.join(parts[:-2])
+        if prefix:
+            records = parse_data_file(filepath)
+            all_data[prefix] = records
+            source_files[prefix] = filepath
+            source_filenames[prefix] = filename
+            print(f"  Loaded {len(records)} records from {filename}")
+
+    section_pattern = re.compile(
+        r'<!--\s*(\d+_\w+)\s+Start\s*-->(.*?)<!--\s*\1\s+End\s*-->',
+        re.DOTALL
+    )
+    sections_found = {}
+    for match in section_pattern.finditer(template):
+        section_name = match.group(1)
+        sections_found[section_name] = {
+            'name': section_name,
+            'content': match.group(2),
+            'full_match': match.group(0)
+        }
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for prefix in sorted(all_data.keys()):
+        records = all_data[prefix]
+        if not records:
+            continue
+
+        parent = SECTION_PARENT.get(prefix, 'enodeb')
+        if parent == 'enodeb':
+            header = common_header + tpl_parts['enodeb_open']
+            footer = tpl_parts['enodeb_close'] + tpl_parts['common_footer']
+        else:
+            header = common_header + tpl_parts['gnbcucp_open']
+            footer = tpl_parts['gnbcucp_close'] + tpl_parts['common_footer']
+
+        section_content = sections_found.get(prefix, {}).get('content')
+
+        if prefix == '00_NRFreqRelation':
+            xml_blocks = process_section_00(records, all_data, nodename)
+        elif prefix == '01_External_GNodeBFunction':
+            xml_blocks = process_section_01(section_content, records, all_data, nodename)
+        elif prefix == '02_External_GutraCell':
+            xml_blocks = process_section_02(section_content, records, all_data, nodename)
+        elif prefix == '03_GUtran_CellRelation':
+            xml_blocks = process_section_03(section_content, records, all_data, nodename)
+        elif prefix == '04_External_ENodeBFunction':
+            xml_blocks = process_section_04(section_content, records, all_data, nodename)
+        elif prefix == '05_TermpointtoENB':
+            xml_blocks = process_section_05_standalone(records, all_data, nodename)
+        elif prefix == '06_External_Eutrancell':
+            xml_blocks = process_section_06_standalone(records, all_data, nodename)
+        elif prefix == '07_External_Eutrancell_relation':
+            xml_blocks = process_section_07(section_content, records, all_data, nodename)
+        elif prefix == '08_External_GNBCUCPfunction':
+            xml_blocks = process_section_08(section_content, records, all_data, nodename)
+        elif prefix == '09_External_NRCellCU':
+            xml_blocks = process_section_09(section_content, records, all_data, nodename)
+        elif prefix == '10_ExternalNRCellRelation':
+            xml_blocks = process_section_10(section_content, records, all_data, nodename)
+        elif prefix == '11_External_Grancell':
+            xml_blocks = process_section_11(section_content, records, all_data, nodename)
+        elif prefix == '12_Geran_CellRelation':
+            xml_blocks = process_section_12(section_content, records, all_data, nodename)
+        elif prefix == '13_Eutran_CellRelation':
+            xml_blocks = process_section_13(section_content, records, all_data, nodename)
+        elif prefix == '14_Internal_NRCellRelation':
+            xml_blocks = process_section_14(section_content, records, all_data, nodename)
+        elif prefix == '15_ExternalENodeBFunction':
+            xml_blocks = process_section_15(section_content, records, all_data, nodename)
+        elif prefix == '16_ExternalEUtranCell':
+            xml_blocks = process_section_16(section_content, records, all_data, nodename)
+        elif prefix == '17_EUtranCellRelation':
+            xml_blocks = process_section_17(section_content, records, all_data, nodename)
+        elif section_content:
+            xml_blocks = []
+            for rec in records:
+                block = substitute_placeholders(
+                    section_content, rec, prefix, all_data, nodename
+                )
+                xml_blocks.append(block)
+        else:
+            print(f"  Skipping {prefix}: no template section and no handler")
+            continue
+
+        section_body = '\n'.join(xml_blocks)
+        if prefix in ('00_NRFreqRelation', '05_TermpointtoENB', '06_External_Eutrancell'):
+            section_body = _indent_xml(section_body)
+        output_content = (
+            header + '\n' +
+            f'\t\t\t\t\t\t<!-- {prefix} Start -->\n' +
+            section_body + '\n' +
+            f'\t\t\t\t\t\t<!-- {prefix} End -->\n' +
+            footer
+        )
+
+        src_filename = source_filenames.get(prefix, f'{prefix}_{site_name}.txt')
+        out_filename = src_filename.replace('.txt', '.xml')
+        out_path = os.path.join(output_dir, out_filename)
+
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(output_content)
+
+        print(f"  Written: {out_filename} ({len(output_content.splitlines())} lines)")
+
+    print(f"\nAll files written to: {output_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert NBR Relation data files to XML')
     parser.add_argument('--template', default='Relation.txt',
@@ -1218,11 +1723,15 @@ def main():
     parser.add_argument('--zip', default='NBR_Relation_Scripts_Intra_Inter_T7_PA2.zip',
                         help='Path to source data ZIP file')
     parser.add_argument('--output', default=None,
-                        help='Output XML file path')
+                        help='Output XML file path (single file mode)')
     parser.add_argument('--site', default=None,
                         help='Site folder name (e.g., MIN149_SANMIGUELTAGUMDDNB01)')
     parser.add_argument('--list-sites', action='store_true',
                         help='List available sites in the ZIP file')
+    parser.add_argument('--split', action='store_true',
+                        help='Split output into separate XML files per section')
+    parser.add_argument('--output-dir', default=None,
+                        help='Output directory for split mode (default: <site>_RELATION/)')
 
     args = parser.parse_args()
 
@@ -1240,10 +1749,17 @@ def main():
                 print(site)
         return
 
-    if args.output is None:
-        args.output = os.path.join(script_dir, 'output.xml')
-
-    convert_txt_to_xml(template_path, zip_path, args.output, args.site)
+    if args.split:
+        if args.output_dir is None:
+            site_name = args.site or 'output'
+            args.output_dir = os.path.join(script_dir, f'{site_name}_RELATION')
+        elif not os.path.isabs(args.output_dir):
+            args.output_dir = os.path.join(script_dir, args.output_dir)
+        convert_txt_to_xml_split(template_path, zip_path, args.output_dir, args.site)
+    else:
+        if args.output is None:
+            args.output = os.path.join(script_dir, 'output.xml')
+        convert_txt_to_xml(template_path, zip_path, args.output, args.site)
 
 
 if __name__ == '__main__':

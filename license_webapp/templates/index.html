@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NodeCraft License Generator</title>
+<style>
+  :root {
+    --accent: #39C0BA;
+    --accent-dark: #2a9a95;
+    --bg-top: #0b1a26;
+    --bg-bottom: #07121b;
+    --panel: #10263a;
+    --panel-raised: #163247;
+    --border: #1f3d55;
+    --text: #e6f1f7;
+    --text-muted: #8aa4b8;
+    --success: #4ade80;
+    --error: #ff8a8a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
+    color: var(--text); min-height: 100vh; padding: 30px 20px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 30px; }
+  header h1 { margin: 0; font-size: 32px; color: var(--accent); letter-spacing: 0.5px; }
+  header p { margin: 6px 0 0; color: var(--text-muted); font-size: 14px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 12px 24px; cursor: pointer; color: var(--text-muted); font-weight: 600;
+         border-bottom: 2px solid transparent; transition: all 0.2s; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab:hover { color: var(--text); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+           padding: 28px; margin-bottom: 20px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .field { flex: 1; min-width: 200px; margin-bottom: 16px; }
+  label { display: block; font-size: 12px; color: var(--text-muted);
+          font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  input[type=text], input[type=file] {
+    width: 100%; padding: 12px 14px; background: var(--bg-bottom);
+    border: 1px solid var(--border); border-radius: 10px; color: var(--text);
+    font-size: 14px; outline: none; transition: border-color 0.2s;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  .btn {
+    padding: 12px 24px; border: none; border-radius: 10px; cursor: pointer;
+    font-size: 14px; font-weight: 600; transition: all 0.2s; display: inline-flex;
+    align-items: center; gap: 8px;
+  }
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent-dark); }
+  .btn-secondary { background: var(--panel-raised); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hidden { display: none; }
+  .result-card { background: var(--panel-raised); border: 1px solid var(--border);
+                 border-radius: 12px; padding: 18px; margin-top: 16px; }
+  .result-card .info { display: grid; grid-template-columns: 130px 1fr; gap: 8px; font-size: 13px; }
+  .result-card .info .k { color: var(--text-muted); font-weight: 600; }
+  .result-card .key-box {
+    margin-top: 12px; padding: 12px; background: var(--bg-bottom);
+    border: 1px solid var(--border); border-radius: 8px; font-family: "Consolas", monospace;
+    font-size: 12px; word-break: break-all; color: var(--accent);
+  }
+  .error { color: var(--error); margin-top: 10px; font-size: 13px; }
+  .success { color: var(--success); margin-top: 10px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 13px; }
+  th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid var(--border);
+           vertical-align: top; }
+  th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 11px;
+       letter-spacing: 0.5px; }
+  td.key { font-family: "Consolas", monospace; font-size: 11px; color: var(--accent);
+           word-break: break-all; max-width: 380px; }
+  td.err { color: var(--error); font-size: 12px; }
+  .upload-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .copy-btn { background: transparent; border: 1px solid var(--accent); color: var(--accent);
+              padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; margin-left: 8px; }
+  .copy-btn:hover { background: var(--accent); color: white; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>NodeCraft License Generator</h1>
+    <p>Local admin tool — generate offline license keys (Ed25519 signed)</p>
+  </header>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="single">Single Entry</div>
+    <div class="tab" data-tab="bulk">Bulk Upload</div>
+  </div>
+
+  <!-- Single Entry -->
+  <div id="tab-single" class="panel">
+    <div class="row">
+      <div class="field">
+        <label>Name / User *</label>
+        <input type="text" id="s-name" placeholder="John Doe">
+      </div>
+      <div class="field">
+        <label>Hostname (optional — PC-lock)</label>
+        <input type="text" id="s-hostname" placeholder="DESKTOP-ABC123">
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>Expires *</label>
+        <input type="text" id="s-expires" placeholder="YYYYMMDD or YYYY-MM-DD">
+      </div>
+      <div class="field">
+        <label>Note (optional)</label>
+        <input type="text" id="s-note" placeholder="Q1 batch">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="genSingle()">Generate License</button>
+    <div id="s-result"></div>
+  </div>
+
+  <!-- Bulk Upload -->
+  <div id="tab-bulk" class="panel hidden">
+    <div class="upload-row">
+      <input type="file" id="b-file" accept=".xlsx,.csv,.xlsm">
+      <button class="btn btn-primary" onclick="genBulk()">Upload & Generate</button>
+      <span class="muted">Template columns: <b>Name, Hostname, Expires, Note</b></span>
+      <a href="/template.xlsx" class="btn btn-secondary" style="text-decoration:none;">Download Template</a>
+    </div>
+    <div id="b-result"></div>
+  </div>
+</div>
+
+<script>
+let lastResults = [];
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('tab-single').classList.toggle('hidden', t.dataset.tab !== 'single');
+    document.getElementById('tab-bulk').classList.toggle('hidden', t.dataset.tab !== 'bulk');
+  };
+});
+
+async function genSingle() {
+  const fd = new FormData();
+  fd.append('name', document.getElementById('s-name').value);
+  fd.append('hostname', document.getElementById('s-hostname').value);
+  fd.append('expires', document.getElementById('s-expires').value);
+  fd.append('note', document.getElementById('s-note').value);
+  const box = document.getElementById('s-result');
+  box.innerHTML = '<div class="muted">Generating...</div>';
+  const res = await fetch('/generate_single', { method: 'POST', body: fd });
+  const j = await res.json();
+  if (!j.ok) { box.innerHTML = `<div class="error">${escapeHtml(j.error)}</div>`; return; }
+  box.innerHTML = `
+    <div class="result-card">
+      <div class="info">
+        <div class="k">Name</div><div>${escapeHtml(j.name)}</div>
+        <div class="k">Hostname</div><div>${escapeHtml(j.hostname)}</div>
+        <div class="k">Expires</div><div>${escapeHtml(j.expires)}</div>
+        <div class="k">Note</div><div>${escapeHtml(j.note || '—')}</div>
+      </div>
+      <div class="key-box" id="single-key">${escapeHtml(j.key)}</div>
+      <button class="copy-btn" onclick="copyText('single-key', this)">Copy Key</button>
+      <button class="copy-btn" onclick="downloadSingle()">Download Excel</button>
+    </div>`;
+  lastResults = [{ name: j.name, hostname: j.hostname, expires: j.expires, note: j.note, key: j.key, error: '' }];
+}
+
+async function genBulk() {
+  const f = document.getElementById('b-file').files[0];
+  const box = document.getElementById('b-result');
+  if (!f) { box.innerHTML = '<div class="error">Please choose a file.</div>'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  box.innerHTML = '<div class="muted">Processing...</div>';
+  const res = await fetch('/generate_bulk', { method: 'POST', body: fd });
+  const j = await res.json();
+  if (!j.ok) { box.innerHTML = `<div class="error">${escapeHtml(j.error)}</div>`; return; }
+  lastResults = j.results;
+  const ok = j.results.filter(r => !r.error).length;
+  const bad = j.results.length - ok;
+  let html = `<div class="success" style="margin-top:14px;">Generated ${ok} / ${j.results.length} licenses${bad ? ` (${bad} errors)` : ''}.</div>`;
+  html += `<button class="btn btn-primary" style="margin-top:12px;" onclick="downloadAll()">Download All as Excel</button>`;
+  html += '<table><thead><tr><th>#</th><th>Name</th><th>Hostname</th><th>Expires</th><th>Key / Error</th></tr></thead><tbody>';
+  j.results.forEach(r => {
+    html += `<tr>
+      <td>${r.row}</td>
+      <td>${escapeHtml(r.name)}</td>
+      <td>${escapeHtml(r.hostname || '—')}</td>
+      <td>${escapeHtml(r.expires)}</td>
+      <td class="${r.error ? 'err' : 'key'}">${escapeHtml(r.error || r.key)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  box.innerHTML = html;
+}
+
+async function downloadAll() {
+  const res = await fetch('/download_excel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ results: lastResults })
+  });
+  const blob = await res.blob();
+  triggerDownload(blob, 'NodeCraft_Licenses.xlsx');
+}
+
+async function downloadSingle() { downloadAll(); }
+
+function triggerDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function copyText(id, btn) {
+  const txt = document.getElementById(id).innerText;
+  navigator.clipboard.writeText(txt);
+  const orig = btn.innerText; btn.innerText = 'Copied!';
+  setTimeout(() => btn.innerText = orig, 1500);
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+</script>
+</body>
+</html>

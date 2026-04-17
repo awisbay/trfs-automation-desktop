@@ -95,6 +95,33 @@ def main(page: ft.Page):
     page.on_route_change = route_change
     page.on_view_pop = view_pop
 
+    # Kill every live SSH session when the window is closed so worker
+    # threads unwind immediately and the process exits cleanly instead
+    # of lingering in the background.
+    def _on_window_event(e):
+        data = getattr(e, "data", None)
+        if data == "close":
+            try:
+                import ssh_registry
+                n = ssh_registry.kill_all()
+                print(f"[EXIT] killed {n} live SSH session(s)")
+            except Exception as exc:
+                print(f"[EXIT] ssh_registry.kill_all failed: {exc}")
+            # Force the whole process to die — Flet keeps non-daemon
+            # threads (paramiko readers, ThreadPoolExecutor workers)
+            # alive otherwise.
+            try:
+                page.window.destroy()
+            except Exception:
+                pass
+            os._exit(0)
+
+    try:
+        page.window.prevent_close = False
+        page.window.on_event = _on_window_event
+    except Exception:
+        pass
+
     # Initial render — check license first
     license_result = load_saved_license()
     start_route = "/form" if license_result["valid"] else "/license"

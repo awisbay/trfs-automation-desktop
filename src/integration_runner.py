@@ -37,6 +37,7 @@ _CREATE_ARNE = _CFG.get("create_arne_script", "ES/create_arne.py")
 _ENTITY_MAKER = _CFG.get("entity_maker_script", "ES/entity_maker.sh")
 _EXE_ENTITY = _CFG.get("exe_entity_script", "ES/exe_entity.py")
 _ENROLLMENT_MOS = _CFG.get("enrollment_mos", "ES/enroll/lhgenm1.mos")
+_SGW_CHECK_MOS = _CFG.get("sgw_check_mos", "SWG_Check.mos")
 
 _LKF_IMPORT = _CFG.get("lkf_import_script", "lkfimport.py")
 _LKF_INSTALL = _CFG.get("lkf_install_script", "lkfinstall.py")
@@ -95,6 +96,98 @@ class IntegrationSSH:
         self.client: Optional[paramiko.SSHClient] = None
         self.shell: Optional[paramiko.Channel] = None
         self._connected = False
+        # Live session-log tee — when set, every byte read from the shell
+        # is appended to this file (full moshell-style terminal capture).
+        self._step_log_fp = None
+        self._step_log_path: Optional[str] = None
+        # Server-side log files produced during a step; downloaded to
+        # LOG/{SHORTCODE}/MOSHELL/ after the step completes.
+        # Each entry: (remote_path, subfolder_or_None)
+        self._remote_logs: list[tuple[str, Optional[str]]] = []
+
+    def register_remote_log(
+        self, remote_path: str, subfolder: Optional[str] = None
+    ) -> None:
+        """Queue a server-side log for download after the current step.
+
+        If `subfolder` is given, the file is placed in moshell_dir/subfolder/.
+        """
+        if remote_path:
+            self._remote_logs.append((remote_path, subfolder))
+
+    def drain_remote_logs(self, moshell_dir: str) -> list[str]:
+        """Download all queued remote logs into `moshell_dir` (or a subfolder)
+        and clear the queue.
+
+        Returns list of successfully-downloaded local paths.
+        """
+        downloaded: list[str] = []
+        if not self._remote_logs:
+            return downloaded
+        for remote, subfolder in list(self._remote_logs):
+            target_dir = (
+                os.path.join(moshell_dir, subfolder) if subfolder else moshell_dir
+            )
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception:
+                pass
+            local = os.path.join(target_dir, os.path.basename(remote))
+            try:
+                self.sftp_download(remote, local)
+                downloaded.append(local)
+            except Exception as exc:
+                self._log(f"Could not download {remote}: {exc}")
+        self._remote_logs.clear()
+        return downloaded
+
+    # ── Live step logging ────────────────────────────────────────
+    def start_step_log(self, path: str) -> None:
+        """Open a file that every byte read from the shell is teed to.
+
+        Any currently-open step log is closed first.
+        """
+        self.stop_step_log()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            self._step_log_fp = open(path, "w", encoding="utf-8", buffering=1)
+            self._step_log_path = path
+            header = (
+                f"# Live moshell session log\n"
+                f"# File: {os.path.basename(path)}\n"
+                f"# Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# Host: {self.host}:{self.port} as {self.username}\n"
+                + "=" * 72 + "\n\n"
+            )
+            self._step_log_fp.write(header)
+        except Exception as exc:
+            self._log(f"Could not open step log {path}: {exc}")
+            self._step_log_fp = None
+            self._step_log_path = None
+
+    def stop_step_log(self) -> None:
+        """Close the current step log file, if any."""
+        if self._step_log_fp is not None:
+            try:
+                self._step_log_fp.write(
+                    f"\n\n# Closed: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                self._step_log_fp.close()
+            except Exception:
+                pass
+        self._step_log_fp = None
+        self._step_log_path = None
+
+    def _tee(self, chunk: str) -> None:
+        """Write a decoded recv chunk to the step log, if open."""
+        if self._step_log_fp is not None and chunk:
+            try:
+                self._step_log_fp.write(chunk)
+            except Exception:
+                pass
 
     # ── Connection ───────────────────────────────────────────────
     def connect(self, timeout: int = 30):
@@ -113,6 +206,11 @@ class IntegrationSSH:
         self.shell = self.client.invoke_shell(term="xterm", width=200, height=50)
         self.shell.settimeout(timeout)
         self._connected = True
+        try:
+            import ssh_registry
+            ssh_registry.register(self)
+        except Exception:
+            pass
         # Consume initial banner / motd
         self._read_until_prompt(timeout=15)
         self._log("SSH connection established.")
@@ -129,6 +227,11 @@ class IntegrationSSH:
             except Exception:
                 pass
         self._connected = False
+        try:
+            import ssh_registry
+            ssh_registry.unregister(self)
+        except Exception:
+            pass
         self._log("SSH disconnected.")
 
     def sftp_upload(self, local_path: str, remote_dir: str) -> str:
@@ -208,22 +311,73 @@ class IntegrationSSH:
     def __exit__(self, *args):
         self.disconnect()
 
+    # ── Fast direct exec (no AMOS shell needed) ──────────────────
+    def exec_ssh(self, command: str, timeout: int = 300) -> str:
+        """Run a command via a fresh SSH channel (bypasses the interactive AMOS shell).
+
+        Much faster than ``run_amos_command_safe`` because there's no prompt
+        detection, no ANSI scrubbing, and no blocking on AMOS readiness.
+        """
+        stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        if err.strip():
+            out += "\n[stderr]\n" + err
+        return out
+
     # ── Core I/O ─────────────────────────────────────────────────
     def send(self, text: str):
         """Send text (with newline) to the shell."""
         self.shell.send(text + "\n")
         time.sleep(0.3)
 
+    def run_amos_set_with_confirm(self, command: str, node_name: str,
+                                  answer: str = "y", timeout: int = 60) -> str:
+        """Run an AMOS ``set`` command that prompts ``Are you Sure [y/n] ?``.
+
+        Sends the command, waits for the y/n prompt (up to 15s), sends the
+        answer, then reads until the AMOS prompt. Works whether or not a
+        confirmation prompt actually appears.
+        """
+        import re as _re
+        self.send(command)
+        buf = ""
+        start = time.time()
+        hit_confirm = False
+        prompt_re = _re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
+        # Phase 1: wait up to 15s for a confirm prompt OR the real amos prompt
+        while time.time() - start < 15:
+            if self.shell.recv_ready():
+                buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                clean = strip_ansi(buf).lower()
+                if "[y/n]" in clean or "are you sure" in clean:
+                    hit_confirm = True
+                    break
+                last = strip_ansi(buf).strip().split("\n")[-1].strip()
+                if (prompt_re.match(last)
+                        and "<" not in last and "/" not in last):
+                    return strip_ansi(buf)
+            else:
+                time.sleep(0.2)
+        if hit_confirm:
+            self.send(answer)
+        # Phase 2: read until amos prompt
+        tail = self._read_until_amos(timeout=timeout)
+        return strip_ansi(buf + tail)
+
     def _read_until_prompt(self, timeout: int = 60) -> str:
         """Read output until a shell prompt is detected."""
         buf = ""
         start = time.time()
         while True:
+            if self._channel_dead():
+                logger.info("Channel closed while waiting for shell prompt")
+                break
             if time.time() - start > timeout:
                 logger.warning("Timeout (%ds) waiting for shell prompt", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                 buf += chunk
                 clean = strip_ansi(buf)
                 last = clean.strip().split("\n")[-1].strip()
@@ -231,50 +385,126 @@ class IntegrationSSH:
                     # Drain any trailing bytes
                     time.sleep(0.3)
                     while self.shell.recv_ready():
-                        buf += self.shell.recv(65536).decode("utf-8", errors="replace")
+                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                     break
             else:
                 time.sleep(0.3)
         return buf
+
+    def _channel_dead(self) -> bool:
+        """True if the shell channel has been closed/EOF'd — used so wait
+        loops bail out immediately when the session is force-disconnected
+        (cancel / back) instead of idling until their timeout expires."""
+        sh = self.shell
+        if sh is None:
+            return True
+        try:
+            if getattr(sh, "closed", False):
+                return True
+            if sh.eof_received:
+                return True
+            if not sh.get_transport() or not sh.get_transport().is_active():
+                return True
+        except Exception:
+            return True
+        return False
 
     def _read_until(self, marker: str, timeout: int = 60) -> str:
         """Read output until a specific marker string appears in the output."""
         buf = ""
         start = time.time()
         while True:
+            if self._channel_dead():
+                logger.info("Channel closed while waiting for '%s'", marker)
+                break
             if time.time() - start > timeout:
                 logger.warning("Timeout (%ds) waiting for '%s'", timeout, marker)
                 break
             if self.shell.recv_ready():
-                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                 buf += chunk
                 if marker.lower() in strip_ansi(buf).lower():
                     time.sleep(0.3)
                     while self.shell.recv_ready():
-                        buf += self.shell.recv(65536).decode("utf-8", errors="replace")
+                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                     break
             else:
                 time.sleep(0.3)
         return buf
 
+    def run_amos_command_autoyes(self, command: str, timeout: int = 180) -> str:
+        """Run an AMOS command and auto-answer any ``[y/n]`` confirmation
+        prompts with ``y``. Used for commands like ``mcc ... ping`` that
+        emit a "Run COMCLI command(s) on N MOs. Are you Sure [y/n] ?" prompt.
+        """
+        import re
+        self.send(command)
+        prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
+        buf = ""
+        start = time.time()
+        answered = False
+        while True:
+            if self._channel_dead():
+                logger.info("Channel closed while waiting for AMOS prompt")
+                break
+            if time.time() - start > timeout:
+                logger.warning(
+                    "Timeout (%ds) waiting for AMOS prompt (autoyes)", timeout)
+                break
+            if self.shell.recv_ready():
+                chunk = (lambda _c=self.shell.recv(65536).decode(
+                    "utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                buf += chunk
+                clean = strip_ansi(buf)
+                # Auto-answer y/n confirmation
+                if not answered and "[y/n]" in clean.lower():
+                    self._log("  auto-answering [y/n] prompt with 'y'")
+                    self.send("y")
+                    answered = True
+                    continue
+                last = clean.strip().split("\n")[-1].strip()
+                if (prompt_re.match(last)
+                        and "<" not in last
+                        and "/" not in last):
+                    time.sleep(0.3)
+                    while self.shell.recv_ready():
+                        buf += (lambda _c=self.shell.recv(65536).decode(
+                            "utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                    break
+            else:
+                time.sleep(0.3)
+        return strip_ansi(buf)
+
     def _read_until_amos(self, timeout: int = 120) -> str:
-        """Read output until an AMOS/moshell prompt (``nodename>``) appears."""
+        """Read output until an AMOS/moshell prompt (``NODENAME>``) appears.
+
+        Must NOT match XML closing tags like ``</hello>`` or ``</rpc-reply>``
+        when a command like ``netconf`` emits XML — only the actual shell
+        prompt (alphanumeric+underscore only, ending with ``>``).
+        """
+        import re
+        prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
         buf = ""
         start = time.time()
         while True:
+            if self._channel_dead():
+                logger.info("Channel closed while waiting for AMOS prompt")
+                break
             if time.time() - start > timeout:
                 logger.warning("Timeout (%ds) waiting for AMOS prompt", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                 buf += chunk
                 clean = strip_ansi(buf)
                 last = clean.strip().split("\n")[-1].strip()
-                # AMOS prompt looks like: NODENAME>
-                if last.endswith(">") and not last.startswith("["):
+                # Real AMOS prompt: word-only token + '>', no XML chars
+                if (prompt_re.match(last)
+                        and "<" not in last
+                        and "/" not in last):
                     time.sleep(0.5)
                     while self.shell.recv_ready():
-                        buf += self.shell.recv(65536).decode("utf-8", errors="replace")
+                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
                     break
             else:
                 time.sleep(0.3)
@@ -299,9 +529,51 @@ class IntegrationSSH:
         output = self._read_until_amos(timeout=timeout)
         self._log("AMOS prompt ready, loading MO tree (lt all)...")
         self.send("lt all")
-        output += self._read_until_amos(timeout=120)
+        output += self._read_until_amos_or_prompt(timeout=120)
         self._log("AMOS ready.")
         return strip_ansi(output)
+
+    def _read_until_amos_or_prompt(self, timeout: int = 120) -> str:
+        """Read until AMOS prompt, handling username/password prompts with 'rbs'/'rbs'."""
+        buf = ""
+        start = time.time()
+        sent_user = False
+        sent_pass = False
+        while True:
+            if self._channel_dead():
+                logger.info("Channel closed while waiting for AMOS prompt")
+                break
+            if time.time() - start > timeout:
+                logger.warning("Timeout (%ds) waiting for AMOS prompt", timeout)
+                break
+            if self.shell.recv_ready():
+                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                buf += chunk
+                clean = strip_ansi(buf)
+                tail = clean[-500:].lower()
+                if not sent_user and "enter username" in tail:
+                    self._log("lt all: sending username 'rbs'")
+                    self.send("rbs")
+                    sent_user = True
+                    time.sleep(0.3)
+                    continue
+                if sent_user and not sent_pass and "password" in tail:
+                    self._log("lt all: sending password")
+                    self.send("rbs")
+                    sent_pass = True
+                    time.sleep(0.3)
+                    continue
+                last = clean.strip().split("\n")[-1].strip()
+                import re as _re
+                if (_re.match(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$", last)
+                        and "<" not in last and "/" not in last):
+                    time.sleep(0.5)
+                    while self.shell.recv_ready():
+                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                    break
+            else:
+                time.sleep(0.3)
+        return buf
 
     def exit_amos(self) -> str:
         """Exit AMOS session back to bash."""
@@ -612,33 +884,56 @@ def run_enrollment(
     all_output += out
     log_cb(f"Enrollment script output:\n{out}")
 
-    # ── 6. Validate enrollment — check NodeCredential ────────────
+    # ── 6. Validate enrollment — poll NodeCredential progress ───
+    # The enrollmentProgress can transition IDLE → ONGOING → SUCCESS.
+    # Auto-poll up to 6 times at 15s intervals BEFORE bothering the user,
+    # so a slow node that's still transitioning won't show a false FAILED.
     log_cb("Validating enrollment (NodeCredential enrollmentProgress)...")
-    out = ssh.run_amos_command_safe(
-        "get NodeCredential enrollmentProgress result",
-        node_name, timeout=60,
-    )
-    all_output += out
-    log_cb(f"NodeCredential output:\n{out}")
-
-    enroll_success = "SUCCESS" in out
-    if not enroll_success:
-        msg = (
-            f"Enrollment validation for {node_name} failed.\n"
-            f"Expected 'SUCCESS' in NodeCredential enrollmentProgress result."
+    enroll_success = False
+    max_auto_polls = 10
+    poll_interval = 8
+    out = ""
+    for attempt in range(1, max_auto_polls + 1):
+        out = ssh.run_amos_command_safe(
+            "get NodeCredential enrollmentProgress result",
+            node_name, timeout=60,
         )
-        log_cb(f"✗ {msg}")
+        all_output += out
+        log_cb(f"Validation poll #{attempt}/{max_auto_polls}:\n{out}")
+
+        if "SUCCESS" in out:
+            enroll_success = True
+            break
+        # Hard failure — don't keep polling if the node says ERROR/FAILURE
+        if "FAILURE" in out or "ERROR" in out.upper().replace("IDLE/ERROR", ""):
+            log_cb("Hard enrollment error detected — stopping auto-poll.")
+            break
+        if attempt < max_auto_polls:
+            log_cb(f"Still not SUCCESS — waiting {poll_interval}s before next check...")
+            time.sleep(poll_interval)
+
+    if not enroll_success:
+        advice = (
+            f"Enrollment validation for {node_name} is not yet SUCCESS after "
+            f"{max_auto_polls} auto-checks.\n\n"
+            f"Recommended manual checks (in another AMOS window):\n"
+            f"  1. get NodeCredential enrollmentProgress       ← should be SUCCESS\n"
+            f"  2. get NodeCredential enrollmentAuthorityType  ← should be set\n"
+            f"  3. get NodeCredential trustedCertificateAuthority\n"
+            f"  4. alt                                          ← check for open alarms\n\n"
+            f"If the node shows ONGOING, just wait ~30s and click Retry.\n"
+            f"If it already shows SUCCESS manually but this dialog says not, click Retry — "
+            f"we'll re-check once (fast) instead of polling."
+        )
+        log_cb(f"✗ Enrollment not yet validated; asking user.")
         while not enroll_success:
             if not wait_for_user:
                 return False, all_output
-            retry = wait_for_user(
-                f"{msg}\n\nCheck the enrollment output for errors.\n"
-                f"Fix the issue, then click Retry to re-check."
-            )
+            retry = wait_for_user(advice)
             if not retry:
                 log_cb("User chose to stop.")
                 return False, all_output
-            log_cb("Re-checking enrollment status...")
+            log_cb("Re-checking enrollment status (single fast check)...")
             out = ssh.run_amos_command_safe(
                 "get NodeCredential enrollmentProgress result",
                 node_name, timeout=60,
@@ -660,7 +955,7 @@ def run_enrollment(
     # ── 8. Wait for SYNCHRONIZED (stay in AMOS, use !python) ─────
     log_cb(f"Waiting for {node_name} to reach SYNCHRONIZED status...")
     sync_cmd = f'!python {CLI_PY} "cmedit get {node_name} cmfunction.syncstatus -t"'
-    max_sync_attempts = 20  # up to ~20 minutes
+    max_sync_attempts = 30
     synced = False
     for attempt in range(1, max_sync_attempts + 1):
         out = ssh.run_amos_command_safe(sync_cmd, node_name, timeout=60)
@@ -671,13 +966,15 @@ def run_enrollment(
             synced = True
             break
 
+        # Faster polling: 15s first 6 attempts, then 30s
+        delay = 15 if attempt <= 6 else 30
         if "TOPOLOGY" in out or "UNSYNCHRONIZED" in out or "PENDING" in out:
-            log_cb(f"Status not yet SYNCHRONIZED (attempt {attempt}/{max_sync_attempts}), "
-                   f"waiting 60s...")
-            time.sleep(60)
+            log_cb(f"Status not yet SYNCHRONIZED ({attempt}/{max_sync_attempts}), "
+                   f"waiting {delay}s...")
         else:
-            log_cb(f"Unexpected sync status (attempt {attempt}), waiting 60s...")
-            time.sleep(60)
+            log_cb(f"Unexpected sync status ({attempt}/{max_sync_attempts}), "
+                   f"waiting {delay}s...")
+        time.sleep(delay)
 
     if not synced:
         msg = (
@@ -750,20 +1047,20 @@ def run_install_lkf(
         else:
             return False, all_output
 
-    # ── 2. Import LKF ────────────────────────────────────────────
+    # ── 2. Import LKF (direct SSH exec — much faster than !python in AMOS) ──
     log_cb(f"Importing LKF: {zip_filename}...")
-    out = ssh.run_amos_command_safe(
-        f"!python {SCRIPTS_PATH}/{_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
-        node_name, timeout=300,
+    out = ssh.exec_ssh(
+        f"python {SCRIPTS_PATH}/{_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
+        timeout=600,
     )
     all_output += out
     log_cb(f"lkfimport.py output:\n{out}")
 
-    # ── 3. Install LKF — extract job name ────────────────────────
+    # ── 3. Install LKF — extract job name (direct SSH exec) ──────
     log_cb(f"Installing LKF for {node_name}...")
-    out = ssh.run_amos_command_safe(
-        f"!python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
-        node_name, timeout=300,
+    out = ssh.exec_ssh(
+        f"python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
+        timeout=600,
     )
     all_output += out
     log_cb(f"lkfinstall.py output:\n{out}")
@@ -792,9 +1089,9 @@ def run_install_lkf(
             if not retry:
                 return False, all_output
             # Ask again — maybe user can provide it or it appeared
-            out2 = ssh.run_amos_command_safe(
-                f"!python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
-                node_name, timeout=120,
+            out2 = ssh.exec_ssh(
+                f"python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
+                timeout=300,
             )
             all_output += out2
             for line in out2.split("\n"):
@@ -811,25 +1108,31 @@ def run_install_lkf(
 
     log_cb(f"✓ Job name: {job_name}")
 
-    # ── 4. Poll status until COMPLETED ───────────────────────────
+    # ── 4. Poll status until COMPLETED (direct SSH exec) ─────────
     log_cb(f"Checking LKF installation status for job: {job_name}...")
-    status_cmd = f"!python {SCRIPTS_PATH}/{_LKF_STATUS} {job_name}"
-    max_attempts = 10
+    status_cmd = f"python {SCRIPTS_PATH}/{_LKF_STATUS} {job_name}"
+    max_attempts = 20
     completed = False
 
     for attempt in range(1, max_attempts + 1):
-        out = ssh.run_amos_command_safe(status_cmd, node_name, timeout=60)
+        out = ssh.exec_ssh(status_cmd, timeout=120)
         all_output += out
         log_cb(f"Status check #{attempt}:\n{out}")
 
         if "COMPLETED" in out:
             completed = True
             break
+        # Early-exit on terminal failure states
+        if "FAILED" in out.upper() or "ERROR" in out.upper():
+            log_cb("Terminal failure detected in LKF status — stopping poll.")
+            break
 
+        # Back off: 10s for first 5 attempts, then 20s after
+        delay = 10 if attempt <= 5 else 20
         if attempt < max_attempts:
-            log_cb(f"Status not yet COMPLETED (attempt {attempt}/{max_attempts}), "
-                   f"waiting 60s...")
-            time.sleep(60)
+            log_cb(f"Status not yet COMPLETED ({attempt}/{max_attempts}), "
+                   f"waiting {delay}s...")
+            time.sleep(delay)
 
     if not completed:
         msg = (
@@ -1013,7 +1316,7 @@ def run_uri_setting(
     """
     all_output = ""
 
-    # ── 1-3. AMOS set commands ──────────────────────────────────
+    # ── 1-3. AMOS set commands (each requires y/n confirmation) ─
     amos_cmds = [
         "set SwM=1 defaultUri",
         f"set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} uri",
@@ -1022,8 +1325,8 @@ def run_uri_setting(
     ]
 
     for cmd in amos_cmds:
-        log_cb(f"Running: {cmd}")
-        out = ssh.run_amos_command_safe(cmd, node_name, timeout=30)
+        log_cb(f"Running (with y/n confirm): {cmd}")
+        out = ssh.run_amos_set_with_confirm(cmd, node_name, answer="y", timeout=60)
         all_output += out
         log_cb(f"Output:\n{out}")
 
@@ -1075,30 +1378,60 @@ def run_uri_setting(
     all_output += out
     log_cb(f"Update output:\n{out}")
 
-    # Check for SUCCESS in the response
-    if "SUCCESS" in out.upper():
+    api_ok = "SUCCESS" in out.upper()
+    if not api_ok:
+        log_cb(f"✗ updateUpMoFtpServerDetails did not return SUCCESS.")
+
+    # ── 6. Verify via `get depack` — uri must start with sftp://mm-software@
+    log_cb("Verifying URI via: get depack")
+    vout = ssh.run_amos_command_safe("get depack", node_name, timeout=60)
+    all_output += vout
+    log_cb(f"get depack output:\n{vout}")
+
+    uri_value = ""
+    for line in vout.splitlines():
+        s = line.strip()
+        if s.startswith("uri") and len(s) > 3:
+            parts = s.split(None, 1)
+            if len(parts) > 1:
+                uri_value = parts[1].strip()
+            break
+    uri_ok = uri_value.startswith("sftp://mm-software@")
+
+    if api_ok and uri_ok:
         log_cb(f"✓ URI setting completed for {node_name}.")
+        log_cb(f"  uri = {uri_value}")
         return True, all_output
-    else:
-        msg = f"URI setting failed for {node_name}.\nOutput: {out[:300]}"
-        log_cb(f"✗ {msg}")
-        if wait_for_user:
-            retry = wait_for_user(
-                f"{msg}\n\nCheck the output and click Retry."
-            )
-            if not retry:
-                return False, all_output
-            # Retry the update
-            out = ssh.run_amos_command_safe(update_cmd, node_name, timeout=60)
-            all_output += out
-            if "SUCCESS" in out.upper():
-                log_cb(f"✓ URI setting completed on retry for {node_name}.")
-                return True, all_output
-            else:
-                log_cb("✗ URI setting still failed after retry.")
-                return False, all_output
-        else:
+
+    msg = (
+        f"URI setting verification failed for {node_name}.\n"
+        f"  updateUpMoFtpServerDetails SUCCESS? {api_ok}\n"
+        f"  uri starts with 'sftp://mm-software@'? {uri_ok}\n"
+        f"  current uri = {uri_value or '(empty)'}"
+    )
+    log_cb(f"✗ {msg}")
+    if wait_for_user:
+        retry = wait_for_user(f"{msg}\n\nCheck manually and click Retry.")
+        if not retry:
             return False, all_output
+        # Retry: re-run curl update + re-verify
+        out = ssh.run_amos_command_safe(update_cmd, node_name, timeout=60)
+        all_output += out
+        vout = ssh.run_amos_command_safe("get depack", node_name, timeout=60)
+        all_output += vout
+        uri_value = ""
+        for line in vout.splitlines():
+            s = line.strip()
+            if s.startswith("uri") and len(s) > 3:
+                parts = s.split(None, 1)
+                if len(parts) > 1:
+                    uri_value = parts[1].strip()
+                break
+        if uri_value.startswith("sftp://mm-software@"):
+            log_cb(f"✓ URI verified on retry: {uri_value}")
+            return True, all_output
+        log_cb(f"✗ URI still not valid on retry: {uri_value or '(empty)'}")
+    return False, all_output
 
 
 # ── Relation step ────────────────────────────────────────────────
@@ -1126,10 +1459,15 @@ def _parse_relation_output(output: str, filename: str) -> dict:
     att = 0             # "Total: N MOs attempted, N MOs set" where N > 0
     cmd_set = 0         # lines with "> set"
     no_change = 0       # lines with "-No Change-"
-    total_error = 0     # lines with "!!!!" or "ERROR"
+    total_error = 0     # lines with "!!!!" or "ERROR" (excluding soft ones)
+    already_exists = 0  # "ERROR: MO already exists" — soft warning on re-run
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        # Soft warning: MO already exists (re-run on a node with relations already created)
+        if "already exists" in stripped and "ERROR" in stripped:
+            already_exists += 1
+            continue
 
         if re.search(r'Total:\s+1\s+MOs\s+attempted,\s+0\s+MOs\s+set', stripped):
             failed += 1
@@ -1169,20 +1507,24 @@ def _parse_relation_output(output: str, filename: str) -> dict:
         summary_line = (
             f"MO_TOTAL={mo_total}  MO_EXIST={mo_exist}  "
             f"MO_CREATED={mo_cre}  FAILED={tot_failed}  "
-            f"MO_N/A={no_att}  ERROR={total_error}"
+            f"MO_N/A={no_att}  ERROR={total_error}  "
+            f"ALREADY_EXISTS={already_exists}"
         )
-        has_issues = (total_error > 0 or tot_failed > 0 or no_att > 0)
+        has_issues = (total_error > 0 or tot_failed > 0)
     else:
         summary_line = (
             f"CMD_SET={cmd_set}  SUCCEED={att}  "
             f"FAILED={failed}  WRONG_MO={no_att}  "
-            f"NO_CHANGE={no_change}  ERROR={total_error}"
+            f"NO_CHANGE={no_change}  ERROR={total_error}  "
+            f"ALREADY_EXISTS={already_exists}"
         )
-        has_issues = (total_error > 0 or failed > 0 or no_att > 0)
+        has_issues = (total_error > 0 or failed > 0)
 
-    # Collect error details
+    # Collect error details (skip soft "already exists" warnings)
     error_lines = []
     for i, line in enumerate(lines):
+        if "already exists" in line and "ERROR" in line:
+            continue
         if '!!!!' in line or 'ERROR' in line:
             # Include context line before the error if available
             if i > 0 and '>' in lines[i - 1]:
@@ -1202,6 +1544,7 @@ def _parse_relation_output(output: str, filename: str) -> dict:
         "cmd_set": cmd_set,
         "no_change": no_change,
         "total_error": total_error,
+        "already_exists": already_exists,
         "summary_line": summary_line,
         "has_issues": has_issues,
         "error_lines": error_lines,
@@ -1341,16 +1684,30 @@ def _run_relation_zip(
     # ── 2. Unzip on server ───────────────────────────────────────
     log_cb(f"Unzipping {zip_filename} on server...")
     out = ssh.run_amos_command_safe(
-        f"!cd {remote_dir} && unzip -o {zip_filename}",
+        f'!unzip -o "{remote_dir}/{zip_filename}" -d "{remote_dir}"',
         node_name, timeout=120,
     )
     all_output += out
     log_cb(f"Unzip output:\n{out}")
 
+    # Sanitize: rename any extracted subfolders that contain spaces,
+    # because moshell's `l+`/`run` commands don't support quoted paths.
+    rename_cmd = (
+        f'!cd "{remote_dir}" && '
+        f'find . -depth -name "* *" | '
+        f'while IFS= read -r p; do '
+        f'np="$(echo "$p" | tr " " "_")"; '
+        f'[ "$p" != "$np" ] && mv "$p" "$np"; '
+        f'done; echo DONE_RENAME'
+    )
+    out = ssh.run_amos_command_safe(rename_cmd, node_name, timeout=60)
+    all_output += out
+    log_cb("Sanitized any paths containing spaces.")
+
     # ── 3. Find folder matching node_name ────────────────────────
     log_cb(f"Looking for folder matching '{node_name}'...")
     out = ssh.run_amos_command_safe(
-        f"!find {remote_dir} -maxdepth 3 -type d -name '*{node_name}*'",
+        f"!find \"{remote_dir}\" -maxdepth 3 -type d -name \"*{node_name}*\"",
         node_name, timeout=30,
     )
     all_output += out
@@ -1378,7 +1735,7 @@ def _run_relation_zip(
                 return False, all_output
             # Re-search
             out = ssh.run_amos_command_safe(
-                f"!find {remote_dir} -maxdepth 3 -type d -name '*{node_name}*'",
+                f"!find \"{remote_dir}\" -maxdepth 3 -type d -name \"*{node_name}*\"",
                 node_name, timeout=30,
             )
             all_output += out
@@ -1398,7 +1755,7 @@ def _run_relation_zip(
     # ── 4. List all .txt files ───────────────────────────────────
     log_cb(f"Listing relation files in {node_folder}...")
     out = ssh.run_amos_command_safe(
-        f"!ls -1 {node_folder}/*.txt 2>/dev/null",
+        f'!ls -1N "{node_folder}"/*.txt 2>/dev/null',
         node_name, timeout=15,
     )
     all_output += out
@@ -1406,6 +1763,9 @@ def _run_relation_zip(
     txt_files = []
     for line in out.strip().split("\n"):
         line = line.strip()
+        # ls may wrap paths containing spaces with single or double quotes
+        if (len(line) >= 2 and line[0] in ("'", '"') and line[-1] == line[0]):
+            line = line[1:-1]
         if line.endswith(".txt") and line.startswith("/"):
             txt_files.append(line)
 
@@ -1418,22 +1778,101 @@ def _run_relation_zip(
 
     log_cb(f"Found {len(txt_files)} relation file(s) to run.")
 
-    # ── 5. Run each relation file ────────────────────────────────
+    # ── 5. Generate moshell batch script via bash, then `run` it once ──
+    # Produces one `l+ <file>.log / run <file> / l-` block per .txt file.
+    # Much faster than Python-side per-file loop and gives isolated logs.
+    safe_node = node_name.replace("/", "_")
+    batch_script = f"{remote_dir}/run_relation_{safe_node}.mos"
+    log_cb(f"Generating batch moshell script: {batch_script}")
+    # l+/l- wraps each `run` so the server also produces a per-file .log
+    # file, which is later downloaded into LOG/{SHORTCODE}/MOSHELL/
+    gen_cmd = (
+        f'!for f in "{node_folder}"/*.txt; do '
+        f'echo "l+ $f.log"; echo "run $f"; echo "l-"; '
+        f'done > "{batch_script}"'
+    )
+    # Clear any stale server-side .log files from previous runs
+    ssh.run_amos_command_safe(
+        f'!rm -f "{node_folder}"/*.log', node_name, timeout=15,
+    )
+    out = ssh.run_amos_command_safe(gen_cmd, node_name, timeout=30)
+    all_output += out
+
+    # Verify script has content
+    out = ssh.run_amos_command_safe(
+        f'!wc -l "{batch_script}"', node_name, timeout=15,
+    )
+    all_output += out
+
+    # Run the whole batch in one moshell call; capture full live terminal
+    # output (includes NODE> prompts, [Proxy ID = ...] lines, crn blocks).
+    log_cb(f"Running all {len(txt_files)} relation files in one batch...")
+    batch_timeout = max(900, len(txt_files) * 120)
+    batch_out = ssh.run_amos_command_safe(
+        f"run {batch_script}", node_name, timeout=batch_timeout,
+    )
+    all_output += batch_out
+    log_cb(f"Batch run completed ({len(batch_out)} bytes of live output).")
+
+    # Register each server-side per-file .log for later download to
+    # MOSHELL/RELATION/ (isolated so other steps' logs don't mix in).
+    for tp in sorted(txt_files):
+        ssh.register_remote_log(f"{tp}.log", subfolder="RELATION")
+    # Also register the batch script itself for reference
+    ssh.register_remote_log(batch_script, subfolder="RELATION")
+
+    # Save the raw combined live output as a single session log
+    combined_path = os.path.join(
+        log_dir, f"RELATION_{node_name}_FULL_SESSION.txt"
+    )
+    try:
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(batch_out)
+        log_cb(f"Full session log saved: {os.path.basename(combined_path)}")
+    except Exception as exc:
+        log_cb(f"Failed to save full session log: {exc}")
+
+    # ── 6. Split the live output into per-file sections ─────────
+    # Each file's section starts at a line like: "run /path/to/XX_File.txt"
+    # and ends right before the next "run /path/..." or end-of-output.
+    file_sections: dict[str, str] = {}
+    sorted_txt_files = sorted(txt_files)
+    # Build regex matching any `run <path>` start-of-line
+    import re as _re
+    markers = []
+    for tp in sorted_txt_files:
+        # Match lines containing "run <path>" (prompt prefix optional)
+        pattern = _re.compile(
+            r"(?m)^(?:.*?>\s*)?run\s+" + _re.escape(tp) + r"\s*$"
+        )
+        m = pattern.search(batch_out)
+        markers.append((m.start() if m else -1, tp))
+    # Sort by position in output (skip missing)
+    found = [(pos, tp) for pos, tp in markers if pos >= 0]
+    found.sort()
+    for i, (pos, tp) in enumerate(found):
+        end = found[i + 1][0] if i + 1 < len(found) else len(batch_out)
+        file_sections[tp] = batch_out[pos:end]
+    # Fallback: any txt file with no marker gets the full batch output
+    for tp in sorted_txt_files:
+        file_sections.setdefault(tp, batch_out)
+
     errors_summary: list[str] = []
     file_summaries: list[str] = []
-    for i, txt_path in enumerate(sorted(txt_files), 1):
+    for i, txt_path in enumerate(sorted_txt_files, 1):
         txt_name = os.path.basename(txt_path)
-        log_cb(f"[{i}/{len(txt_files)}] Running: {txt_name}...")
+        local_name = f"RELATION_{node_name}_{txt_name.replace('.txt', '')}.txt"
+        local_path = os.path.join(log_dir, local_name)
 
-        out = ssh.run_amos_command_safe(
-            f"run {txt_path}",
-            node_name, timeout=900,
-        )
-        all_output += out
-        log_cb(f"Output for {txt_name}:\n{out}")
+        file_output = file_sections.get(txt_path, "")
+        log_cb(f"[{i}/{len(sorted_txt_files)}] Saving log for {txt_name}...")
+        try:
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(file_output)
+        except Exception as exc:
+            log_cb(f"  ! Failed to write {local_name}: {exc}")
 
-        # ── 6. Parse output and build summary ────────────────────
-        parsed = _parse_relation_output(out, txt_name)
+        parsed = _parse_relation_output(file_output, txt_name)
         file_summary = f"{txt_name.replace('.txt', '')}  {parsed['summary_line']}"
         file_summaries.append(file_summary)
         log_cb(f"  → {parsed['summary_line']}")
@@ -1441,21 +1880,15 @@ def _run_relation_zip(
         if parsed["has_issues"]:
             errors_summary.append(file_summary)
 
-        # ── 7. Save separate log with summary appended ──────────
-        rel_log_name = f"RELATION_{node_name}_{txt_name.replace('.txt', '')}.txt"
-        rel_log_path = os.path.join(log_dir, rel_log_name)
+        # Append summary footer to the downloaded log
         try:
-            with open(rel_log_path, "w", encoding="utf-8") as f:
-                f.write(f"Relation Log — {node_name}\n")
+            with open(local_path, "a", encoding="utf-8") as f:
+                f.write("\n\n" + "=" * 72 + "\n")
+                f.write("SUMMARY\n")
+                f.write("=" * 72 + "\n")
                 f.write(f"File: {txt_name}\n")
                 f.write(f"Path: {txt_path}\n")
                 f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 72 + "\n\n")
-                f.write(out)
-                f.write("\n\n")
-                f.write("=" * 72 + "\n")
-                f.write("SUMMARY\n")
-                f.write("=" * 72 + "\n")
                 f.write(f"{parsed['summary_line']}\n")
                 if parsed["has_issues"]:
                     f.write(f"\nStatus: NEEDS REVIEW\n")
@@ -1466,9 +1899,8 @@ def _run_relation_zip(
                             f.write(f"  {err_line}\n")
                 else:
                     f.write(f"\nStatus: OK\n")
-            log_cb(f"Log saved: {rel_log_name}")
         except Exception as exc:
-            log_cb(f"Failed to save log {rel_log_name}: {exc}")
+            log_cb(f"  ! Failed to append summary to {local_name}: {exc}")
 
     # ── Overall summary ─────────────────────────────────────────
     summary_log_path = os.path.join(log_dir, f"RELATION_{node_name}_SUMMARY.txt")
@@ -1512,6 +1944,125 @@ def _run_relation_zip(
 
 
 # ── Verify MME step ──────────────────────────────────────────────
+def run_sgw_check(
+    ssh: "IntegrationSSH",
+    node_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+    node_type: str = "lte_nr",
+    gsm_ping_targets: Optional[list[str]] = None,
+) -> tuple[bool, str]:
+    """SGW transport reachability check.
+
+    - LTE/NR: ``run {SCRIPTS_PATH}/SWG_Check.mos`` (multi-ping script on server).
+    - GSM:    ``mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,
+              AddressIPv4=1 ping -c 5 <ip>`` per target.
+
+    Wrapped in ``l+ / l-``; the server-side log is registered for download
+    into MOSHELL/. Ping blocks are parsed; failed targets are reported as
+    "<ip> > Not OK".
+
+    Returns:
+        (success: bool, full_output: str) — success=True iff every ping OK.
+    """
+    import re
+    all_output = ""
+
+    remote_log = f"/home/shared/{ssh.username}/SGW_Check_{node_name}.log"
+
+    log_cb(f"Running SGW Check for {node_name} ({node_type})...")
+    ssh.run_amos_command_safe(f"!rm -f {remote_log}", node_name, timeout=15)
+
+    ssh.run_amos_command_safe(f"l+ {remote_log}", node_name, timeout=15)
+    if node_type == "gsm":
+        targets = gsm_ping_targets or ["10.14.194.131"]
+        for ip in targets:
+            cmd = (
+                f"mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,"
+                f"AddressIPv4=1 ping -c 5 {ip}"
+            )
+            log_cb(f"  $ {cmd}")
+            # mcc emits a "[y/n]" confirmation prompt — auto-answer 'y'
+            out = ssh.run_amos_command_autoyes(cmd, timeout=180)
+            all_output += out
+    else:
+        out = ssh.run_amos_command_safe(
+            f"run {SCRIPTS_PATH}/{_SGW_CHECK_MOS}", node_name, timeout=900,
+        )
+        all_output += out
+    ssh.run_amos_command_safe("l-", node_name, timeout=15)
+    log_cb(f"SGW_Check output ({len(out)} bytes).")
+
+    # Register for MOSHELL/ download
+    ssh.register_remote_log(remote_log)
+
+    # Parse ping blocks. A "ping <ip>" command appears, then later the
+    # stats line "N packets transmitted, M received, K% packet loss, ..."
+    # Failure = received=0  OR  100% packet loss  OR  Destination unreachable
+    lines = out.split("\n")
+    current_ip: Optional[str] = None
+    results: list[tuple[str, bool]] = []  # (ip, ok)
+    seen_ips: set[str] = set()
+    # Match the "PING <ip> (" header emitted by /bin/ping — reliable and
+    # independent of caller-supplied options like "-c 5" or "--count 3".
+    ping_re = re.compile(r"^\s*PING\s+(\d+\.\d+\.\d+\.\d+)\s*\(", re.IGNORECASE)
+    stats_re = re.compile(
+        r"(\d+)\s+packets\s+transmitted,\s*(\d+)\s+received"
+    )
+
+    for line in lines:
+        m = ping_re.search(line)
+        if m:
+            current_ip = m.group(1)
+            continue
+        if current_ip:
+            if "Destination Host Unreachable" in line or \
+               "Network is unreachable" in line or \
+               "100% packet loss" in line:
+                if current_ip not in seen_ips:
+                    results.append((current_ip, False))
+                    seen_ips.add(current_ip)
+                current_ip = None
+                continue
+            sm = stats_re.search(line)
+            if sm:
+                transmitted = int(sm.group(1))
+                received = int(sm.group(2))
+                ok = received > 0 and received == transmitted
+                if current_ip not in seen_ips:
+                    results.append((current_ip, ok))
+                    seen_ips.add(current_ip)
+                current_ip = None
+
+    if not results:
+        msg = "No ping blocks detected in SGW_Check output."
+        log_cb(f"⚠ {msg}")
+        all_output += f"\n[SGW CHECK] {msg}\n"
+        return False, all_output
+
+    failed = [ip for ip, ok in results if not ok]
+    ok_ips = [ip for ip, ok in results if ok]
+
+    log_cb(f"SGW Check parsed {len(results)} target(s): "
+           f"{len(ok_ips)} OK, {len(failed)} failed.")
+
+    summary_lines = [
+        "[SGW CHECK SUMMARY]",
+        f"Total: {len(results)}  OK: {len(ok_ips)}  FAIL: {len(failed)}",
+        "-" * 60,
+    ]
+    for ip, ok in results:
+        if ok:
+            summary_lines.append(f"  {ip} > OK")
+        else:
+            summary_lines.append(f"  {ip} > Not OK")
+    summary_text = "\n".join(summary_lines)
+    all_output += "\n" + summary_text + "\n"
+    log_cb(summary_text)
+
+    return (len(failed) == 0), all_output
+
+
 def run_verify_mme(
     ssh: IntegrationSSH,
     node_name: str,
@@ -1594,6 +2145,118 @@ def run_verify_mme(
     return True, all_output
 
 
+# ── Backup CV step ──────────────────────────────────────────────
+def run_backup_cv(
+    ssh: IntegrationSSH,
+    node_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Create a pre-integration SHM backup and wait until it succeeds."""
+    all_output = ""
+    backup_name = f"PreIntegration_{time.strftime('%Y%m%d_%H%M')}"
+    backup_cmd = (
+        f'!python {CLI_PY} "shm backup --nodes {node_name} '
+        f'--backupname {backup_name} --upload"'
+    )
+
+    def _extract_value(field: str, text: str) -> str:
+        match = re.search(
+            rf"^\s*{re.escape(field)}\s*:\s*(.+?)\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        return match.group(1).strip() if match else ""
+
+    log_cb(
+        f"Starting Backup CV for {node_name} "
+        f"(backup name: {backup_name})..."
+    )
+    out = ssh.run_amos_command_safe(backup_cmd, node_name, timeout=180)
+    all_output += out
+    log_cb(f"Backup command output:\n{out}")
+
+    job_name = ""
+    for pattern in (
+        r"job name:\s*([A-Za-z0-9_.-]+)",
+        r"shm status --jobname\s+([A-Za-z0-9_.-]+)",
+    ):
+        match = re.search(pattern, out, re.IGNORECASE)
+        if match:
+            job_name = match.group(1).strip()
+            break
+
+    if not job_name:
+        msg = f"Could not parse Backup CV job name for {node_name}."
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(
+                f"{msg}\n\nCheck the backup command output and retry if needed."
+            )
+            if retry:
+                return run_backup_cv(ssh, node_name, log_cb, wait_for_user)
+        return False, all_output
+
+    log_cb(f"✓ Backup job started: {job_name}")
+
+    status_cmd = f'!python {CLI_PY} "shm status --jobname {job_name}"'
+    max_attempts = 90  # up to ~15 minutes at 10s intervals
+
+    for attempt in range(1, max_attempts + 1):
+        out = ssh.run_amos_command_safe(status_cmd, node_name, timeout=60)
+        all_output += out
+        log_cb(f"Backup status check #{attempt}:\n{out}")
+
+        status_value = _extract_value("Status", out).upper()
+        result_value = _extract_value("Result", out).upper()
+
+        if status_value == "COMPLETED" and result_value == "SUCCESS":
+            log_cb(f"✓ Backup CV completed successfully (job: {job_name}).")
+            return True, all_output
+
+        if status_value in {"FAILED", "ABORTED", "CANCELLED"} or \
+                result_value in {"FAILED", "FAILURE", "ERROR"}:
+            msg = (
+                f"Backup CV failed for {node_name} "
+                f"(job: {job_name}, status: {status_value or 'UNKNOWN'}, "
+                f"result: {result_value or 'UNKNOWN'})."
+            )
+            log_cb(f"✗ {msg}")
+            if wait_for_user:
+                retry = wait_for_user(
+                    f"{msg}\n\nCheck the backup job and retry if needed."
+                )
+                if retry:
+                    return run_backup_cv(ssh, node_name, log_cb, wait_for_user)
+            return False, all_output
+
+        if attempt < max_attempts:
+            state_text = status_value or "IN PROGRESS"
+            result_text = result_value or "PENDING"
+            log_cb(
+                f"Backup job {job_name} is {state_text} / {result_text} "
+                f"({attempt}/{max_attempts}); waiting 10s..."
+            )
+            time.sleep(10)
+
+    msg = (
+        f"Backup CV did not reach COMPLETED/SUCCESS after "
+        f"{max_attempts} checks (job: {job_name})."
+    )
+    log_cb(f"✗ {msg}")
+    if wait_for_user:
+        retry = wait_for_user(f"{msg}\n\nClick Retry to check again.")
+        if retry:
+            out = ssh.run_amos_command_safe(status_cmd, node_name, timeout=60)
+            all_output += out
+            status_value = _extract_value("Status", out).upper()
+            result_value = _extract_value("Result", out).upper()
+            if status_value == "COMPLETED" and result_value == "SUCCESS":
+                log_cb(f"✓ Backup CV completed successfully (job: {job_name}).")
+                return True, all_output
+    return False, all_output
+
+
 # ── Take Dump step ──────────────────────────────────────────────
 def run_take_dump(
     ssh: IntegrationSSH,
@@ -1609,7 +2272,7 @@ def run_take_dump(
         dcg completed successfully, logs stored in /ericsson/log/amos/moshell_logfiles/USER/logs_moshell/dcg/NODE/TIMESTAMP
 
     We then list .zip files in that path and SFTP-download them to
-    ``<local_dump_dir>/DUMP/<shortcode>/<nodename>_modump.zip``.
+    ``<local_dump_dir>/DUMP/<nodename>_modump.zip``.
 
     Returns:
         (success: bool, full_output: str)
@@ -1676,7 +2339,7 @@ def run_take_dump(
     log_cb(f"✓ Found zip: {zip_file}")
 
     # ── 4. Download zip to local DUMP folder ────────────────────
-    local_dir = os.path.join(local_dump_dir, "DUMP", shortcode)
+    local_dir = os.path.join(local_dump_dir, "DUMP")
     os.makedirs(local_dir, exist_ok=True)
     local_filename = f"{node_name}_modump.zip"
     local_path = os.path.join(local_dir, local_filename)
@@ -1859,7 +2522,7 @@ def run_take_cm_dump(
       2. cmedit export --status --jobname ...  (poll until COMPLETED)
          — the status output contains the file path in the 'File name' column,
            e.g. /ericsson/batch/data/export/3gpp_export/<jobname>.zip
-      3. SFTP download the zip to local DUMP/<shortcode>/<nodename>_cmdump.zip
+      3. SFTP download the zip to local DUMP/<nodename>_cmdump.zip
 
     Returns:
         (success: bool, full_output: str)
@@ -1915,8 +2578,9 @@ def run_take_cm_dump(
             else:
                 return False, all_output
         else:
-            log_cb(f"Export still in progress (attempt {attempt}/{max_attempts}), waiting 30s...")
-            time.sleep(30)
+            delay = 10 if attempt <= 5 else 20
+            log_cb(f"Export still in progress ({attempt}/{max_attempts}), waiting {delay}s...")
+            time.sleep(delay)
 
     if not export_done:
         msg = f"CM export did not complete after {max_attempts} attempts."
@@ -1950,7 +2614,7 @@ def run_take_cm_dump(
     log_cb(f"✓ Export file: {remote_file}")
 
     # ── 3. SFTP download to local DUMP folder ───────────────────
-    local_dir = os.path.join(local_dump_dir, "DUMP", shortcode)
+    local_dir = os.path.join(local_dump_dir, "DUMP")
     os.makedirs(local_dir, exist_ok=True)
     local_filename = f"{node_name}_cmdump.zip"
     local_path = os.path.join(local_dir, local_filename)

@@ -1,9 +1,9 @@
 """
-Integration workflow — step selection checklist + two-column progress for LTE/NR and GSM nodes.
+Integration workflow — step selection checklist + multi-column progress for LTE/NR, LTE/NR #2, and GSM nodes.
 
 Two phases:
   /integration      — Step selector (checkboxes, Select/Deselect All, Run button)
-  /integration_run  — Progress page (two node columns, high-level log, timer)
+  /integration_run  — Progress page (2-3 node columns, high-level log, timer)
 """
 import asyncio
 import logging
@@ -16,6 +16,8 @@ from datetime import datetime
 import flet as ft
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from relation_log_parser import build_relation_log_excel
 
 from gui.theme import (
     ACCENT,
@@ -49,13 +51,40 @@ INTEGRATION_STEPS = [
     ("relation",         "Relation",                 "lte_nr",  "RELATION"),
     ("baseline",         "Baseline Running",         "lte_nr",  "BASELINE"),
     ("ret_scripts",      "RET Scripts",              "both",    "RET"),
-    ("uri_setting",      "URI Setting",              "lte_nr",  "URI"),
-    ("verify_mme",       "Verify MME",               "both",    "MME"),
+    ("uri_setting",      "URI Setting",              "both",    "URI"),
+    ("verify_mme",       "Verify MME",               "lte_nr",  "MME"),
+    ("sgw_check",        "SGW Check",                "both",    "SGW_CHECK"),
     ("gsm_cell_define",  "GSM Cell Define in BSC",   "gsm",     "GSM_CELL_DEFINE"),
     ("pm_measurement",   "PM Measurement",           "both",    "PM"),
+    ("backup_cv",        "Backup CV",                "both",    "BACKUP_CV"),
     ("take_dump",        "Take Dump",                "both",    "DUMP"),
     ("take_cm_dump",     "Take CM Dump",             "both",    "CM_DUMP"),
 ]
+
+
+SUMMARY_LABELS = {
+    "create_arne":     "Add Node in ENM",
+    "enrollment":      "Node Synchronized in ENM",
+    "install_lkf":     "Install LKF (License File)",
+    "relation":        "Load Neighbour Relation Scripts",
+    "baseline":        "Load Baseline Scripts",
+    "ret_scripts":     "Load RET Scripts",
+    "uri_setting":     "URI Reconfig",
+    "verify_mme":      "Verify Core Connectivity (MME)",
+    "sgw_check":       "Verify SGw Reachability",
+    "gsm_cell_define": "GSM Cells and MO Defined in BSC",
+    "pm_measurement":  "Validate Performance Counter",
+    "backup_cv":       "Configuration Backup and Upload to ENM",
+    "take_dump":       "Take Dump",
+    "take_cm_dump":    "CM Dump Validated by NDO",
+}
+
+_RESULT_SYMBOLS = {
+    "done":    "✅",
+    "error":   "❌",
+    "skip":    "⏩",
+    "running": "🔄",
+}
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -71,9 +100,13 @@ class IntegrationPage:
         self.lte_name = self.form.get("node_name", "LTE/NR Node")
         self.lte_ip = self.form.get("node_ip", "")
         self.lte_subnet = self.form.get("subnetwork", "")
+        self.lte2_name = self.form.get("node2_name", "")
+        self.lte2_ip = self.form.get("node2_ip", "")
+        self.lte2_subnet = self.form.get("node2_subnetwork", "")
         self.gsm_name = self.form.get("gsm_node_name", "")
         self.gsm_ip = self.form.get("gsm_node_ip", "")
         self.gsm_subnet = self.form.get("gsm_subnetwork", "")
+        self.has_lte2 = bool(self.lte2_name)
         self.has_gsm = bool(self.gsm_name)
         self.shortcode = self.form.get("shortcode", "UNKNOWN")
 
@@ -123,7 +156,7 @@ class IntegrationPage:
                 border_radius=6,
                 padding=ft.Padding.symmetric(horizontal=8, vertical=2),
                 width=55,
-                alignment=ft.alignment.center,
+                alignment=ft.Alignment(0, 0),
             )
 
             row = ft.Container(
@@ -175,6 +208,16 @@ class IntegrationPage:
         if self.lte_ip:
             node_info_parts.append(
                 ft.Text(f"({self.lte_ip})", size=12, color=TEXT_MUTED))
+        if self.has_lte2:
+            node_info_parts.extend([
+                ft.Container(width=16),
+                ft.Icon(ft.Icons.CELL_TOWER, size=16, color=ACCENT),
+                ft.Text(f"{self.lte2_name}", size=13, color=TEXT,
+                        weight=ft.FontWeight.W_500),
+            ])
+            if self.lte2_ip:
+                node_info_parts.append(
+                    ft.Text(f"({self.lte2_ip})", size=12, color=TEXT_MUTED))
         if self.has_gsm:
             node_info_parts.extend([
                 ft.Container(width=16),
@@ -316,11 +359,12 @@ class IntegrationPage:
 #  Phase 2 — Progress Page (runs the selected steps)
 # ═════════════════════════════════════════════════════════════════
 class IntegrationRunPage:
-    """Two-column progress view with high-level log output."""
+    """Multi-column progress view with high-level log output."""
 
     def __init__(self, page: ft.Page):
         self.page = page
         self.cancelled = False
+        self._active_ssh = {}
         self._log_queue: queue.Queue = queue.Queue()
         self._run_finished = False
 
@@ -332,9 +376,13 @@ class IntegrationRunPage:
         self.lte_name = self.form.get("node_name", "LTE/NR Node")
         self.lte_ip = self.form.get("node_ip", "")
         self.lte_subnet = self.form.get("subnetwork", "")
+        self.lte2_name = self.form.get("node2_name", "")
+        self.lte2_ip = self.form.get("node2_ip", "")
+        self.lte2_subnet = self.form.get("node2_subnetwork", "")
         self.gsm_name = self.form.get("gsm_node_name", "")
         self.gsm_ip = self.form.get("gsm_node_ip", "")
         self.gsm_subnet = self.form.get("gsm_subnetwork", "")
+        self.has_lte2 = bool(self.lte2_name)
         self.has_gsm = bool(self.gsm_name)
 
         self.shortcode = self.form.get("shortcode", "UNKNOWN")
@@ -344,9 +392,15 @@ class IntegrationRunPage:
         os.makedirs(self.log_dir, exist_ok=True)
 
         # Per-node session log buffers — full detail for file saving
-        # Keyed by node_tag ("lte" or "gsm") to avoid cross-contamination
-        self._session_logs: dict[str, list[str]] = {"lte": [], "gsm": []}
+        # Keyed by node_tag ("lte", "lte2", "gsm") to avoid cross-contamination
+        self._session_logs: dict[str, list[str]] = {"lte": [], "lte2": [], "gsm": []}
         self._session_log_lock = threading.Lock()
+
+        # Per-node step result tracking: {node_tag: {step_key: state}}
+        self._step_results: dict[str, dict[str, str]] = {}
+
+        # Per-node duration tracking: {node_tag: seconds}
+        self._node_durations: dict[str, float] = {}
 
     # ── Build ────────────────────────────────────────────────────
     def build(self) -> ft.View:
@@ -378,18 +432,25 @@ class IntegrationRunPage:
 
         # Build step rows for each node column
         self.lte_steps: dict[str, _StepRow] = {}
+        self.lte2_steps: dict[str, _StepRow] = {}
         self.gsm_steps: dict[str, _StepRow] = {}
 
         lte_rows = []
+        lte2_rows = []
         gsm_rows = []
         for key, label, applies_to, _ in INTEGRATION_STEPS:
             if applies_to in ("both", "lte_nr"):
                 row = _StepRow(label)
                 self.lte_steps[key] = row
                 lte_rows.append(row.control)
-                # Mark deselected steps immediately
                 if key not in self.selected_steps:
                     row.set_state("skip", "Not selected")
+                if self.has_lte2:
+                    row2 = _StepRow(label)
+                    self.lte2_steps[key] = row2
+                    lte2_rows.append(row2.control)
+                    if key not in self.selected_steps:
+                        row2.set_state("skip", "Not selected")
             if applies_to in ("both", "gsm"):
                 row = _StepRow(label)
                 self.gsm_steps[key] = row
@@ -397,6 +458,7 @@ class IntegrationRunPage:
                 if key not in self.selected_steps:
                     row.set_state("skip", "Not selected")
 
+        columns = []
         lte_column = self._node_card(
             title=self.lte_name or "LTE/NR Node",
             subtitle=self._node_subtitle(self.lte_ip, self.lte_subnet),
@@ -404,14 +466,27 @@ class IntegrationRunPage:
             icon=ft.Icons.CELL_TOWER,
             step_rows=lte_rows,
         )
-        gsm_column = self._node_card(
-            title=self.gsm_name or "GSM Node",
-            subtitle=self._node_subtitle(self.gsm_ip, self.gsm_subnet),
-            accent=ACCENT_WARM,
-            icon=ft.Icons.SETTINGS_INPUT_ANTENNA,
-            step_rows=gsm_rows,
-            dimmed=not self.has_gsm,
-        )
+        columns.append(lte_column)
+
+        if self.has_lte2:
+            lte2_column = self._node_card(
+                title=self.lte2_name or "LTE/NR #2 Node",
+                subtitle=self._node_subtitle(self.lte2_ip, self.lte2_subnet),
+                accent=ACCENT,
+                icon=ft.Icons.CELL_TOWER,
+                step_rows=lte2_rows,
+            )
+            columns.append(lte2_column)
+
+        if self.has_gsm:
+            gsm_column = self._node_card(
+                title=self.gsm_name or "GSM Node",
+                subtitle=self._node_subtitle(self.gsm_ip, self.gsm_subnet),
+                accent=ACCENT_WARM,
+                icon=ft.Icons.SETTINGS_INPUT_ANTENNA,
+                step_rows=gsm_rows,
+            )
+            columns.append(gsm_column)
 
         header = ft.Row(
             [
@@ -426,7 +501,7 @@ class IntegrationRunPage:
         )
 
         columns_row = ft.Row(
-            [lte_column, gsm_column],
+            columns,
             spacing=16,
             alignment=ft.MainAxisAlignment.START,
             vertical_alignment=ft.CrossAxisAlignment.START,
@@ -444,17 +519,18 @@ class IntegrationRunPage:
                 expand=True,
             ),
             bgcolor=PANEL_RAISED,
-            padding=14,
+            padding=8,
             expand=True,
         )
+        log_panel.width = float("inf")
 
         body = ft.Container(
             expand=True,
             gradient=background_gradient(),
-            padding=ft.Padding.symmetric(horizontal=28, vertical=20),
+            padding=ft.Padding.symmetric(horizontal=4, vertical=8),
             content=ft.Column(
                 [header, columns_row, log_panel],
-                spacing=16,
+                spacing=10,
                 expand=True,
             ),
         )
@@ -501,9 +577,15 @@ class IntegrationRunPage:
                         ),
                         ft.Text(subtitle, size=11, color=TEXT_MUTED),
                         ft.Divider(height=1, color=BORDER),
-                        *step_rows,
+                        ft.Column(
+                            step_rows,
+                            spacing=10,
+                            scroll=ft.ScrollMode.AUTO,
+                            expand=True,
+                        ),
                     ],
                     spacing=10,
+                    expand=True,
                 ),
                 bgcolor=PANEL,
                 padding=20,
@@ -584,9 +666,15 @@ class IntegrationRunPage:
 
     # ── Step state updates ───────────────────────────────────────
     def _set_step(self, node: str, key: str, state: str, detail: str = ""):
-        steps = self.lte_steps if node == "lte" else self.gsm_steps
+        if node == "lte":
+            steps = self.lte_steps
+        elif node == "lte2":
+            steps = self.lte2_steps
+        else:
+            steps = self.gsm_steps
         if key in steps:
             steps[key].set_state(state, detail)
+        self._step_results.setdefault(node, {})[key] = state
 
     # ── Blocking dialogs (called from worker threads) ────────────
     def _ask_user_retry(self, message: str) -> bool:
@@ -707,8 +795,17 @@ class IntegrationRunPage:
         self._ui_log(f"Shortcode: {self.shortcode}")
         self._ui_log(f"Log directory: {self.log_dir}")
         self._ui_log(
-            f"LTE/NR: {self.lte_name}  IP: {self.lte_ip}  "
+            f"LTE/NR #1: {self.lte_name}  IP: {self.lte_ip}  "
             f"Subnet: {self.lte_subnet}")
+
+        if self.has_lte2:
+            self._ui_log(
+                f"LTE/NR #2: {self.lte2_name}  IP: {self.lte2_ip}  "
+                f"Subnet: {self.lte2_subnet}")
+        else:
+            for key, label, applies_to, _ in INTEGRATION_STEPS:
+                if applies_to in ("both", "lte_nr"):
+                    self._set_step("lte2", key, "skip", "No 2nd LTE/NR node")
 
         selected_names = []
         for key, label, _, _ in INTEGRATION_STEPS:
@@ -726,8 +823,9 @@ class IntegrationRunPage:
                     self._set_step("gsm", key, "skip", "No GSM node")
         self._ui_log("")
 
+        num_workers = 1 + (1 if self.has_lte2 else 0) + (1 if self.has_gsm else 0)
         futures = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures["lte"] = pool.submit(
                 self._run_node_steps,
                 node_tag="lte",
@@ -736,6 +834,15 @@ class IntegrationRunPage:
                 subnetwork=self.lte_subnet,
                 node_type="lte_nr",
             )
+            if self.has_lte2:
+                futures["lte2"] = pool.submit(
+                    self._run_node_steps,
+                    node_tag="lte2",
+                    node_name=self.lte2_name,
+                    node_ip=self.lte2_ip,
+                    subnetwork=self.lte2_subnet,
+                    node_type="lte_nr",
+                )
             if self.has_gsm:
                 futures["gsm"] = pool.submit(
                     self._run_node_steps,
@@ -750,7 +857,12 @@ class IntegrationRunPage:
                 try:
                     future.result()
                 except Exception as exc:
-                    lbl = "LTE/NR" if fkey == "lte" else "GSM"
+                    if fkey == "lte2":
+                        lbl = "LTE/NR #2"
+                    elif fkey == "lte":
+                        lbl = "LTE/NR"
+                    else:
+                        lbl = "GSM"
                     self._ui_log(f"[{lbl}] Node workflow failed: {exc}")
                     logger.exception(f"Integration {lbl} failed")
 
@@ -761,6 +873,95 @@ class IntegrationRunPage:
         self.back_button.visible = True
         self._ui_log("")
         self._ui_log(f"All steps finished. Logs saved to: {self.log_dir}")
+        self._show_summary_popup()
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _show_summary_popup(self):
+        node_order = []
+        node_labels = {}
+        node_order.append("lte")
+        node_labels["lte"] = self.lte_name or "LTE/NR"
+        if self.has_lte2:
+            node_order.append("lte2")
+            node_labels["lte2"] = self.lte2_name or "LTE/NR #2"
+        if self.has_gsm:
+            node_order.append("gsm")
+            node_labels["gsm"] = self.gsm_name or "GSM"
+
+        lines = []
+        for ntag in node_order:
+            nname = node_labels[ntag]
+            results = self._step_results.get(ntag, {})
+            if len(node_order) > 1:
+                lines.append(f"── {nname} ──")
+            for key, label, applies_to, _ in INTEGRATION_STEPS:
+                if applies_to not in ("both", "lte_nr" if ntag != "gsm" else "gsm"):
+                    continue
+                if key not in self.selected_steps:
+                    continue
+                state = results.get(key, "skip")
+                sym = _RESULT_SYMBOLS.get(state, "—")
+                summary_name = SUMMARY_LABELS.get(key, label)
+                lines.append(f"{summary_name}\t{sym}")
+            dur = self._node_durations.get(ntag, 0)
+            mins, secs = divmod(int(dur), 60)
+            lines.append(f"⏱ Total Time\t{mins:02d}:{secs:02d}")
+            lines.append("")
+
+        summary_text = "\n".join(lines).strip()
+
+        close_event = threading.Event()
+
+        def _on_close(e):
+            dlg.open = False
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            close_event.set()
+
+        text_field = ft.TextField(
+            value=summary_text,
+            multiline=True,
+            read_only=True,
+            min_lines=12,
+            max_lines=30,
+            border_color=BORDER,
+            focused_border_color=ACCENT,
+            text_style=ft.TextStyle(size=13, font_family="Consolas"),
+            bgcolor=ft.Colors.with_opacity(0.15, PANEL),
+            border_radius=14,
+            filled=True,
+            expand=True,
+        )
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Integration Summary", color=SUCCESS,
+                          weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                content=ft.Column(
+                    [text_field],
+                    tight=True,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                width=520,
+                height=460,
+            ),
+            actions=[
+                ft.TextButton("Close",
+                              style=ft.ButtonStyle(color=TEXT_MUTED),
+                              on_click=_on_close),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            bgcolor=PANEL,
+        )
+
+        self.page.overlay.append(dlg)
+        dlg.open = True
         try:
             self.page.update()
         except Exception:
@@ -776,14 +977,16 @@ class IntegrationRunPage:
     ):
         """Run selected integration steps for one node."""
         import time
+        node_start = time.monotonic()
         from integration_runner import (
             IntegrationSSH, run_create_arne, run_enrollment,
             run_install_lkf, run_baseline, run_relation, run_verify_mme,
-            run_take_dump, run_gsm_cell_define, run_take_cm_dump,
-            run_uri_setting, run_pm_measurement,
+            run_backup_cv, run_take_dump, run_gsm_cell_define,
+            run_take_cm_dump,
+            run_uri_setting, run_pm_measurement, run_sgw_check,
         )
 
-        label = "LTE/NR" if node_tag == "lte" else "GSM"
+        label = "LTE/NR" if node_tag == "lte" else ("LTE/NR #2" if node_tag == "lte2" else "GSM")
         host = self.form.get("host", "")
         port = self.form.get("port", 5023)
         username = self.form.get("username", "")
@@ -805,6 +1008,7 @@ class IntegrationRunPage:
                 log_callback=detail_cb,
             )
             ssh.connect(timeout=30)
+            self._active_ssh[node_tag] = ssh
             ui_cb("SSH connected.")
         except Exception as exc:
             ui_cb(f"SSH connection failed: {exc}")
@@ -817,8 +1021,9 @@ class IntegrationRunPage:
         # Steps that need an active AMOS session
         amos_steps = {
             "enrollment", "install_lkf", "baseline", "ret_scripts",
-            "relation", "uri_setting", "verify_mme", "take_dump",
-            "take_cm_dump", "gsm_cell_define", "pm_measurement",
+            "relation", "uri_setting", "verify_mme", "sgw_check",
+            "backup_cv", "take_dump", "take_cm_dump", "gsm_cell_define",
+            "pm_measurement",
         }
         in_amos = False
 
@@ -860,21 +1065,34 @@ class IntegrationRunPage:
                 self._set_step(node_tag, key, "running")
                 ui_cb(f"Running {step_label}...")
 
+                # Start live session log for this step. Every byte read
+                # from the SSH shell (prompts, [Proxy ID] lines, crn blocks,
+                # curl output, everything) is teed to this file.
+                session_dir = os.path.join(self.log_dir, "SESSION")
+                os.makedirs(session_dir, exist_ok=True)
+                session_log_path = os.path.join(
+                    session_dir,
+                    f"SESSION_{key.upper()}_{node_name}.log",
+                )
+                try:
+                    ssh.start_step_log(session_log_path)
+                except Exception as _exc:
+                    ui_cb(f"(could not start session log: {_exc})")
+
                 stopped = False
                 try:
                     if key == "create_arne":
                         success, output = run_create_arne(
                             ssh, node_name, node_ip, subnetwork, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Verified")
                             ui_cb(f"{step_label} — verified.")
                         else:
                             self._set_step(node_tag, key, "error",
-                                           "Stopped by user")
-                            ui_cb(f"{step_label} — stopped by user.")
-                            stopped = True
+                                           "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing.")
 
                     elif key == "enrollment":
                         success, output = run_enrollment(
@@ -915,16 +1133,15 @@ class IntegrationRunPage:
                     elif key == "baseline":
                         success, output = run_baseline(
                             ssh, node_name, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                             confirm_baseline=self._ask_user_confirm,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Verified")
                             ui_cb(f"{step_label} — verified.")
                         else:
-                            self._set_step(node_tag, key, "error", "Failed")
-                            ui_cb(f"{step_label} — failed.")
-                            stopped = True
+                            self._set_step(node_tag, key, "error", "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "relation":
                         relation_file = self.form.get("relation_file", "")
@@ -936,7 +1153,7 @@ class IntegrationRunPage:
                             success, output = run_relation(
                                 ssh, node_name, self.shortcode,
                                 relation_file, self.log_dir, detail_cb,
-                                wait_for_user=self._ask_user_retry,
+                                wait_for_user=None,
                             )
                             if success:
                                 self._set_step(node_tag, key, "done",
@@ -944,9 +1161,8 @@ class IntegrationRunPage:
                                 ui_cb(f"{step_label} — completed.")
                             else:
                                 self._set_step(node_tag, key, "error",
-                                               "Failed")
-                                ui_cb(f"{step_label} — failed.")
-                                stopped = True
+                                               "Failed (continued)")
+                                ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "ret_scripts":
                         self._set_step(node_tag, key, "skip", "Coming soon")
@@ -956,7 +1172,7 @@ class IntegrationRunPage:
                         success, output = run_uri_setting(
                             ssh, node_name, username, password,
                             detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -964,14 +1180,13 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — SUCCESS.")
                         else:
                             self._set_step(node_tag, key, "error",
-                                           "Failed")
-                            ui_cb(f"{step_label} — failed.")
-                            stopped = True
+                                           "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "verify_mme":
                         success, output = run_verify_mme(
                             ssh, node_name, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -979,14 +1194,28 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — all ENABLED.")
                         else:
                             self._set_step(node_tag, key, "error",
-                                           "DISABLED found")
-                            ui_cb(f"{step_label} — DISABLED found.")
-                            stopped = True
+                                           "DISABLED (continued)")
+                            ui_cb(f"{step_label} — DISABLED found, continuing.")
+
+                    elif key == "sgw_check":
+                        success, output = run_sgw_check(
+                            ssh, node_name, detail_cb,
+                            wait_for_user=None,
+                            node_type=("gsm" if node_tag == "gsm" else "lte_nr"),
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done",
+                                           "All pings OK")
+                            ui_cb(f"{step_label} — all targets reachable.")
+                        else:
+                            self._set_step(node_tag, key, "error",
+                                           "Ping failed (continued)")
+                            ui_cb(f"{step_label} — some pings failed, continuing.")
 
                     elif key == "gsm_cell_define":
                         success, output = run_gsm_cell_define(
                             ssh, node_name, self.shortcode, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,  # no prompt — just report
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -994,54 +1223,62 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — Cell & MO OK.")
                         else:
                             self._set_step(node_tag, key, "error",
-                                           "Not defined")
-                            ui_cb(f"{step_label} — not defined.")
-                            stopped = True
+                                           "0 instances (continued)")
+                            ui_cb(f"{step_label} — 0 instances, continuing.")
+
+                    elif key == "backup_cv":
+                        success, output = run_backup_cv(
+                            ssh, node_name, detail_cb,
+                            wait_for_user=None,
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done", "SUCCESS")
+                            ui_cb(f"{step_label} â€” SUCCESS.")
+                        else:
+                            self._set_step(node_tag, key, "error", "Failed (continued)")
+                            ui_cb(f"{step_label} â€” failed, continuing to next step.")
 
                     elif key == "take_dump":
                         success, output = run_take_dump(
                             ssh, node_name, self.shortcode,
                             self.log_dir, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
                                            "Downloaded")
                             ui_cb(f"{step_label} — downloaded.")
                         else:
-                            self._set_step(node_tag, key, "error", "Failed")
-                            ui_cb(f"{step_label} — failed.")
-                            stopped = True
+                            self._set_step(node_tag, key, "error", "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "take_cm_dump":
                         success, output = run_take_cm_dump(
                             ssh, node_name, self.shortcode,
                             self.log_dir, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
                                            "Downloaded")
                             ui_cb(f"{step_label} — downloaded.")
                         else:
-                            self._set_step(node_tag, key, "error", "Failed")
-                            ui_cb(f"{step_label} — failed.")
-                            stopped = True
+                            self._set_step(node_tag, key, "error", "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "pm_measurement":
                         pm_type = "gsm" if node_tag == "gsm" else "lte_nr"
                         success, output = run_pm_measurement(
                             ssh, node_name, pm_type,
                             detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=None,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Active")
                             ui_cb(f"{step_label} — PM active.")
                         else:
-                            self._set_step(node_tag, key, "error", "Failed")
-                            ui_cb(f"{step_label} — failed.")
-                            stopped = True
+                            self._set_step(node_tag, key, "error", "Failed (continued)")
+                            ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     else:
                         time.sleep(0.3)
@@ -1053,7 +1290,64 @@ class IntegrationRunPage:
                     self._set_step(node_tag, key, "error",
                                    str(exc)[:40])
                     ui_cb(f"{step_label} — FAILED: {exc}")
-                    stopped = True
+                    # Only stop the whole workflow for pre-LKF-inclusive steps.
+                    # Everything after LKF continues on error.
+                    if key in ("enrollment", "install_lkf"):
+                        stopped = True
+                    else:
+                        ui_cb(f"{step_label} — continuing to next step despite error.")
+                finally:
+                    # Close the session log for this step (always, even on error)
+                    try:
+                        ssh.stop_step_log()
+                    except Exception:
+                        pass
+                    # Download any server-side moshell logs registered
+                    # during this step into LOG/{SHORTCODE}/MOSHELL/
+                    try:
+                        moshell_dir = os.path.join(self.log_dir, "MOSHELL")
+                        downloaded = ssh.drain_remote_logs(moshell_dir)
+                        if downloaded:
+                            ui_cb(
+                                f"Downloaded {len(downloaded)} moshell log "
+                                f"file(s) to MOSHELL/"
+                            )
+                            if key == "relation":
+                                try:
+                                    parsed_path = build_relation_log_excel(
+                                        downloaded,
+                                        self.log_dir,
+                                        node_name,
+                                        log_cb=ui_cb,
+                                    )
+                                    ui_cb(
+                                        "Relation log Excel created: "
+                                        f"{os.path.basename(parsed_path)}"
+                                    )
+                                except Exception as parse_exc:
+                                    ui_cb(
+                                        f"(relation log parsing skipped: {parse_exc})"
+                                    )
+                                # Clean up remote RELATION folder now that
+                                # all logs are safely downloaded locally.
+                                try:
+                                    remote_rel = (
+                                        f"/home/shared/{ssh.username}"
+                                        f"/RELATION/{self.shortcode}"
+                                    )
+                                    ssh.run_amos_command_safe(
+                                        f'!rm -rf "{remote_rel}"/*',
+                                        node_name, timeout=30,
+                                    )
+                                    ui_cb(
+                                        f"Cleaned up remote {remote_rel}/"
+                                    )
+                                except Exception as _clean_exc:
+                                    ui_cb(
+                                        f"(remote cleanup skipped: {_clean_exc})"
+                                    )
+                    except Exception as _exc:
+                        ui_cb(f"(could not download moshell logs: {_exc})")
 
                 self._save_step_log(step_num, node_name, log_suffix,
                                     node_tag=node_tag)
@@ -1075,19 +1369,51 @@ class IntegrationRunPage:
                             remaining = True
                     break
         finally:
+            elapsed = time.monotonic() - node_start
+            self._node_durations[node_tag] = elapsed
             if in_amos:
                 try:
                     ssh.exit_amos()
                 except Exception:
                     pass
-            ssh.disconnect()
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+            self._active_ssh.pop(node_tag, None)
             ui_cb("SSH disconnected.")
 
     # ── Navigation ───────────────────────────────────────────────
+    def _force_disconnect(self) -> None:
+        """Forcibly tear down any active SSH so blocked recv() unwinds."""
+        for node_tag, ssh in list(self._active_ssh.items()):
+            try:
+                if getattr(ssh, "shell", None) is not None:
+                    try:
+                        ssh.shell.close()
+                    except Exception:
+                        pass
+                if getattr(ssh, "client", None) is not None:
+                    try:
+                        t = ssh.client.get_transport()
+                        if t is not None:
+                            t.close()
+                    except Exception:
+                        pass
+                    try:
+                        ssh.client.close()
+                    except Exception:
+                        pass
+                ssh._connected = False
+            except Exception:
+                pass
+        self._active_ssh.clear()
+
     def _on_cancel(self, e):
         self.cancelled = True
         self._timer_running = False
         self._run_finished = True
+        self._force_disconnect()
         self.status_text.value = "Cancelled"
         self.cancel_button.visible = False
         self.back_button.visible = True
@@ -1097,6 +1423,7 @@ class IntegrationRunPage:
         self.cancelled = True
         self._timer_running = False
         self._run_finished = True
+        self._force_disconnect()
         self.page.go("/form")
 
 
@@ -1152,3 +1479,4 @@ class _StepRow:
             ft.Colors.with_opacity(0.08, ACCENT)
             if state == "running" else None
         )
+

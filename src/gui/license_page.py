@@ -167,12 +167,17 @@ class LicensePage:
             self.info_column.visible = True
             self.page.update()
 
-            # Navigate to main app after a short delay
-            import time, threading
-            def _go():
-                time.sleep(1.5)
+            # Navigate to main app after a short delay (scheduled on the page's event loop)
+            import asyncio
+            async def _go():
+                await asyncio.sleep(1.5)
                 self.page.go("/form")
-            threading.Thread(target=_go, daemon=True).start()
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(_go())
+            except RuntimeError:
+                # Fallback: navigate immediately
+                self.page.go("/form")
         else:
             self.status_text.value = result["error"]
             self.status_text.color = "#FFB4B4"
@@ -193,8 +198,8 @@ class LicensePage:
     def _hostname_box(self) -> ft.Container:
         hostname = get_hostname()
 
-        def _copy(e):
-            self.page.set_clipboard(hostname)
+        async def _copy(e):
+            await self.page.clipboard.set(hostname)
             e.control.tooltip = "Copied!"
             self.page.update()
 

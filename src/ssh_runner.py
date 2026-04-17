@@ -55,6 +55,11 @@ class MoshellSession:
         )
         self.shell.settimeout(self.config.moshell.command_timeout)
         self._connected = True
+        try:
+            import ssh_registry
+            ssh_registry.register(self)
+        except Exception:
+            pass
 
         # Wait for initial shell prompt
         self._read_until_prompt(shell_prompt=True)
@@ -77,7 +82,7 @@ class MoshellSession:
         # Run 'lt all' to load MO tree (required before running commands)
         logger.info("Loading MO tree: lt all")
         self._send_command("lt all")
-        lt_output = self._read_until_prompt(moshell_prompt=True, timeout=120)
+        lt_output = self._read_until_prompt_with_creds(timeout=120)
         self._node_connected = True
         logger.info("MO tree loaded. Ready for commands.")
 
@@ -169,12 +174,55 @@ class MoshellSession:
                 pass
 
         self._connected = False
+        try:
+            import ssh_registry
+            ssh_registry.unregister(self)
+        except Exception:
+            pass
         logger.info("Disconnected.")
 
     def _send_command(self, command: str):
         """Send a command through the shell channel."""
         self.shell.send(command + "\n")
         time.sleep(0.5)
+
+    def _read_until_prompt_with_creds(self, timeout: int = 120) -> str:
+        """Read until moshell prompt, responding to 'lt all' username/password prompts with 'rbs'/'rbs'."""
+        buffer = ""
+        start = time.time()
+        prompt_pattern = self.config.moshell.prompt_pattern
+        sent_user = False
+        sent_pass = False
+        while True:
+            if time.time() - start > timeout:
+                logger.warning(f"Timeout after {timeout}s waiting for prompt")
+                break
+            if self.shell.recv_ready():
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                buffer += chunk
+                clean = strip_ansi(buffer)
+                tail = clean[-500:].lower()
+                if not sent_user and "enter username" in tail:
+                    logger.info("lt all: sending username 'rbs'")
+                    self._send_command("rbs")
+                    sent_user = True
+                    time.sleep(0.3)
+                    continue
+                if sent_user and not sent_pass and "password" in tail:
+                    logger.info("lt all: sending password")
+                    self._send_command("rbs")
+                    sent_pass = True
+                    time.sleep(0.3)
+                    continue
+                last_line = clean.strip().split("\n")[-1].strip()
+                if prompt_pattern in last_line:
+                    time.sleep(0.5)
+                    while self.shell.recv_ready():
+                        buffer += self.shell.recv(65536).decode("utf-8", errors="replace")
+                    break
+            else:
+                time.sleep(0.3)
+        return buffer
 
     def _read_until_prompt(
         self,
