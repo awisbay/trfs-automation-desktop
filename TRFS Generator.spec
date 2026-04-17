@@ -1,12 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# Collect all Flet runtime data (icons.json, flet_desktop binaries, etc.)
+flet_datas = collect_data_files('flet') + collect_data_files('flet_desktop')
+playwright_datas = collect_data_files('playwright')
+
+hidden = ['paramiko', 'openpyxl', 'yaml', 'PIL', 'pyautogui', 'playwright',
+          'flet', 'flet_desktop', 'cryptography']
+hidden += collect_submodules('flet')
+hidden += collect_submodules('flet_desktop')
 
 a = Analysis(
     ['src\\gui_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('config.yaml', '.'), ('TEMPLATE_REPORT.xlsx', '.'), ('TRFS commands.txt', '.'), ('TRFS commands - Copy.txt', '.'), ('snapshot.ico', '.'), ('src', 'src'), ('txt_to_xml_converter.py', '.'), ('Relation.txt', '.')],
-    hiddenimports=['paramiko', 'openpyxl', 'yaml', 'PIL', 'pyautogui', 'playwright'],
+    datas=[
+        ('config.yaml', '.'),
+        ('TEMPLATE_REPORT.xlsx', '.'),
+        ('TRFS commands.txt', '.'),
+        ('TRFS commands - Copy.txt', '.'),
+        ('snapshot.ico', '.'),
+        ('src', 'src'),
+        ('txt_to_xml_converter.py', '.'),
+        ('Relation.txt', '.'),
+    ] + flet_datas + playwright_datas,
+    hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -32,7 +51,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='C:\\Users\\ewisbay\\AppData\\Local\\Temp\\bf201d99-e8af-4f51-bbfa-1ee4a2d3c927',
     icon=['snapshot.ico'],
 )
 coll = COLLECT(
