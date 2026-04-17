@@ -119,7 +119,7 @@ class LicensePage:
         body = ft.Container(
             expand=True,
             gradient=background_gradient(),
-            alignment=ft.alignment.center,
+            alignment=ft.Alignment(0, 0),
             padding=ft.Padding.symmetric(horizontal=80, vertical=40),
             content=ft.Container(
                 content=content,
