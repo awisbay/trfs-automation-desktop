@@ -52,6 +52,7 @@ INTEGRATION_STEPS = [
     ("uri_setting",      "URI Setting",              "lte_nr",  "URI"),
     ("verify_mme",       "Verify MME",               "both",    "MME"),
     ("gsm_cell_define",  "GSM Cell Define in BSC",   "gsm",     "GSM_CELL_DEFINE"),
+    ("pm_measurement",   "PM Measurement",           "both",    "PM"),
     ("take_dump",        "Take Dump",                "both",    "DUMP"),
     ("take_cm_dump",     "Take CM Dump",             "both",    "CM_DUMP"),
 ]
@@ -779,7 +780,7 @@ class IntegrationRunPage:
             IntegrationSSH, run_create_arne, run_enrollment,
             run_install_lkf, run_baseline, run_relation, run_verify_mme,
             run_take_dump, run_gsm_cell_define, run_take_cm_dump,
-            run_uri_setting,
+            run_uri_setting, run_pm_measurement,
         )
 
         label = "LTE/NR" if node_tag == "lte" else "GSM"
@@ -817,7 +818,7 @@ class IntegrationRunPage:
         amos_steps = {
             "enrollment", "install_lkf", "baseline", "ret_scripts",
             "relation", "uri_setting", "verify_mme", "take_dump",
-            "take_cm_dump", "gsm_cell_define",
+            "take_cm_dump", "gsm_cell_define", "pm_measurement",
         }
         in_amos = False
 
@@ -1022,6 +1023,21 @@ class IntegrationRunPage:
                             self._set_step(node_tag, key, "done",
                                            "Downloaded")
                             ui_cb(f"{step_label} — downloaded.")
+                        else:
+                            self._set_step(node_tag, key, "error", "Failed")
+                            ui_cb(f"{step_label} — failed.")
+                            stopped = True
+
+                    elif key == "pm_measurement":
+                        pm_type = "gsm" if node_tag == "gsm" else "lte_nr"
+                        success, output = run_pm_measurement(
+                            ssh, node_name, pm_type,
+                            detail_cb,
+                            wait_for_user=self._ask_user_retry,
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done", "Active")
+                            ui_cb(f"{step_label} — PM active.")
                         else:
                             self._set_step(node_tag, key, "error", "Failed")
                             ui_cb(f"{step_label} — failed.")

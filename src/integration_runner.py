@@ -949,16 +949,23 @@ def run_baseline(
     all_output += out
     log_cb(f"cvls output:\n{out}")
 
-    # Look for POST_<baseline_name_without_extension>_execution
-    baseline_stem = baseline_file.replace(".mos", "")
-    if f"POST_{baseline_stem}_execution" in out:
-        log_cb(f"✓ Baseline verified — found POST_{baseline_stem}_execution")
+    # Look for any "Post_Globe_Baseline" backup entry in cvls output.
+    # Real cvls shows entries like:
+    #   "Post_Globe_Baseline_All_Bands_execution_260414_1832"
+    #   "POST_Globe_Baseline_L_NonModular_Rev_15042026_execution_260415_2055"
+    # Accept both capitalizations. Match anywhere in the cvls backup list.
+    def _baseline_done(text: str) -> bool:
+        low = text.lower()
+        return "post_globe_baseline" in low
+
+    if _baseline_done(out):
+        log_cb(f"✓ Baseline verified — 'Post_Globe_Baseline' backup found in cvls")
         return True, all_output
 
     # Not found — retry loop
     msg = (
         f"Baseline verification failed for {node_name}.\n"
-        f"Expected 'POST_{baseline_stem}_execution' in cvls output."
+        f"Expected a 'Post_Globe_Baseline...' backup entry in cvls output."
     )
     log_cb(f"✗ {msg}")
     while True:
@@ -973,8 +980,8 @@ def run_baseline(
         out = ssh.run_amos_command_safe("cvls", node_name, timeout=60)
         all_output += out
         log_cb(f"Re-check cvls:\n{out}")
-        if f"POST_{baseline_stem}_execution" in out:
-            log_cb(f"✓ Baseline verified — found POST_{baseline_stem}_execution")
+        if _baseline_done(out):
+            log_cb(f"✓ Baseline verified — 'Post_Globe_Baseline' backup found in cvls")
             return True, all_output
 
 
@@ -1524,7 +1531,11 @@ def run_verify_mme(
     all_output += out
     log_cb(f"st mme output:\n{out}")
 
-    # Parse: check if any line has DISABLED or if no MOs found
+    # Parse: MME rows look like
+    #   "2966  1 (UNLOCKED)  1 (ENABLED)   ENodeBFunction=1,TermPointToMme=S1-MME1"
+    #   "22862              1 (ENABLED)   Transport=1,SctpEndpoint=S1_MME"
+    # Every row MUST show "(ENABLED)" in the op-state column; any "(DISABLED)"
+    # or missing "(ENABLED)" marker = failure.
     lines = out.split("\n")
     mme_lines = [l for l in lines if "TermPointToMme" in l or "SctpEndpoint" in l]
 
@@ -1535,7 +1546,15 @@ def run_verify_mme(
             wait_for_user(msg)
         return False, all_output
 
-    disabled = [l.strip() for l in mme_lines if "DISABLED" in l]
+    def _bad_rows(rows):
+        bad = []
+        for l in rows:
+            s = l.strip()
+            if "(DISABLED)" in s or "(ENABLED)" not in s:
+                bad.append(s)
+        return bad
+
+    disabled = _bad_rows(mme_lines)
 
     if disabled:
         disabled_list = "\n".join(disabled)
@@ -1563,7 +1582,7 @@ def run_verify_mme(
 
             mme_lines = [l for l in out.split("\n")
                          if "TermPointToMme" in l or "SctpEndpoint" in l]
-            disabled = [l.strip() for l in mme_lines if "DISABLED" in l]
+            disabled = _bad_rows(mme_lines)
             if disabled:
                 disabled_list = "\n".join(disabled)
                 msg = (
@@ -1958,3 +1977,70 @@ def run_take_cm_dump(
 
     log_cb(f"✓ Take CM Dump completed for {node_name}.")
     return True, all_output
+
+
+# ── PM Measurement step ─────────────────────────────────────────
+def run_pm_measurement(
+    ssh: IntegrationSSH,
+    node_name: str,
+    node_type: str,  # "lte_nr" or "gsm"
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Verify PM measurements are active with ``pst . act``.
+
+    Expected USERDEF PM job per node type:
+      - lte_nr → "USERDEF-Radionode_4G_5G_PM.Cont.Y.STATS"
+      - gsm    → "USERDEF-Radionode_2G_PM.Cont.Y.STATS"
+
+    Returns:
+        (success: bool, full_output: str)
+    """
+    if node_type == "gsm":
+        expected_marker = "USERDEF-Radionode_2G_PM.Cont.Y.STATS"
+    else:
+        expected_marker = "USERDEF-Radionode_4G_5G_PM.Cont.Y.STATS"
+
+    log_cb(f"Checking PM Measurement (pst . act) — looking for '{expected_marker}'...")
+
+    out = ssh.run_amos_command_safe("pst . act", node_name, timeout=120)
+    log_cb(f"pst . act output:\n{out}")
+
+    if expected_marker in out:
+        # Also ensure the row shows ACTIVE state (not e.g. SUSPENDED)
+        active_ok = False
+        for line in out.split("\n"):
+            if expected_marker in line and "ACTIVE" in line:
+                active_ok = True
+                break
+        if active_ok:
+            log_cb(f"✓ PM Measurement OK — {expected_marker} is ACTIVE")
+            return True, out
+        else:
+            log_cb(f"⚠ {expected_marker} present but not ACTIVE.")
+
+    # Retry loop
+    while True:
+        msg = (
+            f"PM Measurement verification failed for {node_name}.\n"
+            f"Expected '{expected_marker}' ACTIVE in 'pst . act' output."
+        )
+        log_cb(f"✗ {msg}")
+
+        if not wait_for_user:
+            return False, out
+        retry = wait_for_user(
+            f"{msg}\n\nFix the PM jobs, then click Retry to re-check."
+        )
+        if not retry:
+            log_cb("User chose to stop.")
+            return False, out
+
+        log_cb("Re-checking PM Measurement...")
+        out = ssh.run_amos_command_safe("pst . act", node_name, timeout=120)
+        log_cb(f"Re-check output:\n{out}")
+
+        for line in out.split("\n"):
+            if expected_marker in line and "ACTIVE" in line:
+                log_cb(f"✓ PM Measurement OK — {expected_marker} is ACTIVE")
+                return True, out
