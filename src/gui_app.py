@@ -19,9 +19,20 @@ from license_manager import load_saved_license
 def main(page: ft.Page):
     page.title = "NodeCraft v1.0 — ewisbay"
     from app_path import get_app_dir
-    _icon_path = os.path.join(get_app_dir(), "snapshot.ico")
-    if os.path.exists(_icon_path):
-        page.window.icon = _icon_path
+    # Icon can live next to the exe OR inside _internal/ (PyInstaller COLLECT)
+    _app_dir = get_app_dir()
+    _icon_candidates = [
+        os.path.join(_app_dir, "snapshot.ico"),
+        os.path.join(_app_dir, "_internal", "snapshot.ico"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "snapshot.ico"),
+    ]
+    for _p in _icon_candidates:
+        if os.path.exists(_p):
+            page.window.icon = os.path.abspath(_p)
+            print(f"[ICON] Using: {os.path.abspath(_p)}")
+            break
+    else:
+        print(f"[ICON] Not found in any of: {_icon_candidates}")
     page.window.width = 1380
     page.window.height = 920
     page.window.min_width = 1080
