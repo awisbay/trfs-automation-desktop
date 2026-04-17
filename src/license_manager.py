@@ -7,6 +7,7 @@ License format: base64 encoded JSON payload + Ed25519 signature.
 import base64
 import json
 import os
+import socket
 import time
 from datetime import datetime
 
@@ -16,6 +17,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 _PUBLIC_KEY_B64 = "2Nz/qcut2Ro3W0BFe3ErZ6HivtAqmwEzWPozavPJCxA="
 
 LICENSE_FILE = "license.key"
+
+
+def get_hostname() -> str:
+    """Return the current PC hostname (normalized: lowercase, stripped)."""
+    return socket.gethostname().strip().lower()
 
 
 def _get_public_key() -> Ed25519PublicKey:
@@ -85,6 +91,20 @@ def verify_license(license_key: str) -> dict:
     # Check product
     if payload.get("product") != "NodeCraft":
         return {"valid": False, "payload": payload, "error": "License is not for this product."}
+
+    # Check hostname (if present in license)
+    license_hostname = payload.get("hostname")
+    if license_hostname:
+        current = get_hostname()
+        if license_hostname.strip().lower() != current:
+            return {
+                "valid": False,
+                "payload": payload,
+                "error": (
+                    f"License is bound to hostname '{license_hostname}', "
+                    f"but this PC is '{current}'."
+                ),
+            }
 
     return {"valid": True, "payload": payload, "error": None}
 

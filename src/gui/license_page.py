@@ -16,7 +16,7 @@ from gui.theme import (
     background_gradient,
     panel,
 )
-from license_manager import verify_license, save_license
+from license_manager import verify_license, save_license, get_hostname
 
 
 class LicensePage:
@@ -68,12 +68,14 @@ class LicensePage:
                     ft.Container(height=16),
                     ft.Text(
                         "Enter your license key to activate NodeCraft.\n"
-                        "Contact your administrator to obtain a license.",
+                        "Send your hostname below to your administrator to obtain a license.",
                         size=13,
                         color=TEXT_MUTED,
                         text_align=ft.TextAlign.CENTER,
                     ),
-                    ft.Container(height=20),
+                    ft.Container(height=14),
+                    self._hostname_box(),
+                    ft.Container(height=14),
                     self.license_field,
                     ft.Container(height=8),
                     self.status_text,
@@ -154,11 +156,14 @@ class LicensePage:
             self.status_text.color = SUCCESS
             self.status_text.visible = True
 
-            self.info_column.controls = [
+            info_rows = [
                 self._info_row("Licensed to", payload.get("user", "—")),
                 self._info_row("Expires", payload.get("expires", "—")),
                 self._info_row("Issued", payload.get("issued", "—")),
             ]
+            if payload.get("hostname"):
+                info_rows.append(self._info_row("PC-locked to", payload["hostname"]))
+            self.info_column.controls = info_rows
             self.info_column.visible = True
             self.page.update()
 
@@ -184,6 +189,49 @@ class LicensePage:
                 self.info_column.visible = True
 
             self.page.update()
+
+    def _hostname_box(self) -> ft.Container:
+        hostname = get_hostname()
+
+        def _copy(e):
+            self.page.set_clipboard(hostname)
+            e.control.tooltip = "Copied!"
+            self.page.update()
+
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+            bgcolor=PANEL_RAISED,
+            border=ft.Border.all(1, ft.Colors.with_opacity(0.3, ACCENT)),
+            border_radius=12,
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.COMPUTER, size=18, color=ACCENT),
+                    ft.Column(
+                        [
+                            ft.Text("Your Hostname", size=11, color=TEXT_MUTED, weight=ft.FontWeight.W_600),
+                            ft.Text(
+                                hostname,
+                                size=14,
+                                color=TEXT,
+                                weight=ft.FontWeight.W_600,
+                                selectable=True,
+                            ),
+                        ],
+                        spacing=2,
+                        expand=True,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.CONTENT_COPY,
+                        icon_color=ACCENT,
+                        icon_size=18,
+                        tooltip="Copy hostname",
+                        on_click=_copy,
+                    ),
+                ],
+                spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
 
     def _info_row(self, label: str, value: str) -> ft.Row:
         return ft.Row(
