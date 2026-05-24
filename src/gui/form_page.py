@@ -9,6 +9,16 @@ import flet as ft
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from command_parser import parse_commands_file
+from license_manager import get_license_info
+
+
+def _get_license_user() -> str:
+    """Best-effort lookup of the licensed user's name; falls back to 'User'."""
+    try:
+        info = get_license_info() or {}
+        return str(info.get("user") or info.get("name") or "User").strip() or "User"
+    except Exception:
+        return "User"
 from config_loader import build_config_from_form, load_config
 from session import load_session, save_session
 from gui.theme import (
@@ -286,6 +296,12 @@ class FormPage:
                         weight=ft.FontWeight.W_500,
                     ),
                     ft.Text(
+                        f"Welcome, {_get_license_user()}",
+                        size=15,
+                        color=TEXT,
+                        weight=ft.FontWeight.W_600,
+                    ),
+                    ft.Text(
                         "Control room for SSH execution, ENM capture, Excel reports, and Integration testing.",
                         size=15,
                         color=TEXT_MUTED,
@@ -425,16 +441,68 @@ class FormPage:
                                 style=ft.ButtonStyle(
                                     bgcolor=ACCENT_WARM,
                                     color="#06242A",
+                                    mouse_cursor=ft.MouseCursor.CLICK,
                                     padding=ft.Padding.symmetric(horizontal=20, vertical=18),
                                     shape=ft.RoundedRectangleBorder(radius=16),
                                 ),
                                 on_click=self._on_integration,
                             ),
+                            ft.Container(width=12),
+                            ft.OutlinedButton(
+                                "Terminal",
+                                icon=ft.Icons.TERMINAL,
+                                tooltip="Open interactive SSH terminal (multi-tab)",
+                                style=ft.ButtonStyle(
+                                    color=ACCENT,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
+                                    shape=ft.RoundedRectangleBorder(radius=16),
+                                ),
+                                on_click=self._on_terminal,
+                            ),
+                            ft.Container(width=12),
+                            ft.OutlinedButton(
+                                "Clear Data",
+                                icon=ft.Icons.CLEANING_SERVICES_OUTLINED,
+                                icon_color="#FF8A8A",
+                                tooltip="Clear all site fields (SSH credentials are kept)",
+                                style=ft.ButtonStyle(
+                                    color="#FF8A8A",
+                                    bgcolor=ft.Colors.with_opacity(0.08, "#FF6B6B"),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, "#FF6B6B")),
+                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
+                                    shape=ft.RoundedRectangleBorder(radius=16),
+                                ),
+                                on_click=self._on_clear_data,
+                            ),
                             ft.Container(expand=True),
+                            # TRFS Launch — disabled in this build to
+                            # shrink the distribution (no Playwright /
+                            # Chromium dependency needed). The code path
+                            # (``_on_start`` and the entire Progress /
+                            # Result / Capture pipeline) is intentionally
+                            # kept intact so we can re-enable in a future
+                            # build by removing ``disabled=True`` and
+                            # putting playwright back in requirements.
                             ft.ElevatedButton(
                                 "TRFS Launch",
                                 icon=ft.Icons.PLAY_CIRCLE_FILL_ROUNDED,
-                                style=primary_button_style(),
+                                disabled=True,
+                                tooltip=(
+                                    "TRFS Launch is disabled in this build. "
+                                    "Re-enable by removing 'disabled=True' "
+                                    "in form_page.py and re-installing "
+                                    "Playwright + Chromium."
+                                ),
+                                style=ft.ButtonStyle(
+                                    bgcolor=ACCENT,
+                                    color="#06242A",
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=20, vertical=18),
+                                    shape=ft.RoundedRectangleBorder(radius=16),
+                                ),
                                 on_click=self._on_start,
                             ),
                             ft.Container(width=16),
@@ -655,22 +723,37 @@ class FormPage:
                 return
 
             try:
-                # Locate template and converter
+                # Locate template and converter. In a PyInstaller build the
+                # bundled resources live in ``_internal/`` next to the exe,
+                # whereas in dev they sit at the repo root. Check both.
                 src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 repo_root = os.path.dirname(src_dir)
-                template_path = os.path.join(repo_root, "Relation.txt")
-                if not os.path.isfile(template_path):
-                    # Try next to the zip
-                    template_path = os.path.join(os.path.dirname(zip_path), "Relation.txt")
-                if not os.path.isfile(template_path):
+                candidates = [
+                    src_dir,                          # _internal/  (PyInstaller one-folder)
+                    repo_root,                        # dev repo root
+                    os.path.dirname(zip_path),        # next to the uploaded zip
+                ]
+                # Also honour sys._MEIPASS if present (PyInstaller onefile)
+                meipass = getattr(sys, "_MEIPASS", None)
+                if meipass:
+                    candidates.insert(0, meipass)
+
+                def _find(name: str) -> str | None:
+                    for base in candidates:
+                        p = os.path.join(base, name)
+                        if os.path.isfile(p):
+                            return p
+                    return None
+
+                template_path = _find("Relation.txt")
+                if not template_path:
                     self.relation_zip_status.value = "⚠ Template Relation.txt not found."
                     self.relation_zip_status.color = "#FFB4B4"
                     self.page.update()
                     return
 
-                # Import converter
-                converter_path = os.path.join(repo_root, "txt_to_xml_converter.py")
-                if not os.path.isfile(converter_path):
+                converter_path = _find("txt_to_xml_converter.py")
+                if not converter_path:
                     self.relation_zip_status.value = "⚠ txt_to_xml_converter.py not found."
                     self.relation_zip_status.color = "#FFB4B4"
                     self.page.update()
@@ -776,6 +859,41 @@ class FormPage:
         self.error_box.visible = True
         self.page.update()
 
+    def _on_clear_data(self, e):
+        """Clear all site-related fields. SSH credentials (host, port,
+        username, password) are intentionally preserved so the operator
+        doesn't have to retype them for the next site."""
+        site_fields = [
+            self.shortcode_field,
+            self.node_name_field, self.node_ip_field, self.subnetwork_field,
+            self.node2_name_field, self.node2_ip_field, self.node2_subnetwork_field,
+            self.gsm_node_name_field, self.bsc_name_field,
+            self.gsm_node_ip_field, self.gsm_subnetwork_field,
+            # Integration file paths belong to the current site — clearing
+            # them prevents accidentally re-using the previous site's files.
+            self.lkf_field, self.relation_field, self.relation_zip_field,
+        ]
+        for fld in site_fields:
+            try:
+                fld.value = ""
+            except Exception:
+                pass
+
+        # Hide any lingering validation banner.
+        self.error_text.value = ""
+        self.error_text.visible = False
+        self.error_box.visible = False
+        # Reset command-file parse summary (commands_field itself is kept
+        # since it's not site-specific).
+        try:
+            self.parse_info.visible = False
+            self.band_count_text.value = "0"
+            self.category_count_text.value = "0"
+        except Exception:
+            pass
+
+        self.page.update()
+
     def _on_start(self, e):
         f = self._collect_form()
 
@@ -815,6 +933,7 @@ class FormPage:
             config_path=self.defaults.get("config_path") or None,
             gsm_node_name=f["gsm_node_name"],
             bsc_name=f["bsc_name"],
+            node2_name=f["node2_name"],
         )
 
         self.page.trfs_config = config
@@ -822,6 +941,25 @@ class FormPage:
         self.page.trfs_commands_file = f["commands_file"]
 
         self.page.go("/progress")
+
+    def _on_terminal(self, e):
+        # Open the multi-tab SSH terminal. Pre-fills the first tab with
+        # the SSH credentials currently in the form (so the operator
+        # gets a connected session to the gateway in one click).
+        # Site fields aren't required — only host/user/password matter
+        # for SSH.
+        f = self._collect_form()
+        # Hand off only what the terminal cares about — host, port,
+        # username, password — under the same key the integration form
+        # uses, so the terminal page can read it without knowing which
+        # workflow opened it.
+        self.page.integration_form = {
+            "host": f.get("host", ""),
+            "port": f.get("port", 22),
+            "username": f.get("username", ""),
+            "password": f.get("password", ""),
+        }
+        self.page.go("/terminal")
 
     def _on_integration(self, e):
         f = self._collect_form()

@@ -3,5 +3,16 @@ openpyxl>=3.1.5
 Pillow>=10.0.0
 PyYAML>=6.0
 pyautogui>=0.9.54
-playwright>=1.50.0
 flet>=0.84.0
+
+# Playwright was removed from this build to shrink the distribution.
+# TRFS Launch (which needs Playwright + Chromium to capture ENM web
+# screenshots) is disabled in the GUI; the import sites in
+# ``src/enm_capture.py`` and ``src/srs_capture.py`` are wrapped in
+# try/except + lazy imports so the app boots fine without it.
+# To re-enable TRFS:
+#   1. Add ``playwright>=1.50.0`` back to this file
+#   2. Run ``pip install -r requirements.txt``
+#   3. Run ``playwright install chromium``
+#   4. In ``src/gui/form_page.py`` remove ``disabled=True`` from the
+#      "TRFS Launch" ElevatedButton.

@@ -11,8 +11,23 @@ from typing import List
 class SiteConfig:
     shortcode: str
     node_name: str
+    node2_name: str = ""
     gsm_node_name: str = ""
     bsc_name: str = ""
+
+    def get_node_names(self) -> List[str]:
+        """Return list of active LTE/NR node names (excludes empty strings)."""
+        nodes = [self.node_name]
+        if self.node2_name:
+            nodes.append(self.node2_name)
+        return nodes
+
+    def get_all_nodes(self) -> List[str]:
+        """Return list of all active node names including GSM (excludes empty strings)."""
+        nodes = self.get_node_names()
+        if self.gsm_node_name:
+            nodes.append(self.gsm_node_name)
+        return nodes
 
 
 @dataclass
@@ -137,12 +152,14 @@ def build_config_from_form(
     config_path: str | None = None,
     gsm_node_name: str = "",
     bsc_name: str = "",
+    node2_name: str = "",
 ) -> AppConfig:
     """Build an AppConfig from GUI form values, merging with existing config.yaml defaults."""
     if config_path and os.path.isfile(config_path):
         config = load_config(config_path)
         config.site.shortcode = shortcode
         config.site.node_name = node_name
+        config.site.node2_name = node2_name
         config.site.gsm_node_name = gsm_node_name
         config.site.bsc_name = bsc_name
         config.ssh.host = host
@@ -150,11 +167,14 @@ def build_config_from_form(
         config.ssh.username = username
         config.ssh.password = password
         config.paths.commands = os.path.basename(commands_file)
-        config.moshell.login_command = config.moshell.login_command.replace(
-            config.moshell.login_command.split()[1] if config.moshell.login_command.split()[1:] else "",
-            node_name,
-        ) if "{node_name}" not in config.moshell.login_command else config.moshell.login_command.format(node_name=node_name)
-        config.moshell.prompt_pattern = config.moshell.prompt_pattern.format(node_name=node_name)
+        # Canonicalize moshell login/prompt for the NEW node_name. We cannot
+        # rely on .format() here because load_config() already substituted the
+        # {node_name} placeholder with the YAML's saved node; the string has
+        # no placeholder left. Forcing the canonical forms here guarantees
+        # the SSH runner waits for the correct prompt no matter what was in
+        # the persisted config or a prior run's session cache.
+        config.moshell.login_command = f"amos {node_name}"
+        config.moshell.prompt_pattern = f"{node_name}>"
         _apply_shortcode_paths(config)
     else:
         base_dir = os.path.dirname(os.path.abspath(commands_file)) if commands_file else os.getcwd()
@@ -162,6 +182,7 @@ def build_config_from_form(
             site=SiteConfig(
                 shortcode=shortcode,
                 node_name=node_name,
+                node2_name=node2_name,
                 gsm_node_name=gsm_node_name,
                 bsc_name=bsc_name,
             ),
@@ -202,3 +223,25 @@ def build_config_from_form(
 def get_full_path(config: AppConfig, relative_path: str) -> str:
     """Resolve a relative path against the base directory."""
     return os.path.join(config.base_dir, relative_path)
+
+
+def create_node_config(config: AppConfig, node_name: str) -> AppConfig:
+    """Create a copy of *config* targeting a specific node.
+
+    Replaces the node name in the moshell login command and prompt pattern
+    so that an ``MoshellSession`` opened with the returned config connects
+    to *node_name* instead of the original node.
+    """
+    import copy
+    node_config = copy.deepcopy(config)
+    old_node = config.site.node_name
+    node_config.site.node_name = node_name
+    # Update moshell login command: replace the old node name with the new one
+    node_config.moshell.login_command = node_config.moshell.login_command.replace(
+        old_node, node_name
+    )
+    # Update moshell prompt pattern
+    node_config.moshell.prompt_pattern = node_config.moshell.prompt_pattern.replace(
+        old_node, node_name
+    )
+    return node_config

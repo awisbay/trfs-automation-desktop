@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Callable, Optional
 
 import paramiko
@@ -15,33 +16,189 @@ import paramiko
 logger = logging.getLogger(__name__)
 
 # ── Load dynamic config ─────────────────────────────────────────
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Lookup order for ``config.json``:
+#   1. ``<exe_dir>/config.json``  — user's editable copy next to the
+#      exe (or project root in dev mode). This is the file operators
+#      actually edit to point at different ENM script paths.
+#   2. ``<this_file_dir>/config.json`` — bundled default that ships
+#      inside the PyInstaller _MEIPASS. Used as fallback when the
+#      user-editable file is missing (typical on a fresh exe install,
+#      until ``ensure_assets_in_app_dir`` seeds a copy beside the exe).
+def _resolve_config_path() -> str:
+    candidates = []
+    try:
+        from app_path import get_app_dir
+        candidates.append(os.path.join(get_app_dir(), "config.json"))
+    except Exception:
+        pass
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    )
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]  # for the warning log
+
+
+_CONFIG_PATH = _resolve_config_path()
 
 
 def _load_config() -> dict:
     """Load config.json. Returns defaults if file is missing."""
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
+            logger.info(f"Loaded integration config from {_CONFIG_PATH}")
+            return cfg
     except Exception:
-        logger.warning("config.json not found, using built-in defaults.")
+        logger.warning(
+            f"config.json not found at {_CONFIG_PATH} — using built-in defaults."
+        )
         return {}
 
 
 _CFG = _load_config()
 
+# ── Script path resolution ──────────────────────────────────────
+# Every script path in config.json should be a FULL absolute path
+# (starts with ``/``). Operators can point each script at any
+# directory — they don't all need to live under the same root.
+#
+# For backward compatibility, if a value does NOT start with ``/``
+# we treat it as relative to ``scripts_path`` (the legacy behaviour).
+# Old config.json files with bare names like ``"ES/create_arne.py"``
+# keep working, but the recommended form is the explicit full path.
 SCRIPTS_PATH = _CFG.get("scripts_path", "/home/shared/ESETARI/INOC/SCRIPTS")
-CLI_PY = _CFG.get("cli_py", f"{SCRIPTS_PATH}/cli.py")
 
-_CREATE_ARNE = _CFG.get("create_arne_script", "ES/create_arne.py")
-_ENTITY_MAKER = _CFG.get("entity_maker_script", "ES/entity_maker.sh")
-_EXE_ENTITY = _CFG.get("exe_entity_script", "ES/exe_entity.py")
-_ENROLLMENT_MOS = _CFG.get("enrollment_mos", "ES/enroll/lhgenm1.mos")
-_SGW_CHECK_MOS = _CFG.get("sgw_check_mos", "SWG_Check.mos")
 
-_LKF_IMPORT = _CFG.get("lkf_import_script", "lkfimport.py")
-_LKF_INSTALL = _CFG.get("lkf_install_script", "lkfinstall.py")
-_LKF_STATUS = _CFG.get("lkf_status_script", "lkfstatus.py")
+def _resolve_script_path(value: str) -> str:
+    """Return ``value`` unchanged if it's already an absolute Unix
+    path; otherwise prepend ``SCRIPTS_PATH`` (legacy behaviour)."""
+    if not value:
+        return value
+    if value.startswith("/"):
+        return value
+    return f"{SCRIPTS_PATH}/{value}"
+
+
+CLI_PY = _resolve_script_path(
+    _CFG.get("cli_py", "/home/shared/ESETARI/INOC/SCRIPTS/cli.py")
+)
+
+# Enrollment / ARNE scripts
+_CREATE_ARNE = _resolve_script_path(
+    _CFG.get("create_arne_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne_2.py")
+)
+_ENTITY_MAKER = _resolve_script_path(
+    _CFG.get("entity_maker_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh")
+)
+_EXE_ENTITY = _resolve_script_path(
+    _CFG.get("exe_entity_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py")
+)
+_ENROLLMENT_MOS = _resolve_script_path(
+    _CFG.get("enrollment_mos",
+             "/home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos")
+)
+
+# SGW reachability check
+_SGW_CHECK_MOS = _resolve_script_path(
+    _CFG.get("sgw_check_mos",
+             "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos")
+)
+
+# LKF management scripts (typically at SCRIPTS_PATH root)
+_LKF_IMPORT = _resolve_script_path(
+    _CFG.get("lkf_import_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/lkfimport.py")
+)
+_LKF_INSTALL = _resolve_script_path(
+    _CFG.get("lkf_install_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/lkfinstall.py")
+)
+_LKF_STATUS = _resolve_script_path(
+    _CFG.get("lkf_status_script",
+             "/home/shared/ESETARI/INOC/SCRIPTS/lkfstatus.py")
+)
+
+# Where ENM's SMRS service stores per-node license files. Configurable
+# in case a deployment uses a non-default path.
+_SMRS_LICENCE_DIR = _CFG.get(
+    "smrs_licence_dir",
+    "/ericsson/tor/smrs/smrsroot/licence",
+)
+
+
+def _find_node_lkf_in_zip(zip_path: str, node_name: str) -> Optional[str]:
+    """Open ``zip_path`` locally and find the per-node LKF XML inside.
+
+    Convention: the zip contains one file per node, named like
+    ``<NODE_NAME>_<fingerprint>.xml``. A sibling
+    ``<NODE_NAME>_<fingerprint>_info.xml`` may also be present —
+    that's the metadata file, NOT the license, and we explicitly
+    skip it.
+
+    Match is case-insensitive on the leading node name so casing
+    differences between the zip and the node DN don't cause a miss.
+
+    Returns the bare filename (no path) if found, else ``None``.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+    except Exception as exc:
+        logger.warning(f"[lkf] cannot open zip {zip_path}: {exc}")
+        return None
+
+    node_lower = node_name.lower()
+    candidates: list[str] = []
+    for name in names:
+        base = os.path.basename(name)
+        low = base.lower()
+        if not low.endswith(".xml"):
+            continue
+        if low.endswith("_info.xml"):
+            continue
+        # Either starts with <node>_ or contains the node name as a
+        # leading token. Strict prefix match avoids picking another
+        # node's file when this node's name is a substring.
+        if low.startswith(node_lower + "_") or low == node_lower + ".xml":
+            candidates.append(base)
+    if not candidates:
+        return None
+    # If multiple non-info XMLs match, prefer the lexicographically
+    # last one (typically the newest fingerprint).
+    return sorted(candidates)[-1]
+
+
+def _lkf_already_on_smrs(
+    ssh: "IntegrationSSH",
+    node_name: str,
+    lkf_filename: str,
+    log_cb: Callable[[str], None],
+) -> bool:
+    """Check whether ``<smrs_dir>/<node_name>/<lkf_filename>`` exists
+    on the gateway. Returns True only if an exact-name match is
+    present (so a stale file with a different fingerprint won't be
+    treated as 'already installed')."""
+    remote_path = f"{_SMRS_LICENCE_DIR}/{node_name}/{lkf_filename}"
+    log_cb(f"Checking if LKF already on SMRS: {remote_path}")
+    # ``! ls -1 <path> 2>/dev/null`` prints the path on success,
+    # nothing on failure. Then we just look for the filename in
+    # the output.
+    out = ssh.run_amos_command_safe(
+        f"!ls -1 '{remote_path}' 2>/dev/null",
+        node_name, timeout=15,
+    )
+    return lkf_filename in out
+
+_BASELINE_SCRIPT = _resolve_script_path(_CFG.get(
+    "baseline_script_path",
+    "/home/shared/common/INTEGRATION_TEAM/script/Baseline_script.mos",
+))
 
 _BASELINE_FILES = _CFG.get("baseline_files", {
     "L":  "Globe_Baseline_L_NonModular_Rev_15042026.mos",
@@ -119,6 +276,11 @@ class IntegrationSSH:
         """Download all queued remote logs into `moshell_dir` (or a subfolder)
         and clear the queue.
 
+        After a successful download we also DELETE the file from the
+        server so ``/home/shared/<user>/`` doesn't grow indefinitely
+        across runs. The deletion is best-effort — if it fails we just
+        log a warning, the local copy is the one that matters.
+
         Returns list of successfully-downloaded local paths.
         """
         downloaded: list[str] = []
@@ -136,6 +298,9 @@ class IntegrationSSH:
             try:
                 self.sftp_download(remote, local)
                 downloaded.append(local)
+                # Successfully copied locally → delete from server.
+                # ``sftp_remove`` is best-effort and never raises.
+                self.sftp_remove(remote)
             except Exception as exc:
                 self._log(f"Could not download {remote}: {exc}")
         self._remote_logs.clear()
@@ -292,6 +457,29 @@ class IntegrationSSH:
             sftp.close()
 
         return local_path
+
+    def sftp_remove(self, remote_path: str) -> bool:
+        """Delete ``remote_path`` from the server via SFTP. Best-effort:
+        returns ``True`` on success, ``False`` (no exception raised) on
+        any failure — clean-up never blocks a step. Used after a log
+        has been safely downloaded locally to keep the operator's
+        ``/home/shared/<user>/`` from growing without bound."""
+        if not remote_path:
+            return False
+        try:
+            sftp = self.client.open_sftp()
+            try:
+                sftp.remove(remote_path)
+            finally:
+                sftp.close()
+            self._log(f"SFTP removed remote {remote_path}")
+            return True
+        except FileNotFoundError:
+            # Already gone — count as success.
+            return True
+        except Exception as exc:
+            self._log(f"SFTP remove failed for {remote_path}: {exc}")
+            return False
 
     def reconnect(self, timeout: int = 30):
         """Disconnect and re-establish the SSH session."""
@@ -473,6 +661,192 @@ class IntegrationSSH:
                     break
             else:
                 time.sleep(0.3)
+        return strip_ansi(buf)
+
+    def drain_after_command(self, wait: float = 5.0, read_timeout: int = 300) -> str:
+        """After a long-running command, drain any remaining output.
+
+        Call this after ``run_amos_command_safe()`` for commands that take a
+        long time (e.g. baseline, relation).  ``_read_until_amos`` may detect
+        a false prompt early; this method waits a few seconds, drains stale
+        data, and reads until the real AMOS prompt confirms the command is
+        truly finished.
+
+        Returns any additional output received.
+        """
+        import time as _t
+        self._log("Draining remaining output after long-running command...")
+        extra = ""
+
+        _t.sleep(wait)
+
+        stale = False
+        while self.shell and self.shell.recv_ready():
+            try:
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                extra += chunk
+                stale = True
+            except Exception:
+                break
+
+        if stale:
+            self._log("Additional output found — reading until AMOS prompt...")
+            remaining = self._read_until_amos(timeout=read_timeout)
+            extra += remaining
+            self._log(f"Drained {len(extra)} additional bytes.")
+        else:
+            self._log("No remaining output — command appears complete.")
+
+        return extra
+
+    def run_amos_blocking_with_sentinel(
+        self,
+        command: str,
+        node_name: str,
+        timeout: int = 3600,
+        quiet_after: float = 10.0,
+    ) -> str:
+        """Run a long-running AMOS command and wait for a sentinel echo
+        AND a quiescence window to prove it *really* finished.
+
+        This models the operator's mental check for baseline:
+          * run <baseline.mos>
+          * baseline fires many set/crn commands
+          * each one fills in the next time the AMOS prompt is ready
+          * we decide baseline is done when the prompt is idle for N seconds
+          * then cvls verifies a ``Post_...`` entry appears
+
+        Implementation uses a sentinel token AND a quiet window (both must
+        hold). Either check alone is insufficient:
+          * sentinel alone → moshell may still print trailing noise after
+            the nonce (ANSI resets, final prompt redraw)
+          * quiescence alone → a natural mid-script pause can fire too
+            early (baseline has seconds-long gaps while each set commits)
+
+        Flow:
+            1. Build a unique nonce → ``__TRFS_DONE_<8hex>__``
+            2. Send ``<command>`` (e.g. ``run <baseline.mos>``)
+            3. Send ``!echo <nonce>`` on a fresh line. Moshell *queues* it
+               behind the current ``run``, so it only executes once the
+               script exits and the AMOS prompt is free — that's the
+               "prompt idle, no more commands to feed" signal.
+            4. After seeing the nonce, wait for an AMOS prompt *and* for
+               ``quiet_after`` seconds of no new bytes on the channel.
+
+        Args:
+            command:      The AMOS command to run (most often ``run <path>``).
+            node_name:    For logging / reconnect (unused in fast path).
+            timeout:      Hard upper bound in seconds.
+            quiet_after:  How long the channel must be silent after the
+                          AMOS prompt appears before we declare "done".
+                          10 s matches the operator's rule-of-thumb for
+                          baseline; pass a smaller value for fast scripts.
+
+        Returns: the full accumulated output (ANSI-stripped).
+        """
+        nonce = uuid.uuid4().hex[:8]
+        sentinel = f"__TRFS_DONE_{nonce}__"
+        self._log(
+            f"[sentinel] '{command}' → waiting for {sentinel} "
+            f"+ {quiet_after:.0f}s quiet"
+        )
+        self.send(command)
+        # Small gap so moshell reads the command line before the echo.
+        time.sleep(0.4)
+        self.send(f"!echo {sentinel}")
+
+        prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
+        buf = ""
+        start = time.time()
+        saw_sentinel = False
+        saw_prompt_after_sentinel = False
+        last_byte_time = start
+        last_progress = start
+        while True:
+            if self._channel_dead():
+                self._log("[sentinel] channel dead — aborting wait.")
+                break
+            if time.time() - start > timeout:
+                self._log(
+                    f"[sentinel] TIMEOUT after {timeout}s — "
+                    f"sentinel {'seen' if saw_sentinel else 'NOT seen'}. "
+                    "Returning what we have."
+                )
+                break
+            if self.shell.recv_ready():
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                buf += chunk
+                now = time.time()
+                last_byte_time = now
+                last_progress = now
+                clean = strip_ansi(buf)
+                if not saw_sentinel:
+                    # IMPORTANT: distinguish PTY input-echo from real
+                    # output. When we ``send("!echo SENTINEL")``, the PTY
+                    # may echo those bytes back to us *immediately* —
+                    # long before moshell actually executes the echo.
+                    # The input-echo line looks like
+                    #     "!echo __TRFS_DONE_xxx__"
+                    # while the real output line is
+                    #     "__TRFS_DONE_xxx__"   (on its own).
+                    # We only count the latter; otherwise we could flip
+                    # ``saw_sentinel`` true while the batch is still
+                    # running and a slow MO commit (>10s without output)
+                    # would falsely satisfy the quiescence gate.
+                    for line in clean.splitlines():
+                        s = line.strip()
+                        if s == sentinel:
+                            saw_sentinel = True
+                            elapsed = int(now - start)
+                            self._log(
+                                f"[sentinel] nonce seen on its own line "
+                                f"after {elapsed}s — script finished; "
+                                f"waiting for AMOS prompt + "
+                                f"{quiet_after:.0f}s of idle."
+                            )
+                            break
+                if saw_sentinel:
+                    last_line = ""
+                    for line in reversed(clean.splitlines()):
+                        if line.strip():
+                            last_line = line.strip()
+                            break
+                    if (prompt_re.match(last_line)
+                            and "<" not in last_line
+                            and "/" not in last_line):
+                        saw_prompt_after_sentinel = True
+            else:
+                now = time.time()
+                # Quiescence gate: sentinel fired, prompt returned, and
+                # channel has been silent for ``quiet_after`` seconds.
+                if (saw_sentinel
+                        and saw_prompt_after_sentinel
+                        and (now - last_byte_time) >= quiet_after):
+                    self._log(
+                        f"[sentinel] prompt idle for {quiet_after:.0f}s — "
+                        "baseline/relation confirmed complete."
+                    )
+                    break
+                # Periodic heartbeat during multi-minute waits
+                if now - last_progress > 60:
+                    phase = (
+                        "pending sentinel"
+                        if not saw_sentinel
+                        else (
+                            "waiting for AMOS prompt"
+                            if not saw_prompt_after_sentinel
+                            else f"waiting for {quiet_after:.0f}s idle "
+                                 f"(last byte {int(now-last_byte_time)}s ago)"
+                        )
+                    )
+                    self._log(
+                        f"[sentinel] still alive — {phase}, "
+                        f"elapsed={int(now-start)}s"
+                    )
+                    last_progress = now
+                time.sleep(0.5)
         return strip_ansi(buf)
 
     def _read_until_amos(self, timeout: int = 120) -> str:
@@ -678,6 +1052,8 @@ def run_create_arne(
     subnetwork: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    *,
+    bsc_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run create_arne.py, fill the 3 prompts, then verify with cli.py.
 
@@ -685,6 +1061,16 @@ def run_create_arne(
     which should block until the user clicks Retry (returns True) or
     Cancel (returns False).  Re-verifies in a loop until success or
     cancellation.
+
+    For GSM nodes, if ``bsc_name`` is provided, additionally sets the
+    ``controllingBsc`` attribute on the NetworkElement to point at the
+    BSC after the ARNE entry has been verified::
+
+        cmedit set NetworkElement=<node> controllingBsc="NetworkElement=<bsc>"
+
+    Uses the same ``python cli.py "<cmedit ...>"`` invocation pattern as
+    ``verify_arne``, including a ``cmedit get`` read-back to confirm the
+    attribute landed.
 
     Returns:
         (success: bool, full_output: str)
@@ -722,7 +1108,7 @@ def run_create_arne(
 
     # Step 1: Run the ARNE creation script (interactive prompts)
     output = ssh.run_interactive(
-        command=f"python {SCRIPTS_PATH}/{_CREATE_ARNE}",
+        command=f"python {_CREATE_ARNE}",
         prompts=[
             ("nodename",   node_name),
             ("ip address", node_ip),
@@ -766,6 +1152,123 @@ def run_create_arne(
         if success:
             log_cb(f"✓ ARNE verified — {node_name} found (1 instance)")
 
+    # ── GSM only: set controllingBsc → NetworkElement=<BSC> ─────
+    # Same invocation pattern as ``verify_arne``: python + cli.py with
+    # the cmedit string wrapped in shell quotes. We then read the
+    # attribute back with ``cmedit get`` to confirm it was applied.
+    if bsc_name:
+        bsc = bsc_name.strip()
+        if not bsc:
+            log_cb("(controllingBsc skipped — empty BSC name)")
+        else:
+            set_ok, set_out = _set_controlling_bsc(
+                ssh, node_name, bsc, log_cb,
+                wait_for_user=wait_for_user,
+            )
+            all_output += "\n" + set_out
+            if not set_ok:
+                # The controllingBsc set failed — but ARNE itself is
+                # already verified, so we report this as a partial
+                # failure. Caller decides whether to continue.
+                log_cb(
+                    f"✗ controllingBsc could not be set on {node_name} "
+                    f"→ NetworkElement={bsc}. ARNE entry exists but the "
+                    "BSC link is missing."
+                )
+                return False, all_output
+
+    return True, all_output
+
+
+def _set_controlling_bsc(
+    ssh: IntegrationSSH,
+    node_name: str,
+    bsc_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Set ``controllingBsc`` on a GSM NetworkElement and verify.
+
+    Sends, via the same ``python cli.py "<cmd>"`` wrapper used by
+    ``verify_arne``::
+
+        cmedit set NetworkElement=<node> \\
+                   controllingBsc="NetworkElement=<bsc>"
+
+    Then reads back with ``cmedit get NetworkElement=<node> \\
+    controllingBsc`` and confirms the response shows the expected BSC.
+    On mismatch, prompts the operator to retry (same pattern as the
+    ARNE verification loop above).
+    """
+    all_output = ""
+    expected_value = f"NetworkElement={bsc_name}"
+
+    # Outer single quotes wrap the whole cmedit string for bash; the
+    # inner double quotes around the controllingBsc value are preserved
+    # and reach cli.py intact.
+    set_cmd = (
+        f"python {CLI_PY} "
+        f"'cmedit set NetworkElement={node_name} "
+        f'controllingBsc="NetworkElement={bsc_name}"\''
+    )
+    log_cb(f"Setting controllingBsc on {node_name} → {expected_value}")
+    log_cb(f"  $ {set_cmd}")
+    set_out = ssh.run_command(set_cmd, timeout=60)
+    all_output += set_out
+    log_cb(f"cmedit set output:\n{set_out}")
+
+    # Verification: read attribute back. Successful "1 instance(s)
+    # updated" plus the BSC name appearing in the get output is our
+    # double-check.
+    get_cmd = (
+        f"python {CLI_PY} "
+        f'"cmedit get {node_name} controllingBsc"'
+    )
+
+    def _verify_once() -> tuple[bool, str]:
+        log_cb(f"  $ {get_cmd}")
+        out = ssh.run_command(get_cmd, timeout=60)
+        log_cb(f"cmedit get output:\n{out}")
+        ok = (
+            "1 instance(s)" in out
+            and expected_value in out
+        )
+        return ok, out
+
+    ok, get_out = _verify_once()
+    all_output += "\n" + get_out
+    if ok:
+        log_cb(
+            f"✓ controllingBsc verified on {node_name} → {expected_value}"
+        )
+        return True, all_output
+
+    # Verification failed — same retry loop pattern as ARNE.
+    while not ok:
+        log_cb(
+            f"✗ controllingBsc not yet showing {expected_value} on "
+            f"{node_name}."
+        )
+        if wait_for_user is None:
+            return False, all_output
+        retry = wait_for_user(
+            f"Setting controllingBsc on '{node_name}' → "
+            f"'{expected_value}' did not verify.\n\n"
+            f"Check the output above (the attribute may need ENM "
+            f"propagation time, or the BSC name may be wrong).\n"
+            f"Click 'Retry' to re-check, or 'Stop' to skip the BSC "
+            f"link step."
+        )
+        if not retry:
+            log_cb("User chose to stop the controllingBsc verification.")
+            return False, all_output
+        log_cb("User clicked Retry — re-checking controllingBsc…")
+        ok, get_out = _verify_once()
+        all_output += "\n" + get_out
+
+    log_cb(
+        f"✓ controllingBsc verified on {node_name} → {expected_value}"
+    )
     return True, all_output
 
 
@@ -809,7 +1312,7 @@ def run_enrollment(
     # ── 3. Create entity XML ─────────────────────────────────────
     log_cb(f"Creating entity XML for {node_name}...")
     out = ssh.run_amos_command_safe(
-        f"!bash {SCRIPTS_PATH}/{_ENTITY_MAKER} {node_name}",
+        f"!bash {_ENTITY_MAKER} {node_name}",
         node_name, timeout=60,
     )
     all_output += out
@@ -847,7 +1350,7 @@ def run_enrollment(
     # ── 4. Upload entity file ────────────────────────────────────
     log_cb(f"Uploading entity file for {node_name}...")
     out = ssh.run_amos_command_safe(
-        f"!python {SCRIPTS_PATH}/{_EXE_ENTITY} "
+        f"!python {_EXE_ENTITY} "
         f"~/INOC/SCRIPTS/NS/{node_name}.xml",
         node_name, timeout=300,
     )
@@ -876,22 +1379,39 @@ def run_enrollment(
     log_cb("✓ Entity upload confirmed.")
 
     # ── 5. Run enrollment MOS script ─────────────────────────────
+    # Use the sentinel-based runner (same as baseline/relation): the
+    # enrollment .mos contains many ``set NodeCredential``,
+    # ``set TrustedCertificate``, etc. — each prints a transient
+    # ``NODE>`` prompt that ``_read_until_amos`` would match wrongly,
+    # returning before the script is actually done. That premature
+    # return is what makes the next step (``get NodeCredential
+    # enrollmentProgress``) see IDLE/ONGOING and fire a false error
+    # popup; the operator's Retry then succeeds because the enrollment
+    # really did finish in the background by then.
+    #
+    # Sentinel + 10s idle quiescence guarantees we only proceed to the
+    # progress check after the enrollment script has truly returned to
+    # the AMOS prompt and stayed quiet — so the very first
+    # ``enrollmentProgress`` check has a real chance of seeing SUCCESS.
     log_cb("Running enrollment script (lhgenm1.mos)...")
-    out = ssh.run_amos_command_safe(
-        f"run {SCRIPTS_PATH}/{_ENROLLMENT_MOS}",
-        node_name, timeout=600,
+    log_cb("(sentinel + 10s idle quiescence; can take several minutes)")
+    out = ssh.run_amos_blocking_with_sentinel(
+        f"run {_ENROLLMENT_MOS}",
+        node_name, timeout=600, quiet_after=10.0,
     )
     all_output += out
     log_cb(f"Enrollment script output:\n{out}")
 
     # ── 6. Validate enrollment — poll NodeCredential progress ───
     # The enrollmentProgress can transition IDLE → ONGOING → SUCCESS.
-    # Auto-poll up to 6 times at 15s intervals BEFORE bothering the user,
-    # so a slow node that's still transitioning won't show a false FAILED.
+    # Per spec: retry 2 times for credential status, ~2 minutes per
+    # retry (= 1 initial check + 1 retry, 120 s apart). Slow nodes
+    # that are still transitioning get one full 2-minute window before
+    # we bother the user.
     log_cb("Validating enrollment (NodeCredential enrollmentProgress)...")
     enroll_success = False
-    max_auto_polls = 10
-    poll_interval = 8
+    max_auto_polls = 2
+    poll_interval = 120
     out = ""
     for attempt in range(1, max_auto_polls + 1):
         out = ssh.run_amos_command_safe(
@@ -943,61 +1463,118 @@ def run_enrollment(
             enroll_success = "SUCCESS" in out
     log_cb("✓ Enrollment validated — SUCCESS.")
 
-    # ── 7. Force sync (stay in AMOS, use !python) ────────────────
-    log_cb(f"Forcing sync for {node_name}...")
-    out = ssh.run_amos_command_safe(
-        f'!python {CLI_PY} "cmedit action {node_name} cmfunction=1 SYNC"',
-        node_name, timeout=60,
+    # ── 7-8. Force sync and wait for SYNCHRONIZED ────────────────
+    # Per spec: 2 attempts at 2-minute intervals for the sync check.
+    synced, sync_output = _ensure_node_synchronized(
+        ssh,
+        node_name,
+        log_cb,
+        wait_for_user=wait_for_user,
+        force_first=True,
+        poll_interval=120,
+        max_attempts=2,
     )
-    all_output += out
-    log_cb(f"Sync command output:\n{out}")
-
-    # ── 8. Wait for SYNCHRONIZED (stay in AMOS, use !python) ─────
-    log_cb(f"Waiting for {node_name} to reach SYNCHRONIZED status...")
-    sync_cmd = f'!python {CLI_PY} "cmedit get {node_name} cmfunction.syncstatus -t"'
-    max_sync_attempts = 30
-    synced = False
-    for attempt in range(1, max_sync_attempts + 1):
-        out = ssh.run_amos_command_safe(sync_cmd, node_name, timeout=60)
-        all_output += out
-        log_cb(f"Sync check #{attempt}:\n{out}")
-
-        if "SYNCHRONIZED" in out:
-            synced = True
-            break
-
-        # Faster polling: 15s first 6 attempts, then 30s
-        delay = 15 if attempt <= 6 else 30
-        if "TOPOLOGY" in out or "UNSYNCHRONIZED" in out or "PENDING" in out:
-            log_cb(f"Status not yet SYNCHRONIZED ({attempt}/{max_sync_attempts}), "
-                   f"waiting {delay}s...")
-        else:
-            log_cb(f"Unexpected sync status ({attempt}/{max_sync_attempts}), "
-                   f"waiting {delay}s...")
-        time.sleep(delay)
-
+    all_output += sync_output
     if not synced:
-        msg = (
-            f"Sync for {node_name} did not reach SYNCHRONIZED after "
-            f"{max_sync_attempts} attempts."
-        )
-        log_cb(f"✗ {msg}")
-        while not synced:
-            if not wait_for_user:
-                return False, all_output
-            retry = wait_for_user(
-                f"{msg}\n\nClick Retry to keep checking, or Stop to abort."
-            )
-            if not retry:
-                log_cb("User chose to stop.")
-                return False, all_output
-            out = ssh.run_amos_command_safe(sync_cmd, node_name, timeout=60)
-            all_output += out
-            log_cb(f"Re-check sync:\n{out}")
-            synced = "SYNCHRONIZED" in out
+        return False, all_output
 
     log_cb(f"✓ {node_name} is SYNCHRONIZED. Enrollment complete.")
     return True, all_output
+
+
+def _parse_sync_state(output: str) -> str:
+    """Extract the node sync state from CLI output.
+
+    Check UNSYNCHRONIZED before SYNCHRONIZED because the former contains the
+    latter as a substring.
+    """
+    upper = output.upper()
+    if "UNSYNCHRONIZED" in upper:
+        return "UNSYNCHRONIZED"
+    if "SYNCHRONIZED" in upper:
+        return "SYNCHRONIZED"
+    if "PENDING" in upper:
+        return "PENDING"
+    if "TOPOLOGY" in upper:
+        return "TOPOLOGY"
+    return "UNKNOWN"
+
+
+def _ensure_node_synchronized(
+    ssh: IntegrationSSH,
+    node_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+    *,
+    force_first: bool = False,
+    poll_interval: int = 5,
+    max_attempts: int = 60,
+) -> tuple[bool, str]:
+    """Ensure the node reaches SYNCHRONIZED using the standard CLI commands."""
+    all_output = ""
+    sync_cmd = f'!python {CLI_PY} "cmedit get {node_name} cmfunction.syncstatus -t"'
+    force_sync_cmd = f'!python {CLI_PY} "cmedit action {node_name} cmfunction=1 SYNC"'
+
+    def _run_force_sync(prefix: str) -> None:
+        nonlocal all_output
+        log_cb(prefix)
+        out = ssh.run_amos_command_safe(force_sync_cmd, node_name, timeout=60)
+        all_output += out
+        log_cb(f"Sync command output:\n{out}")
+
+    def _poll_cycle(cycle_label: str) -> bool:
+        nonlocal all_output
+        forced_sync = False
+
+        if force_first:
+            _run_force_sync(f"Forcing sync for {node_name}...")
+            forced_sync = True
+
+        log_cb(cycle_label)
+        for attempt in range(1, max_attempts + 1):
+            out = ssh.run_amos_command_safe(sync_cmd, node_name, timeout=60)
+            all_output += out
+            state = _parse_sync_state(out)
+            log_cb(f"Sync check #{attempt}/{max_attempts} [{state}]:\n{out}")
+
+            if state == "SYNCHRONIZED":
+                log_cb(f"✓ {node_name} is SYNCHRONIZED.")
+                return True
+
+            if state == "UNSYNCHRONIZED" and not forced_sync:
+                _run_force_sync(
+                    f"{node_name} is UNSYNCHRONIZED — forcing sync before continuing..."
+                )
+                forced_sync = True
+
+            if attempt < max_attempts:
+                log_cb(
+                    f"Status is {state}; waiting {poll_interval}s before next check..."
+                )
+                time.sleep(poll_interval)
+
+        return False
+
+    if _poll_cycle(f"Waiting for {node_name} to reach SYNCHRONIZED status..."):
+        return True, all_output
+
+    msg = (
+        f"Sync for {node_name} did not reach SYNCHRONIZED after "
+        f"{max_attempts} checks."
+    )
+    log_cb(f"✗ {msg}")
+
+    while wait_for_user:
+        retry = wait_for_user(
+            f"{msg}\n\nClick Retry to keep checking, or Stop to abort."
+        )
+        if not retry:
+            log_cb("User chose to stop.")
+            return False, all_output
+        if _poll_cycle(f"Re-checking sync status for {node_name}..."):
+            return True, all_output
+
+    return False, all_output
 
 
 # ── LKF step ─────────────────────────────────────────────────────
@@ -1024,84 +1601,245 @@ def run_install_lkf(
     all_output = ""
     zip_filename = os.path.basename(lkf_local_path)
 
-    # ── 1. Upload LKF file via SFTP ──────────────────────────────
-    log_cb(f"Uploading LKF file: {zip_filename}...")
-    try:
-        # Upload to /home/shared/<username>/LKF
-        lkf_remote_dir = f"/home/shared/{ssh.username}/LKF"
-        remote_path = ssh.sftp_upload(lkf_local_path, lkf_remote_dir)
-        # Resolve ~ for display (actual path handled by SFTP)
-        all_output += f"[SFTP] Uploaded {zip_filename} → ~/LKF/{zip_filename}\n"
-        log_cb(f"✓ LKF file uploaded to ~/LKF/{zip_filename}")
-    except Exception as exc:
-        msg = f"SFTP upload failed: {exc}"
-        log_cb(f"✗ {msg}")
-        all_output += f"[SFTP] {msg}\n"
-        if wait_for_user:
-            retry = wait_for_user(
-                f"LKF file upload failed: {exc}\n\n"
-                f"Please upload the file manually to ~/LKF/ and click Retry."
+    # ── 0. Fast-path check: is this node's LKF already on SMRS? ─
+    # We open the zip locally (no upload yet) and look for the
+    # per-node XML inside. If a file with the same name is already in
+    # ``<smrs_dir>/<node>/`` on the gateway, the import was done in a
+    # previous run and we can skip straight to ``lkfinstall.py`` —
+    # saves an SFTP upload + a 10-minute lkfimport.py run.
+    target_xml = _find_node_lkf_in_zip(lkf_local_path, node_name)
+    skip_upload_and_import = False
+    if target_xml:
+        log_cb(
+            f"Found LKF XML for {node_name} in zip: {target_xml} "
+            f"(matched non-_info.xml entry)"
+        )
+        try:
+            if _lkf_already_on_smrs(ssh, node_name, target_xml, log_cb):
+                log_cb(
+                    f"✓ LKF already on SMRS for {node_name} — "
+                    "skipping SFTP upload and lkfimport.py."
+                )
+                skip_upload_and_import = True
+                all_output += (
+                    f"[fast-path] LKF {target_xml} already present at "
+                    f"{_SMRS_LICENCE_DIR}/{node_name}/ — skipping import.\n"
+                )
+            else:
+                log_cb(
+                    f"LKF not present at "
+                    f"{_SMRS_LICENCE_DIR}/{node_name}/ — will do full "
+                    "upload + import flow."
+                )
+        except Exception as exc:
+            log_cb(
+                f"(SMRS pre-check failed: {exc}; will do full flow)"
             )
-            if not retry:
-                return False, all_output
-        else:
-            return False, all_output
+    else:
+        log_cb(
+            f"No matching <{node_name}>_*.xml found in {zip_filename} — "
+            "will do full upload + import flow."
+        )
 
-    # ── 2. Import LKF (direct SSH exec — much faster than !python in AMOS) ──
-    log_cb(f"Importing LKF: {zip_filename}...")
-    out = ssh.exec_ssh(
-        f"python {SCRIPTS_PATH}/{_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
-        timeout=600,
-    )
-    all_output += out
-    log_cb(f"lkfimport.py output:\n{out}")
+    if skip_upload_and_import:
+        log_cb("Skipping steps 1 & 2 (upload + import) — fast-path.")
+    else:
+        # ── 1. Upload LKF file via SFTP ──────────────────────────────
+        log_cb(f"Uploading LKF file: {zip_filename}...")
+        try:
+            # Upload to /home/shared/<username>/LKF
+            lkf_remote_dir = f"/home/shared/{ssh.username}/LKF"
+            remote_path = ssh.sftp_upload(lkf_local_path, lkf_remote_dir)
+            # Resolve ~ for display (actual path handled by SFTP)
+            all_output += f"[SFTP] Uploaded {zip_filename} → ~/LKF/{zip_filename}\n"
+            log_cb(f"✓ LKF file uploaded to ~/LKF/{zip_filename}")
+        except Exception as exc:
+            msg = f"SFTP upload failed: {exc}"
+            log_cb(f"✗ {msg}")
+            all_output += f"[SFTP] {msg}\n"
+            if wait_for_user:
+                retry = wait_for_user(
+                    f"LKF file upload failed: {exc}\n\n"
+                    f"Please upload the file manually to ~/LKF/ and click Retry."
+                )
+                if not retry:
+                    return False, all_output
+            else:
+                return False, all_output
+
+        # ── 2. Import LKF (direct SSH exec — much faster than !python in AMOS) ──
+        log_cb(f"Importing LKF: {zip_filename}...")
+        out = ssh.exec_ssh(
+            f"python {_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
+            timeout=600,
+        )
+        all_output += out
+        log_cb(f"lkfimport.py output:\n{out}")
+
+        # Validate the import succeeded BEFORE proceeding to install.
+        # Previously we plowed straight into ``lkfinstall.py`` regardless,
+        # so an import error (corrupt zip, ENM down) showed up as a
+        # confusing "no job name" later instead of a clear import failure.
+        upper_imp = out.upper()
+        import_ok = (
+            "IMPORTED SUCCESSFULLY" in upper_imp
+            or "IMPORT SUCCESSFUL" in upper_imp
+            or "ALREADY EXISTS" in upper_imp     # already imported earlier
+            or "ALREADY IMPORTED" in upper_imp
+        )
+        # Explicit failure markers — but be careful not to false-positive
+        # on harmless lines like "Error description: None".
+        import_failed = bool(
+            re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp)
+            or re.search(r"\bEXCEPTION\b", upper_imp)
+            or "TRACEBACK" in upper_imp
+        )
+        if import_failed and not import_ok:
+            msg = (
+                f"LKF import failed for {zip_filename}.\n"
+                f"Output tail:\n{out[-500:]}"
+            )
+            log_cb(f"✗ {msg}")
+            if wait_for_user:
+                retry = wait_for_user(
+                    f"{msg}\n\nFix the issue (e.g. re-export the LKF, check ENM) "
+                    f"and click Retry, or Stop to abort."
+                )
+                if not retry:
+                    return False, all_output
+                # One re-attempt
+                out = ssh.exec_ssh(
+                    f"python {_LKF_IMPORT} "
+                    f"/home/shared/{ssh.username}/LKF/{zip_filename}",
+                    timeout=600,
+                )
+                all_output += out
+                log_cb(f"Retry import output:\n{out}")
+                upper_imp = out.upper()
+                if (re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp) and
+                        "IMPORTED" not in upper_imp and
+                        "ALREADY" not in upper_imp):
+                    log_cb("✗ Import still failed.")
+                    return False, all_output
+            else:
+                return False, all_output
+        log_cb("✓ LKF imported (or already present in ENM).")
 
     # ── 3. Install LKF — extract job name (direct SSH exec) ──────
     log_cb(f"Installing LKF for {node_name}...")
     out = ssh.exec_ssh(
-        f"python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
+        f"python {_LKF_INSTALL} {node_name}",
         timeout=600,
     )
     all_output += out
     log_cb(f"lkfinstall.py output:\n{out}")
 
-    # Extract job name from output
-    # Expected: "... with job name: Shm_Cli_InstallLicense_USER_TIMESTAMP"
-    job_name = None
-    for line in out.split("\n"):
-        if "job name:" in line.lower():
-            # Get everything after "job name:"
-            parts = line.split("job name:")
-            if len(parts) > 1:
-                job_name = parts[-1].strip()
-                # Clean: take only the first word (no trailing junk)
-                job_name = job_name.split()[0] if job_name else None
-            break
+    # Extract job name with a regex that tolerates case + spacing +
+    # trailing punctuation, e.g.
+    #   "Job started with Job Name : Shm_Cli_InstallLicense_USER_..."
+    #   "with job name:Shm_Cli_..."
+    # The job-name token is a typical Shm_* identifier — we anchor on
+    # that pattern instead of just the label, so a stray "job name:"
+    # label without a value can't capture garbage.
+    JOB_NAME_RE = re.compile(
+        r"job\s*name\s*[:=]?\s*([A-Za-z][A-Za-z0-9_.\-]*)",
+        re.IGNORECASE,
+    )
+    SHM_JOB_RE = re.compile(r"\b(Shm_Cli_InstallLicense_[A-Za-z0-9_.\-]+)\b")
+
+    def _extract_job_name(text: str) -> Optional[str]:
+        # Prefer a labelled match; fall back to a bare Shm_* identifier
+        m = JOB_NAME_RE.search(text)
+        if m:
+            cand = m.group(1).rstrip(".,;:")
+            # Reject obviously bad captures (label echoed without value)
+            if len(cand) >= 4 and cand.lower() != "name":
+                return cand
+        m = SHM_JOB_RE.search(text)
+        if m:
+            return m.group(1)
+        return None
+
+    def _find_existing_install_jobs(text: str) -> list[str]:
+        """Scan ``text`` for ALL ``Shm_Cli_InstallLicense_*`` job IDs.
+
+        ENM job names embed the username + timestamp, so the same node
+        can have multiple historical jobs. We sort lexicographically:
+        the timestamp suffix (``YYYYMMDDHHMMSS`` form) makes sorting
+        equivalent to "most recent last".
+        """
+        ids = SHM_JOB_RE.findall(text)
+        # De-dup while preserving order, then sort to put most-recent last
+        seen: dict[str, None] = {}
+        for j in ids:
+            seen[j] = None
+        return sorted(seen.keys())
+
+    job_name = _extract_job_name(out)
 
     if not job_name:
-        msg = f"Could not extract job name from lkfinstall.py output for {node_name}."
+        # Before bothering the operator (and risking a duplicate
+        # submission), scan EVERYTHING we've collected so far for a
+        # Shm_Cli_InstallLicense_* token. ``lkfinstall.py`` sometimes
+        # prints the job name on a delayed line that the strict
+        # extractor misses — or it appears in a "queued" status line
+        # that doesn't include the literal "job name:" label. If we
+        # find one, we can poll its status directly without re-submit.
+        recovered = _find_existing_install_jobs(all_output)
+        if recovered:
+            # Take the most recent (last after sort) — that's the one
+            # this very lkfinstall.py call just submitted.
+            job_name = recovered[-1]
+            log_cb(
+                f"✓ Recovered job name '{job_name}' from accumulated "
+                "output without re-submitting (avoids duplicate ENM job)."
+            )
+            if len(recovered) > 1:
+                log_cb(
+                    f"  (also saw {len(recovered) - 1} older job(s) in "
+                    f"output; using the most recent)"
+                )
+
+    if not job_name:
+        # Last-resort: still need to re-submit. Warn the operator
+        # explicitly that this MAY create a duplicate if the first
+        # attempt actually did kick off a job in ENM that we just
+        # couldn't see in the output.
+        msg = (
+            f"Could not extract or recover any "
+            f"Shm_Cli_InstallLicense_* job ID for {node_name}.\n\n"
+            f"Last output tail:\n{out[-400:]}"
+        )
         log_cb(f"✗ {msg}")
         if wait_for_user:
             retry = wait_for_user(
-                f"{msg}\n\nCheck the output above. If the install was initiated "
-                f"manually, click Retry to continue to status check."
+                f"{msg}\n\nClicking Retry will RE-SUBMIT the install. "
+                f"Before clicking Retry, please verify in ENM that no "
+                f"existing 'Shm_Cli_InstallLicense_*' job for "
+                f"{node_name} is still running — otherwise you'll end "
+                f"up with two parallel install jobs.\n\n"
+                f"Click Retry to re-submit, or Stop to abort."
             )
             if not retry:
                 return False, all_output
-            # Ask again — maybe user can provide it or it appeared
+            # Operator confirmed re-submit
             out2 = ssh.exec_ssh(
-                f"python {SCRIPTS_PATH}/{_LKF_INSTALL} {node_name}",
+                f"python {_LKF_INSTALL} {node_name}",
                 timeout=300,
             )
             all_output += out2
-            for line in out2.split("\n"):
-                if "job name:" in line.lower():
-                    parts = line.split("job name:")
-                    if len(parts) > 1:
-                        job_name = parts[-1].strip().split()[0]
-                    break
+            log_cb(f"Re-submit output:\n{out2}")
+            job_name = _extract_job_name(out2)
             if not job_name:
-                log_cb("✗ Still no job name found.")
+                # Even after re-submit, last-chance recovery scan
+                recovered2 = _find_existing_install_jobs(all_output)
+                if recovered2:
+                    job_name = recovered2[-1]
+                    log_cb(
+                        f"✓ Recovered job '{job_name}' from re-submit output."
+                    )
+            if not job_name:
+                log_cb("✗ Still no job name found after re-submit.")
                 return False, all_output
         else:
             return False, all_output
@@ -1109,22 +1847,39 @@ def run_install_lkf(
     log_cb(f"✓ Job name: {job_name}")
 
     # ── 4. Poll status until COMPLETED (direct SSH exec) ─────────
+    # Look for the *job's status field* explicitly, not just the
+    # substring "ERROR" anywhere in output. Lines like
+    #     "Error description: None"
+    # used to early-exit the poll with a false fatal-error.
     log_cb(f"Checking LKF installation status for job: {job_name}...")
-    status_cmd = f"python {SCRIPTS_PATH}/{_LKF_STATUS} {job_name}"
+    status_cmd = f"python {_LKF_STATUS} {job_name}"
     max_attempts = 20
     completed = False
+
+    # Real fatal states the LKF status tool prints — anchored to a
+    # status field, not free-text.
+    FATAL_RE = re.compile(
+        r"(?:^|\s)(?:status|state|result)\s*[:=]\s*"
+        r"(failed|failure|error|cancelled|canceled|terminated)\b",
+        re.IGNORECASE,
+    )
+    COMPLETED_RE = re.compile(
+        r"(?:^|\s)(?:status|state|result)\s*[:=]\s*completed\b",
+        re.IGNORECASE,
+    )
 
     for attempt in range(1, max_attempts + 1):
         out = ssh.exec_ssh(status_cmd, timeout=120)
         all_output += out
         log_cb(f"Status check #{attempt}:\n{out}")
 
-        if "COMPLETED" in out:
+        if COMPLETED_RE.search(out) or "COMPLETED" in out.split("\n")[-5:].__str__().upper():
+            # Bias toward the regex match, but accept "COMPLETED" if it
+            # appears near the end of output (last 5 lines).
             completed = True
             break
-        # Early-exit on terminal failure states
-        if "FAILED" in out.upper() or "ERROR" in out.upper():
-            log_cb("Terminal failure detected in LKF status — stopping poll.")
+        if FATAL_RE.search(out):
+            log_cb("Terminal failure detected in LKF status field — stopping poll.")
             break
 
         # Back off: 10s for first 5 attempts, then 20s after
@@ -1177,71 +1932,37 @@ def run_baseline(
     """
     all_output = ""
 
-    # ── 1. Check $rats ───────────────────────────────────────────
-    log_cb("Checking node RAT type (pv $rats)...")
-    out = ssh.run_amos_command_safe("pv $rats", node_name, timeout=30)
-    all_output += out
-    log_cb(f"pv $rats output:\n{out}")
-
-    # Parse $rats value: look for "$rats = L" or "$rats = LN" etc.
-    rats_value = None
-    for line in out.split("\n"):
-        clean = line.strip()
-        if "$rats" in clean and "=" in clean:
-            # e.g. "$rats = LN"
-            val = clean.split("=")[-1].strip()
-            if val:
-                rats_value = val.upper()
-            break
-
-    if not rats_value or rats_value not in BASELINE_MAP:
-        msg = (
-            f"Could not determine RAT type from 'pv $rats' output.\n"
-            f"Got: {rats_value!r}\n"
-            f"Expected one of: L, LN, N"
-        )
-        log_cb(f"✗ {msg}")
-        if wait_for_user:
-            wait_for_user(msg)
-        return False, all_output
-
-    log_cb(f"RAT type detected: $rats = {rats_value}")
-
-    # ── 2. Determine baseline file ───────────────────────────────
-    baseline_file = BASELINE_MAP[rats_value]
-    baseline_path = f"{SCRIPTS_PATH}/{baseline_file}"
+    # Baseline path is configurable so teams can switch script locations
+    # without editing code. Relative values resolve under scripts_path.
+    # ``_BASELINE_SCRIPT`` is already a full absolute path
+    # (``_resolve_script_path`` normalized it at module load).
+    baseline_path = _BASELINE_SCRIPT
     log_cb(f"Baseline file: {baseline_path}")
 
-    # ── 3. List available baseline files so user can verify ──────
-    log_cb("Listing available baseline files on server...")
-    ls_out = ssh.run_amos_command_safe(
-        f"!ls -1 {SCRIPTS_PATH}/Globe_Baseline_*.mos",
-        node_name, timeout=15,
-    )
-    all_output += ls_out
-    log_cb(f"Available baseline files:\n{ls_out}")
-
-    # ── 4. Confirm with user before running ──────────────────────
-    if confirm_baseline:
-        confirmed = confirm_baseline(
-            "Confirm Baseline Script",
-            f"Node: {node_name}\n"
-            f"RAT type: $rats = {rats_value}\n\n"
-            f"Baseline file to run:\n"
-            f"  {baseline_path}\n\n"
-            f"Available files on server:\n{ls_out.strip()}\n\n"
-            f"Is this the correct baseline file?\n"
-            f"If the filename has been updated, cancel and update the script path."
-        )
-        if not confirmed:
-            log_cb("User cancelled baseline execution.")
-            return False, all_output
-
-    # ── 5. Run baseline ──────────────────────────────────────────
+    # ── Run baseline ─────────────────────────────────────────────
+    # Operator's mental model for "baseline done":
+    #   1. We issue ``run <baseline.mos>``.
+    #   2. Baseline fires many set/crn commands; each fills when the
+    #      AMOS prompt is ready for the next one.
+    #   3. The prompt going idle (no more commands being pushed into it)
+    #      for ~10 s = the script has finished its last command.
+    #   4. Then cvls must show a ``Post_Globe_Baseline...`` backup entry.
+    #
+    # ``run_amos_blocking_with_sentinel`` is the deterministic equivalent
+    # of step 3: we queue ``!echo __TRFS_DONE_<nonce>__`` right after
+    # ``run``, so the nonce only prints when moshell is actually back at
+    # an AMOS prompt with nothing queued. We then additionally require
+    # 10 s of channel silence (``quiet_after=10.0``) — matching the
+    # operator's manual rule and guarding against any trailing prompt
+    # redraw or ANSI noise.
     log_cb(f"Running baseline: run {baseline_path}")
-    out = ssh.run_amos_command_safe(
+    log_cb(
+        "(sentinel + 10s idle quiescence; baseline can run 30-60 min — "
+        "heartbeat every 60s shows it's still alive)"
+    )
+    out = ssh.run_amos_blocking_with_sentinel(
         f"run {baseline_path}",
-        node_name, timeout=600,  # baselines can take a while
+        node_name, timeout=3600, quiet_after=10.0,
     )
     all_output += out
     log_cb(f"Baseline output:\n{out}")
@@ -1306,8 +2027,9 @@ def run_uri_setting(
          password cleartext=true,password=
 
     Bash commands (via ! prefix in AMOS):
-      4. curl login to get cookie
-      5. curl POST to updateUpMoFtpServerDetails with node name
+      4. Ensure node is SYNCHRONIZED
+      5. curl login to get cookie
+      6. curl POST to updateUpMoFtpServerDetails with node name
 
     Both curl commands must return "SUCCESS" to pass.
 
@@ -1316,11 +2038,60 @@ def run_uri_setting(
     """
     all_output = ""
 
-    # ── 1-3. AMOS set commands (each requires y/n confirmation) ─
+    # ── 1. Detect the current UpgradePackage ID ─────────────────
+    # The package ID is not constant across nodes (e.g. ``CXP2010174/2-
+    # R42H05`` on some, ``CXP2010174/2-R42G13`` on others). We used to
+    # hard-code one from config, which silently broke nodes running a
+    # different package. Now we ``pr UpgradePackage`` and parse the
+    # actual ID off the printed MO line.
+    log_cb(f"Detecting UpgradePackage on {node_name}...")
+    pr_out = ssh.run_amos_command_safe(
+        "pr UpgradePackage", node_name, timeout=30,
+    )
+    all_output += pr_out
+    log_cb(f"pr UpgradePackage output:\n{pr_out}")
+
+    # Lines look like:
+    #   1234 UNLOCKED  ENABLED  SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42G13
+    # We capture the ID token after ``UpgradePackage=``. The token can
+    # include letters, digits, ``/``, ``-`` and ``.`` — anything up to
+    # whitespace or end-of-line.
+    pkg_re = re.compile(r"UpgradePackage=([A-Za-z0-9_/\-.]+)")
+    detected = pkg_re.findall(pr_out)
+
+    # De-duplicate while preserving order. Most nodes list one
+    # UpgradePackage; if more than one shows up we prefer the LAST
+    # one (typically the current/active package after an upgrade —
+    # older packages tend to be printed first).
+    seen: dict[str, None] = {}
+    for pid in detected:
+        seen[pid] = None
+    detected_unique = list(seen.keys())
+
+    if not detected_unique:
+        msg = (
+            f"Could not detect any UpgradePackage on {node_name} from "
+            f"'pr UpgradePackage'. Falling back to config default "
+            f"'{_UPGRADE_PKG_ID}' (may not match this node)."
+        )
+        log_cb(f"⚠ {msg}")
+        upgrade_pkg_id = _UPGRADE_PKG_ID
+    else:
+        upgrade_pkg_id = detected_unique[-1]
+        if len(detected_unique) == 1:
+            log_cb(f"✓ Detected UpgradePackage: {upgrade_pkg_id}")
+        else:
+            log_cb(
+                f"✓ Found {len(detected_unique)} UpgradePackages "
+                f"({', '.join(detected_unique)}); using most recent: "
+                f"{upgrade_pkg_id}"
+            )
+
+    # ── 2-4. AMOS set commands (each requires y/n confirmation) ─
     amos_cmds = [
         "set SwM=1 defaultUri",
-        f"set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} uri",
-        f"set SystemFunctions=1,SwM=1,UpgradePackage={_UPGRADE_PKG_ID} "
+        f"set SystemFunctions=1,SwM=1,UpgradePackage={upgrade_pkg_id} uri",
+        f"set SystemFunctions=1,SwM=1,UpgradePackage={upgrade_pkg_id} "
         "password cleartext=true,password=",
     ]
 
@@ -1330,20 +2101,82 @@ def run_uri_setting(
         all_output += out
         log_cb(f"Output:\n{out}")
 
-    # ── 4. curl login to get cookie ─────────────────────────────
+    # ENM needs a few seconds to commit set-changes into its internal
+    # model before ``updateUpMoFtpServerDetails`` will see them. Without
+    # this small wait the curl POST sometimes runs against a stale view
+    # and returns failure even though the AMOS sets succeeded.
+    log_cb("Pausing 3 s for ENM to commit URI/SwM/UpgradePackage changes…")
+    time.sleep(3)
+
+    # ── 4. Ensure node is SYNCHRONIZED before ENM curl calls ────
+    sync_ok, sync_output = _ensure_node_synchronized(
+        ssh,
+        node_name,
+        log_cb,
+        wait_for_user=wait_for_user,
+        poll_interval=5,
+        max_attempts=60,
+    )
+    all_output += sync_output
+    if not sync_ok:
+        return False, all_output
+
+    # ── 5. curl login to get cookie ─────────────────────────────
+    # Cookie filename includes the node name so concurrent multi-node
+    # runs don't clobber each other's session. Previously every node
+    # wrote to ``./cookie.txt`` and the last login won, causing random
+    # "session timeout" failures on the other nodes' curl POST.
+    safe_node = re.sub(r"[^A-Za-z0-9._-]", "_", node_name)
+    cookie_file = f"./cookie_{safe_node}.txt"
+
+    # Track the cookie path for end-of-step cleanup so each run
+    # doesn't leave a stale cookie behind on the gateway. The bare
+    # ``cookie_<NODE>.txt`` in the user's home folder is what we want
+    # to remove. Path is resolved at cleanup time, not here.
+    def _cleanup_cookie():
+        # ``cookie_file`` starts with ``./`` — strip and prefix the
+        # SSH user's home so SFTP can find the absolute path.
+        try:
+            bare = cookie_file.lstrip("./").lstrip("/")
+            abs_path = f"/home/shared/{ssh.username}/{bare}"
+            ssh.sftp_remove(abs_path)
+        except Exception:
+            pass
     login_cmd = (
-        f'!curl --insecure --request POST '
+        f'!curl --insecure --silent --show-error --max-time 30 '
+        f'--request POST '
         f'--data "IDToken1={enm_username}" '
         f'--data "IDToken2={enm_password}" '
-        f'--cookie-jar ./cookie.txt {ENM_LOGIN_URL}'
+        f'--cookie-jar {cookie_file} {ENM_LOGIN_URL}'
     )
+
+    def _is_login_ok(login_output: str) -> bool:
+        """Accept any of the success indicators ENM has used over time
+        (string varies between releases / locales)."""
+        upper = login_output.upper()
+        return (
+            "AUTHENTICATION SUCCESSFUL" in upper
+            or '"SUCCESS"' in upper
+            or '"STATUS":"OK"' in upper
+            or '"CODE":200' in upper
+            or "AUTHENTICATED" in upper
+        )
+
     log_cb("Logging in to ENM (curl)...")
     out = ssh.run_amos_command_safe(login_cmd, node_name, timeout=60)
     all_output += out
     log_cb(f"Login output:\n{out}")
 
-    # Check for "Authentication Successful"
-    if "Authentication Successful" not in out and "SUCCESS" not in out.upper():
+    if not _is_login_ok(out):
+        # One automatic retry before bothering the operator — ENM
+        # SSO occasionally returns 503 on first request after idle.
+        log_cb("Login response unclear; auto-retrying once…")
+        time.sleep(2)
+        out = ssh.run_amos_command_safe(login_cmd, node_name, timeout=60)
+        all_output += out
+        log_cb(f"Login retry output:\n{out}")
+
+    if not _is_login_ok(out):
         msg = f"ENM login failed for URI setting.\nOutput: {out[:300]}"
         log_cb(f"✗ {msg}")
         if wait_for_user:
@@ -1355,20 +2188,20 @@ def run_uri_setting(
             # Retry login
             out = ssh.run_amos_command_safe(login_cmd, node_name, timeout=60)
             all_output += out
-            if "Authentication Successful" not in out and \
-                    "SUCCESS" not in out.upper():
+            if not _is_login_ok(out):
                 log_cb("✗ Login still failed after retry.")
                 return False, all_output
         else:
             return False, all_output
 
-    log_cb("✓ ENM login successful.")
+    log_cb(f"✓ ENM login successful (cookie: {cookie_file}).")
 
-    # ── 5. curl POST to update URI FTP server details ───────────
+    # ── 6. curl POST to update URI FTP server details ───────────
     update_cmd = (
-        f"!curl --insecure --request POST "
+        f"!curl --insecure --silent --show-error --max-time 60 "
+        f"--request POST "
         f"'{ENM_URI_UPDATE_URL}' "
-        f"--cookie cookie.txt "
+        f"--cookie {cookie_file} "
         f'-H "Content-Type: application/json" '
         f"-d '[\"{{nodeName}}\"]'"
     ).replace("{nodeName}", node_name)
@@ -1401,6 +2234,7 @@ def run_uri_setting(
     if api_ok and uri_ok:
         log_cb(f"✓ URI setting completed for {node_name}.")
         log_cb(f"  uri = {uri_value}")
+        _cleanup_cookie()
         return True, all_output
 
     msg = (
@@ -1413,12 +2247,16 @@ def run_uri_setting(
     if wait_for_user:
         retry = wait_for_user(f"{msg}\n\nCheck manually and click Retry.")
         if not retry:
+            _cleanup_cookie()
             return False, all_output
         # Retry: re-run curl update + re-verify
         out = ssh.run_amos_command_safe(update_cmd, node_name, timeout=60)
         all_output += out
+        log_cb(f"Retry update output:\n{out}")
+        retry_api_ok = "SUCCESS" in out.upper()
         vout = ssh.run_amos_command_safe("get depack", node_name, timeout=60)
         all_output += vout
+        log_cb(f"Retry get depack output:\n{vout}")
         uri_value = ""
         for line in vout.splitlines():
             s = line.strip()
@@ -1427,10 +2265,16 @@ def run_uri_setting(
                 if len(parts) > 1:
                     uri_value = parts[1].strip()
                 break
-        if uri_value.startswith("sftp://mm-software@"):
+        if retry_api_ok and uri_value.startswith("sftp://mm-software@"):
             log_cb(f"✓ URI verified on retry: {uri_value}")
+            _cleanup_cookie()
             return True, all_output
-        log_cb(f"✗ URI still not valid on retry: {uri_value or '(empty)'}")
+        log_cb(
+            "✗ URI still not valid on retry: "
+            f"update SUCCESS? {retry_api_ok}, "
+            f"uri = {uri_value or '(empty)'}"
+        )
+    _cleanup_cookie()
     return False, all_output
 
 
@@ -1572,6 +2416,57 @@ def run_relation(
     all_output = ""
     filename = os.path.basename(relation_local_path)
     is_xml = filename.lower().endswith(".xml")
+
+    # ── 0. Pre-step: set + verify SystemConstant 4631:1 ──────────
+    # Some baselines don't include this SC, but the neighbour relation
+    # scripts rely on it. Set it once at the top of the relation step,
+    # then verify with ``scg`` — we look for a line like
+    #     default     4631:1
+    # in the "Namespace   SystemConstants" block. ``scw`` may or may
+    # not prompt for y/n depending on moshell version, so we use
+    # ``run_amos_set_with_confirm`` which handles both transparently.
+    log_cb("Setting SystemConstant 4631:1 (pre-relation step)...")
+    sc_out = ssh.run_amos_set_with_confirm(
+        "scw 4631:1", node_name, answer="y", timeout=60,
+    )
+    all_output += sc_out
+    log_cb(f"scw 4631:1 output:\n{sc_out}")
+
+    log_cb("Verifying with 'scg'...")
+    scg_out = ssh.run_amos_command_safe("scg", node_name, timeout=30)
+    all_output += scg_out
+    log_cb(f"scg output:\n{scg_out}")
+
+    # Look for "default<whitespace>4631:1" — the line from the
+    # "Namespace   SystemConstants" block. Word boundary at the end
+    # to avoid matching ``4631:10`` etc.
+    sc_re = re.compile(r"^\s*default\s+4631:1\s*$", re.MULTILINE)
+    sc_ok = bool(sc_re.search(scg_out))
+    if not sc_ok:
+        msg = (
+            f"SystemConstant 4631:1 not visible in 'scg' output for "
+            f"{node_name}. Expected a line like 'default     4631:1' "
+            f"in the SystemConstants namespace block."
+        )
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(
+                f"{msg}\n\nIf you've already set this manually, click "
+                f"Retry to re-verify with 'scg'. Click Stop to abort "
+                f"the relation step."
+            )
+            if not retry:
+                return False, all_output
+            scg_out2 = ssh.run_amos_command_safe("scg", node_name, timeout=30)
+            all_output += scg_out2
+            log_cb(f"Re-check scg output:\n{scg_out2}")
+            if not sc_re.search(scg_out2):
+                log_cb("✗ SystemConstant 4631:1 still not visible after retry.")
+                return False, all_output
+        else:
+            return False, all_output
+
+    log_cb("✓ SystemConstant 4631:1 confirmed in 'scg' output.")
 
     # ── 1. Upload relation file via SFTP ─────────────────────────
     remote_dir = f"/home/shared/{ssh.username}/RELATION/{shortcode}"
@@ -1806,13 +2701,92 @@ def _run_relation_zip(
 
     # Run the whole batch in one moshell call; capture full live terminal
     # output (includes NODE> prompts, [Proxy ID = ...] lines, crn blocks).
+    #
+    # Critical: use ``run_amos_blocking_with_sentinel`` — the batch script
+    # we generate chains ``l+``, ``run <file>``, ``l-`` for every relation
+    # file, and each of those can cause moshell to print a transient
+    # ``NODE>`` prompt that ``_read_until_amos`` would wrongly accept as
+    # "done". The sentinel (``!echo __TRFS_DONE_<nonce>__``) is queued
+    # immediately after the ``run`` command so it only prints once the
+    # batch actually finished — i.e. we never mark relation OK early.
     log_cb(f"Running all {len(txt_files)} relation files in one batch...")
-    batch_timeout = max(900, len(txt_files) * 120)
-    batch_out = ssh.run_amos_command_safe(
+    batch_timeout = max(3600, len(txt_files) * 300)
+    log_cb(
+        f"(sentinel + 10s idle quiescence; timeout={batch_timeout}s, "
+        "heartbeat every 60s)"
+    )
+    batch_out = ssh.run_amos_blocking_with_sentinel(
         f"run {batch_script}", node_name, timeout=batch_timeout,
+        quiet_after=10.0,
     )
     all_output += batch_out
     log_cb(f"Batch run completed ({len(batch_out)} bytes of live output).")
+
+    # ── Sanity check: did any of the relation scripts ACTUALLY run? ──
+    # Without this, an empty batch_out (because ``run <batch>``
+    # failed: bad path, moshell couldn't open it, all scripts errored
+    # at the load stage, etc.) would still flow through the parser
+    # and produce "0 errors, 0 failures" → step shows as success even
+    # though zero scripts ran. The signal we trust is the count of
+    # ``run /path/<file>.txt`` echo lines that moshell prints when
+    # it starts executing each script — one per file in the batch.
+    run_marker_count = 0
+    for tp in txt_files:
+        # Each l+/run/l- block in the batch produces at least one
+        # ``> run /path/<file>.txt`` echo. Tolerate prompt prefix +
+        # whitespace variations; tp is an absolute Unix path.
+        pat = re.compile(
+            r"(?m)^(?:.*?>\s*)?run\s+" + re.escape(tp) + r"\s*$"
+        )
+        if pat.search(batch_out):
+            run_marker_count += 1
+
+    if run_marker_count == 0:
+        msg = (
+            f"Relation batch produced no 'run <file>.txt' markers — "
+            f"none of the {len(txt_files)} script(s) actually executed. "
+            f"This usually means moshell failed to open the batch "
+            f"script ({batch_script}) or every file errored at load. "
+            f"Batch output tail:\n{batch_out[-600:]}"
+        )
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            retry = wait_for_user(
+                f"Relation step FAILED — no scripts actually ran for "
+                f"{node_name}.\n\n"
+                f"Check the batch output, fix the issue (path / "
+                f"permissions / corrupt zip / wrong node folder) and "
+                f"click Retry to re-run, or Stop to abort."
+            )
+            if not retry:
+                return False, all_output
+            # Retry the batch run once
+            log_cb("Re-running batch script after operator confirmation…")
+            batch_out2 = ssh.run_amos_blocking_with_sentinel(
+                f"run {batch_script}", node_name, timeout=batch_timeout,
+                quiet_after=10.0,
+            )
+            all_output += batch_out2
+            batch_out = batch_out2  # use re-run output downstream
+            run_marker_count = 0
+            for tp in txt_files:
+                pat = re.compile(
+                    r"(?m)^(?:.*?>\s*)?run\s+" + re.escape(tp) + r"\s*$"
+                )
+                if pat.search(batch_out):
+                    run_marker_count += 1
+            if run_marker_count == 0:
+                log_cb(
+                    "✗ Re-run also produced 0 run markers — aborting."
+                )
+                return False, all_output
+        else:
+            return False, all_output
+
+    log_cb(
+        f"Sanity check OK: {run_marker_count}/{len(txt_files)} "
+        f"scripts started executing (counted 'run <file>.txt' markers)."
+    )
 
     # Register each server-side per-file .log for later download to
     # MOSHELL/RELATION/ (isolated so other steps' logs don't mix in).
@@ -1832,30 +2806,74 @@ def _run_relation_zip(
     except Exception as exc:
         log_cb(f"Failed to save full session log: {exc}")
 
-    # ── 6. Split the live output into per-file sections ─────────
-    # Each file's section starts at a line like: "run /path/to/XX_File.txt"
-    # and ends right before the next "run /path/..." or end-of-output.
-    file_sections: dict[str, str] = {}
+    # ── 6. Build per-file logs ──────────────────────────────────
+    # Source of truth is the **server-side ``l+ <file>.log``** that moshell
+    # produces around each ``run <file>`` in the batch — one .log per .txt,
+    # isolated by moshell itself. We SFTP-download those directly.
+    #
+    # We previously split the combined session output via regex on
+    # ``run <path>`` markers, but that was unreliable: when moshell's
+    # echo of the command didn't exactly match (ANSI noise, wrapped line,
+    # different prompt prefix) the marker missed and the fallback
+    # ``setdefault(tp, batch_out)`` assigned the *entire* batch text to
+    # that file — which is why script #11's log sometimes showed script
+    # #04's content. Downloading the per-file ``.log`` eliminates that.
     sorted_txt_files = sorted(txt_files)
-    # Build regex matching any `run <path>` start-of-line
-    import re as _re
-    markers = []
+    file_sections: dict[str, str] = {}
+
+    log_cb(
+        f"Downloading {len(sorted_txt_files)} per-file server log(s) "
+        "(l+/l- isolates each run)..."
+    )
+    missing_on_server: list[str] = []
     for tp in sorted_txt_files:
-        # Match lines containing "run <path>" (prompt prefix optional)
-        pattern = _re.compile(
-            r"(?m)^(?:.*?>\s*)?run\s+" + _re.escape(tp) + r"\s*$"
+        remote_log = f"{tp}.log"
+        local_tmp = os.path.join(
+            log_dir, f"_tmp_{os.path.basename(remote_log)}"
         )
-        m = pattern.search(batch_out)
-        markers.append((m.start() if m else -1, tp))
-    # Sort by position in output (skip missing)
-    found = [(pos, tp) for pos, tp in markers if pos >= 0]
-    found.sort()
-    for i, (pos, tp) in enumerate(found):
-        end = found[i + 1][0] if i + 1 < len(found) else len(batch_out)
-        file_sections[tp] = batch_out[pos:end]
-    # Fallback: any txt file with no marker gets the full batch output
-    for tp in sorted_txt_files:
-        file_sections.setdefault(tp, batch_out)
+        try:
+            ssh.sftp_download(remote_log, local_tmp)
+            with open(local_tmp, "r", encoding="utf-8", errors="replace") as fr:
+                file_sections[tp] = fr.read()
+            try:
+                os.remove(local_tmp)
+            except Exception:
+                pass
+        except Exception as exc:
+            log_cb(
+                f"  ! No server-side log for {os.path.basename(tp)} "
+                f"({exc}); will try session split."
+            )
+            missing_on_server.append(tp)
+
+    # Fallback for files whose server-side .log didn't exist (e.g. moshell
+    # crashed mid-batch, filesystem error). Use a TIGHT per-file regex
+    # split of the combined batch output — never a full-batch fallback,
+    # which is what caused cross-file contamination before.
+    if missing_on_server:
+        import re as _re
+        markers = []
+        for tp in sorted_txt_files:
+            pattern = _re.compile(
+                r"(?m)^(?:.*?>\s*)?run\s+" + _re.escape(tp) + r"\s*$"
+            )
+            m = pattern.search(batch_out)
+            markers.append((m.start() if m else -1, tp))
+        found = sorted([(pos, tp) for pos, tp in markers if pos >= 0])
+        for i, (pos, tp) in enumerate(found):
+            end = found[i + 1][0] if i + 1 < len(found) else len(batch_out)
+            if tp in missing_on_server:
+                file_sections[tp] = batch_out[pos:end]
+        # Any file still missing → explicit placeholder, NOT full batch.
+        for tp in sorted_txt_files:
+            if tp not in file_sections:
+                file_sections[tp] = (
+                    f"[NO LOG AVAILABLE]\n"
+                    f"Neither the server-side l+/l- log ({tp}.log) nor a\n"
+                    f"'run {tp}' marker was found in the batch session output.\n"
+                    f"This usually means moshell skipped this file or the\n"
+                    f"batch terminated before reaching it.\n"
+                )
 
     errors_summary: list[str] = []
     file_summaries: list[str] = []
@@ -1865,7 +2883,15 @@ def _run_relation_zip(
         local_path = os.path.join(log_dir, local_name)
 
         file_output = file_sections.get(txt_path, "")
-        log_cb(f"[{i}/{len(sorted_txt_files)}] Saving log for {txt_name}...")
+        source = (
+            "server l+ log"
+            if txt_path not in missing_on_server
+            else "session split (fallback)"
+        )
+        log_cb(
+            f"[{i}/{len(sorted_txt_files)}] Saving log for {txt_name} "
+            f"[{source}]..."
+        )
         try:
             with open(local_path, "w", encoding="utf-8") as f:
                 f.write(file_output)
@@ -1967,6 +2993,7 @@ def run_sgw_check(
     """
     import re
     all_output = ""
+    command_output = ""
 
     remote_log = f"/home/shared/{ssh.username}/SGW_Check_{node_name}.log"
 
@@ -1977,21 +3004,43 @@ def run_sgw_check(
     if node_type == "gsm":
         targets = gsm_ping_targets or ["10.14.194.131"]
         for ip in targets:
-            cmd = (
-                f"mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,"
-                f"AddressIPv4=1 ping -c 5 {ip}"
-            )
-            log_cb(f"  $ {cmd}")
-            # mcc emits a "[y/n]" confirmation prompt — auto-answer 'y'
-            out = ssh.run_amos_command_autoyes(cmd, timeout=180)
-            all_output += out
+            gsm_cmds = [
+                (
+                    "Abis",
+                    f"mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,"
+                    f"AddressIPv4=1 ping -c 5 {ip}",
+                ),
+                (
+                    "Traffic",
+                    f"mcc Transport=1,Router=Abis,InterfaceIPv4=Traffic,"
+                    f"AddressIPv4=1 ping -c 5 {ip}",
+                ),
+            ]
+
+            for idx, (iface_name, cmd) in enumerate(gsm_cmds, start=1):
+                log_cb(f"  $ {cmd}")
+                # mcc emits a "[y/n]" confirmation prompt — auto-answer 'y'
+                out = ssh.run_amos_command_autoyes(cmd, timeout=180)
+                all_output += out
+
+                # Some GSM nodes expose the ping MO only on Traffic. If Abis
+                # returns zero MOs, fall back to the Traffic interface.
+                if "Total: 0 MOs" in out and idx < len(gsm_cmds):
+                    log_cb(
+                        f"No MO found on InterfaceIPv4={iface_name}; "
+                        f"retrying with InterfaceIPv4={gsm_cmds[idx][0]}..."
+                    )
+                    continue
+
+                break
+        command_output = all_output
     else:
-        out = ssh.run_amos_command_safe(
-            f"run {SCRIPTS_PATH}/{_SGW_CHECK_MOS}", node_name, timeout=900,
+        command_output = ssh.run_amos_command_safe(
+            f"run {_SGW_CHECK_MOS}", node_name, timeout=900,
         )
-        all_output += out
+        all_output += command_output
     ssh.run_amos_command_safe("l-", node_name, timeout=15)
-    log_cb(f"SGW_Check output ({len(out)} bytes).")
+    log_cb(f"SGW_Check output ({len(command_output)} bytes).")
 
     # Register for MOSHELL/ download
     ssh.register_remote_log(remote_log)
@@ -1999,7 +3048,7 @@ def run_sgw_check(
     # Parse ping blocks. A "ping <ip>" command appears, then later the
     # stats line "N packets transmitted, M received, K% packet loss, ..."
     # Failure = received=0  OR  100% packet loss  OR  Destination unreachable
-    lines = out.split("\n")
+    lines = command_output.split("\n")
     current_ip: Optional[str] = None
     results: list[tuple[str, bool]] = []  # (ip, ok)
     seen_ips: set[str] = set()
@@ -2286,18 +3335,37 @@ def run_take_dump(
     log_cb(f"dcgk output:\n{out}")
 
     # ── 2. Parse output for the log path ────────────────────────
+    # ``dcgk`` output varies a bit between LTE/NR and GSM. Common
+    # forms we've seen (case differs, path prefix differs):
+    #   "dcg completed successfully, logs stored in /ericsson/log/..."
+    #   "Logs stored in /home/shared/<user>/.../dcg/<node>/<ts>"
+    #   "DCG completed; output: /opt/ericsson/.../dcg/<node>/..."
+    # Strategy: scan every line for an absolute Unix path that
+    # contains ``dcg`` somewhere (case-insensitive). That catches both
+    # ``/ericsson/.../dcg/...`` and ``/home/.../dcg/...`` without
+    # needing to hard-code the prefix.
     dcg_path = None
     for line in out.split("\n"):
-        if "dcg completed successfully" in line.lower() or "logs stored in" in line.lower():
-            # Extract path after "logs stored in "
-            idx = line.find("/ericsson/")
-            if idx != -1:
-                dcg_path = line[idx:].strip()
-                break
-            # Also try "in /" pattern
-            idx = line.find("in /")
-            if idx != -1:
-                dcg_path = line[idx + 3:].strip()
+        low = line.lower()
+        if (
+            "dcg completed" in low
+            or "logs stored in" in low
+            or "stored in" in low
+            or "/dcg/" in low
+        ):
+            # Find the FIRST absolute path on this line
+            idx = line.find("/")
+            while idx != -1:
+                # Path token = run until whitespace or end of line
+                end = idx
+                while end < len(line) and not line[end].isspace():
+                    end += 1
+                candidate = line[idx:end].strip().rstrip(".,;:)")
+                if "/dcg/" in candidate.lower() and candidate.startswith("/"):
+                    dcg_path = candidate
+                    break
+                idx = line.find("/", idx + 1)
+            if dcg_path:
                 break
 
     if not dcg_path:
@@ -2644,6 +3712,104 @@ def run_take_cm_dump(
 
 
 # ── PM Measurement step ─────────────────────────────────────────
+# ── External Alarm step ──────────────────────────────────────────
+_EXTERNAL_ALARM_TEMPLATE = _resolve_script_path(_CFG.get(
+    "external_alarm_template",
+    "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
+))
+
+
+def run_external_alarm(
+    ssh: IntegrationSSH,
+    node_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Pre-define External Alarm — install the AlarmPort template on
+    the primary BB and verify with ``st alarmport``.
+
+    Sub-steps:
+      1. ``run <template>`` — drives a moshell ``run`` of
+         ``External_Alarm_Template.txt`` which creates the 8
+         AlarmPort MOs under ``Equipment=1,FieldReplaceableUnit=BB-1``.
+         Sentinel + 5 s quiescence so the verify command only runs
+         once the template script truly finished.
+      2. ``st alarmport`` — expect ``Total: 8 MOs`` in output. If the
+         count is anything else, prompt the operator to fix manually
+         (typical cause: missing or wrong external alarm hardware).
+
+    Args:
+        ssh:           Active SSH session, already inside AMOS for
+                       ``node_name``.
+        node_name:     The primary LTE/NR node DN (caller is
+                       responsible for skipping this step on lte2/gsm
+                       via the ``applies_to="lte_primary"`` scope).
+        log_cb:        Detail-log callback.
+        wait_for_user: Optional retry prompt.
+
+    Returns:
+        (success: bool, full_output: str)
+    """
+    all_output = ""
+
+    # ── 1. Run the External_Alarm_Template.txt ──────────────────
+    log_cb(
+        f"Running External_Alarm_Template.txt on {node_name}: "
+        f"{_EXTERNAL_ALARM_TEMPLATE}"
+    )
+    log_cb("(sentinel + 5s idle quiescence; usually finishes in <60 s)")
+    out = ssh.run_amos_blocking_with_sentinel(
+        f"run {_EXTERNAL_ALARM_TEMPLATE}",
+        node_name, timeout=600, quiet_after=5.0,
+    )
+    all_output += out
+    log_cb(f"External_Alarm_Template.txt output:\n{out}")
+
+    # ── 2. Verify with st alarmport — expect "Total: 8 MOs" ─────
+    def _verify_once() -> tuple[bool, str, Optional[int]]:
+        """Run ``st alarmport`` once and parse the total count. Returns
+        ``(ok, raw_output, count_or_None)``."""
+        v = ssh.run_amos_command_safe("st alarmport", node_name, timeout=30)
+        m = re.search(r"Total:\s*(\d+)\s*MOs", v)
+        count = int(m.group(1)) if m else None
+        return (count == 8), v, count
+
+    log_cb("Verifying with 'st alarmport' (expecting 8 AlarmPort MOs)...")
+    ok, verify_out, count = _verify_once()
+    all_output += verify_out
+    log_cb(f"st alarmport output:\n{verify_out}")
+
+    if ok:
+        log_cb(f"✓ External Alarm verified — Total: 8 MOs on {node_name}.")
+        return True, all_output
+
+    # ── Retry loop via wait_for_user ────────────────────────────
+    while not ok:
+        msg = (
+            f"External Alarm verification failed for {node_name}.\n"
+            f"Expected 'Total: 8 MOs' from 'st alarmport', got "
+            f"{'(no Total line in output)' if count is None else f'Total: {count} MOs'}."
+        )
+        log_cb(f"✗ {msg}")
+        if not wait_for_user:
+            return False, all_output
+        retry = wait_for_user(
+            f"{msg}\n\nIf you've fixed the hardware / re-run the "
+            f"template manually, click Retry to re-verify with "
+            f"'st alarmport'. Click Stop to abort."
+        )
+        if not retry:
+            log_cb("User chose to stop the External Alarm verification.")
+            return False, all_output
+        log_cb("Re-checking 'st alarmport'...")
+        ok, verify_out, count = _verify_once()
+        all_output += verify_out
+        log_cb(f"Re-check output:\n{verify_out}")
+
+    log_cb(f"✓ External Alarm verified — Total: 8 MOs on {node_name}.")
+    return True, all_output
+
+
 def run_pm_measurement(
     ssh: IntegrationSSH,
     node_name: str,

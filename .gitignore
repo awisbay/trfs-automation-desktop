@@ -1,18 +1,77 @@
+# ── Virtual envs / Python ────────────────────────────────────
 .venv/
 venv/
 __pycache__/
 *.pyc
+
+# ── OS / IDE ─────────────────────────────────────────────────
 .DS_Store
-*.xlsx
+.idea/
+.vscode/
+.claude/worktrees/
+
+# ── Build artifacts ──────────────────────────────────────────
+dist/
+build/
+*.spec
+# Track the canonical build recipe — exception to the *.spec rule.
+!NodeCraft.spec
+# Pre-bundled Flet client zip is 38 MB; regenerate locally with
+# the cached client at ~/.flet/client/ (see NodeCraft.spec).
+build_assets/
+
+# ── Operational outputs (logs, parsed data, screenshots) ─────
+LOG/
+logs/
 output/
 screenshots/
 trfs_automation.log
-*.spec
-dist/
-build/
+alarm_test.log
+trfs_sim.log
+REL_PARSED/
+
+# ── Operator-specific input files ────────────────────────────
+# Site-specific commands files / LKF zips / relation zips that
+# operators drop into the project root — don't track these.
+LKF_*.zip
+LKF_COMBINED/
+NBR_*.zip
+SSP*.zip
+TRFS commands_*.txt
+
+# Reports / spreadsheets generated locally
+*.xlsx
+
+# ── Secrets ──────────────────────────────────────────────────
+# Private signing key for license generator — NEVER push.
+nodecraft_keygen.py
+# A signed license file (per-user) — also do not push.
+license.key
+
+# ── App config with credentials ──────────────────────────────
+# config.yaml has SSH host + password — must stay local.
 config.yaml
 .session.json
 src/.session.json
-logs/
-nodecraft_keygen.py
-license.key
+
+# ── Misc release artifacts ───────────────────────────────────
+release/
+img/
+
+# ── Local dev / test / simulation scripts ────────────────────
+# These are operator-personal helper scripts. Some have
+# hardcoded SSH passwords (run_trfs_sim.py, run_uri_cli.py) or
+# BSC service-account credentials (test_pim_gsm_bsc.py) — they
+# must NEVER be committed.
+run_trfs_sim.py
+run_alarm_test.py
+run_uri_cli.py
+run_lkf_cli.py
+run_relation_cli.py
+run_relation_zip_cli.py
+run_sgw_check_cli.py
+test_pim_gsm_bsc.py
+test_switch_node.py
+test_three_nodes_enm_real.py
+test_three_nodes_full.py
+test_two_nodes_full.py

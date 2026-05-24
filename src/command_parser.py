@@ -1,8 +1,11 @@
 """
 Parse TRFS commands.txt into structured data organized by band and category.
 """
+import logging
 import re
 from typing import Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 # Mapping from header text in commands.txt to internal band key
@@ -127,3 +130,21 @@ def get_all_bands() -> List[str]:
 def get_moshell_categories() -> List[str]:
     """Return list of moshell command categories (non-ENM)."""
     return list(CATEGORY_PATTERNS.values())
+
+
+def filter_gsm_pim(band: str, commands_by_category: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Remove PIM category from GSM bands (PIM requires BSC access not yet available).
+
+    Args:
+        band: Band key (e.g., "G900")
+        commands_by_category: Dict of category -> list of commands
+
+    Returns:
+        Filtered dict with PIM removed for GSM bands.
+    """
+    if not band.upper().startswith("G"):
+        return commands_by_category
+    filtered = {k: v for k, v in commands_by_category.items() if k != "PIM"}
+    if "PIM" in commands_by_category:
+        logger.info(f"[{band}] PIM skipped — GSM PIM requires BSC access (not yet available)")
+    return filtered

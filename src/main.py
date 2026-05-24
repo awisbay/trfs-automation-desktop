@@ -15,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from app_path import get_app_dir
-from config_loader import load_config, get_full_path, AppConfig, _apply_shortcode_paths
-from command_parser import parse_commands_file, get_moshell_categories
+from config_loader import load_config, get_full_path, AppConfig, _apply_shortcode_paths, create_node_config
+from command_parser import parse_commands_file, get_moshell_categories, filter_gsm_pim
 from ssh_runner import MoshellSession
 from terminal_renderer import render_terminal_screenshot, render_multi_command_screenshot
 from excel_writer import create_band_excel, insert_screenshots_for_band
@@ -28,7 +28,8 @@ from enm_capture import (
     capture_shm_software_administration_screenshot,
     EnmBrowserSession,
 )
-from sdir_capture import capture_shared_sdir_screenshot
+from sdir_capture import capture_shared_sdir_screenshot, capture_sdir_for_node, run_band_detection_commands, run_node_setup
+from band_detector import detect_bands_from_sdir, detect_bands_from_hgetc, get_node_bands_from_sdir_map
 
 # Setup logging
 os.makedirs(os.path.join(get_app_dir(), "logs"), exist_ok=True)
@@ -50,6 +51,7 @@ def run_band_commands(
     commands_by_category: dict,
     is_first_band: bool = True,
     shared_sdir_screenshot: str | None = None,
+    node_name: str = "",
 ) -> dict:
     """
     Run all moshell commands for a band and generate screenshots.
@@ -102,16 +104,31 @@ def run_band_commands(
                 # Reuse the shared sdir screenshot as-is
                 category_screenshots.append(shared_sdir_screenshot)
                 continue
-            screenshot_path = os.path.join(
-                screenshots_dir,
-                f"{config.site.shortcode}_{band}_{category}{suffix}.png",
-            )
+            # Stamp the node tag (last underscore-segment of the DN) into
+            # the filename so parallel-node runs never collide on disk and
+            # so each screenshot is traceable to the node it came from.
+            # Example: `TCPHT_P3ACANOCOTAGUMDDNB01_L900_CELL.png`.
+            if node_name:
+                node_tag = node_name.split("_")[-1] if "_" in node_name else node_name[:12]
+                # Per-node shortcode from the DN's first underscore segment
+                sc = node_name.split("_")[0] if "_" in node_name else config.site.shortcode
+                screenshot_path = os.path.join(
+                    screenshots_dir,
+                    f"{sc}_{node_tag}_{band}_{category}{suffix}.png",
+                )
+                title_sc = sc
+            else:
+                screenshot_path = os.path.join(
+                    screenshots_dir,
+                    f"{config.site.shortcode}_{band}_{category}{suffix}.png",
+                )
+                title_sc = config.site.shortcode
             render_terminal_screenshot(
                 command=cmd,
                 output=output,
                 style=config.terminal_style,
                 save_path=screenshot_path,
-                title=f"{config.site.shortcode} - {band} - {category}",
+                title=f"{title_sc} - {band} - {category}",
             )
             category_screenshots.append(screenshot_path)
 
@@ -260,6 +277,7 @@ def run_moshell_for_band(
     commands_by_category: dict,
     is_first_band: bool = True,
     shared_sdir_screenshot: str | None = None,
+    node_name: str = "",
 ) -> tuple[str, dict]:
     """
     Phase 1 worker: create Excel file + run moshell commands for one band.
@@ -271,82 +289,149 @@ def run_moshell_for_band(
     logger.info(f"\n{'='*60}")
     logger.info(f"[{band}] Moshell phase starting")
     logger.info(f"{'='*60}")
-    excel_path = create_band_excel(config, band)
+    excel_path = create_band_excel(config, band, node_name=node_name)
     moshell_screenshots = run_band_commands(
         session, config, band, commands_by_category, is_first_band,
         shared_sdir_screenshot=shared_sdir_screenshot,
+        node_name=node_name,
     )
     return excel_path, moshell_screenshots
 
 
 def capture_enm_shared_artifacts(config: AppConfig) -> dict:
     """
-    Phase 2: open ONE browser session and capture the four node-level ENM
-    artifacts that can be reused across every band:
+    Per-node ENM capture. Opens ONE Playwright browser session for the
+    node described by *config* (config.site.node_name) and captures:
 
-        - SHM Software Administration
-        - FM Alarm Viewer
-        - Cell Management / NR Cells tab
-        - Cell Management / LTE Cells tab
+        - Cell Management  — tabs depend on tech:
+              GSM node     -> ["GSM Cell"]           (1 screenshot)
+              LTE/NR node  -> ["NR Cells","LTE Cells"] (2 screenshots)
+        - Alarm Viewer     (1 screenshot)
+        - SHM Software Administration (1 screenshot)
 
-    Returns a dict mapping artifact name to screenshot path (or None on
-    failure). Caller distributes these into the per-band screenshots dict.
+    All filenames are stamped with the **per-node** shortcode + node tag
+    (derived from the DN's first and last underscore segments) so
+    multi-node parallel runs never collide on disk, e.g.::
+
+        MIN3592_MAGUWETAGUMDDNB01_SHARED_LTE_CELLS_ENM_2.png
+        MIN3117_P3ACANOCOTAGUMDDNB02_SHARED_GSM_CELL_ENM_1.png
+        MIN3117_P3ACANOCOTAGUMDDNB01_SHARED_ALARM_ENM_1.png
+
+    Returns dict keyed by artifact (``shm``, ``alarm``, ``cellmgmt_nr``,
+    ``cellmgmt_lte``, ``cellmgmt_gsm``) -> path or None on failure.
+    ``build_enm_screenshots_for_band`` consumes those keys.
     """
-    result = {"shm": None, "alarm": None, "cellmgmt_nr": None, "cellmgmt_lte": None}
+    result = {
+        "shm": None, "alarm": None,
+        "cellmgmt_nr": None, "cellmgmt_lte": None, "cellmgmt_gsm": None,
+    }
 
     if not config.enm or not config.enm.enabled:
-        logger.info("[ENM shared] Skipped — enm disabled in config")
+        logger.info("[ENM] Skipped — enm disabled in config")
         return result
 
     screenshots_dir = get_full_path(config, config.paths.screenshots_dir)
-    shortcode = config.site.shortcode
+    os.makedirs(screenshots_dir, exist_ok=True)
+
+    # Per-node shortcode + tag (matches run_band_commands / test_three_nodes_*).
+    node_name = config.site.node_name
+    if "_" in node_name:
+        node_shortcode = node_name.split("_")[0]
+        node_tag = node_name.split("_")[-1]
+    else:
+        node_shortcode = config.site.shortcode
+        node_tag = node_name[:12] or "NODE"
+    prefix = f"{node_shortcode}_{node_tag}"
+    is_gsm_node = (
+        bool(getattr(config.site, "gsm_node_name", ""))
+        and node_name == config.site.gsm_node_name
+    )
+    tech_label = "GSM" if is_gsm_node else "LTE/NR"
+    logger.info(f"[ENM] {node_name}: opening browser session (tech={tech_label})")
 
     try:
         session = EnmBrowserSession(config, debug_dir=screenshots_dir).__enter__()
     except Exception as e:
-        logger.warning(f"[ENM shared] Failed to open browser session: {e}")
+        logger.warning(f"[ENM] {node_name}: failed to open browser session: {e}")
         return result
 
     try:
-        # 1. Cell Management — capture BOTH tabs in one go so we don't
-        #    re-navigate to the Cell Management page twice.
+        # ── 1. Cell Management ──────────────────────────────────────
         try:
-            base_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_CELL_ENM")
+            tabs = ["GSM Cell"] if is_gsm_node else ["NR Cells", "LTE Cells"]
+            base_path = os.path.join(screenshots_dir, f"{prefix}_SHARED_CELL_ENM")
             captured = session.capture_cell_management(
-                base_path,
-                band=None,  # no band-specific scroll — we want the full tab view
-                tabs_override=["NR Cells", "LTE Cells"],
+                base_path, band=None, tabs_override=tabs,
             )
-            # capture_cell_management returns [<base>_1.png, <base>_2.png]
-            # matching the order of tabs_override
-            if len(captured) >= 1:
-                result["cellmgmt_nr"] = captured[0]
-            if len(captured) >= 2:
-                result["cellmgmt_lte"] = captured[1]
-            logger.info(f"[ENM shared] Cell Management captured: NR={result['cellmgmt_nr']}, LTE={result['cellmgmt_lte']}")
+            # Rename index suffix -> include tab name so filenames are readable
+            # and so Cell Mgmt captures don't collide between GSM and LTE/NR
+            # runs that happen in the same screenshots folder.
+            for idx, (tab, path) in enumerate(zip(tabs, captured), start=1):
+                # `path` is None when that tab's capture failed — skip rename
+                # and leave the corresponding result key as None. Sibling tabs
+                # and the alarm/SHM captures that follow still proceed.
+                if not path:
+                    logger.warning(
+                        f"[ENM] {node_name}: '{tab}' tab capture produced no "
+                        f"file — leaving result slot empty"
+                    )
+                    continue
+                safe_tab = tab.replace(" ", "_").upper()
+                new_path = os.path.join(
+                    screenshots_dir,
+                    f"{prefix}_SHARED_{safe_tab}_ENM_{idx}.png",
+                )
+                try:
+                    if os.path.abspath(path) != os.path.abspath(new_path):
+                        if os.path.exists(new_path):
+                            os.remove(new_path)
+                        os.rename(path, new_path)
+                except Exception as exc:
+                    logger.warning(
+                        f"[ENM] {node_name}: rename {path} -> {new_path} "
+                        f"failed ({exc}); keeping original"
+                    )
+                    new_path = path
+                if tab == "NR Cells":
+                    result["cellmgmt_nr"] = new_path
+                elif tab == "LTE Cells":
+                    result["cellmgmt_lte"] = new_path
+                elif tab == "GSM Cell":
+                    result["cellmgmt_gsm"] = new_path
+            logger.info(
+                f"[ENM] {node_name}: Cell Management OK — "
+                f"nr={bool(result['cellmgmt_nr'])} "
+                f"lte={bool(result['cellmgmt_lte'])} "
+                f"gsm={bool(result['cellmgmt_gsm'])}"
+            )
         except Exception as e:
-            logger.warning(f"[ENM shared] Cell Management failed: {e}")
+            logger.warning(f"[ENM] {node_name}: Cell Management failed: {e}")
 
-        # 2. SHM Software Administration
+        # ── 2. Alarm Viewer ─────────────────────────────────────────
         try:
-            shm_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_NOC_Logs_ENM_1.png")
-            result["shm"] = session.capture_shm_software_admin(shm_path)
-            logger.info(f"[ENM shared] SHM captured: {result['shm']}")
-        except Exception as e:
-            logger.warning(f"[ENM shared] SHM failed: {e}")
-
-        # 3. Alarm Viewer
-        try:
-            alarm_path = os.path.join(screenshots_dir, f"{shortcode}_SHARED_ALARM_ENM_1.png")
+            alarm_path = os.path.join(
+                screenshots_dir, f"{prefix}_SHARED_ALARM_ENM_1.png"
+            )
             result["alarm"] = session.capture_alarm_viewer(alarm_path)
-            logger.info(f"[ENM shared] Alarm Viewer captured: {result['alarm']}")
+            logger.info(f"[ENM] {node_name}: Alarm Viewer OK -> {result['alarm']}")
         except Exception as e:
-            logger.warning(f"[ENM shared] Alarm Viewer failed: {e}")
+            logger.warning(f"[ENM] {node_name}: Alarm Viewer failed: {e}")
+
+        # ── 3. SHM Software Administration ──────────────────────────
+        try:
+            shm_path = os.path.join(
+                screenshots_dir, f"{prefix}_SHARED_NOC_Logs_ENM_1.png"
+            )
+            result["shm"] = session.capture_shm_software_admin(shm_path)
+            logger.info(f"[ENM] {node_name}: SHM OK -> {result['shm']}")
+        except Exception as e:
+            logger.warning(f"[ENM] {node_name}: SHM failed: {e}")
     finally:
         try:
             session.__exit__(None, None, None)
         except Exception:
             pass
+        logger.info(f"[ENM] {node_name}: browser session closed")
 
     return result
 
@@ -384,7 +469,13 @@ def build_enm_screenshots_for_band(
             out[enm_key] = [shared_artifacts["alarm"]]
         elif enm_key == "CELL_ENM":
             is_nr = band.upper().startswith("NR")
-            key = "cellmgmt_nr" if is_nr else "cellmgmt_lte"
+            is_gsm = band.upper().startswith("G")
+            if is_gsm:
+                key = "cellmgmt_gsm"
+            elif is_nr:
+                key = "cellmgmt_nr"
+            else:
+                key = "cellmgmt_lte"
             if shared_artifacts.get(key):
                 out[enm_key] = [shared_artifacts[key]]
 
@@ -637,6 +728,340 @@ def process_band_demo(
     return excel_path
 
 
+def run_multi_node(
+    config: AppConfig,
+    all_commands: dict,
+    band_filter: list[str] | None = None,
+    enm_prompt=None,
+    node_band_map: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """
+    Multi-node TRFS orchestrator with automatic band detection.
+
+    Phase 0: Run ``hgetc`` band detection commands on each node (fast, ~10s).
+    Phase 0b: Run ``sdir`` on each node (slow, ~4 min) for VSWR screenshots.
+    Phase 1: Run moshell commands per band (on the correct node).
+    Phase 2: Capture shared ENM artifacts per node.
+    Phase 3: Distribute ENM screenshots and insert into Excel.
+
+    If ``node_band_map`` is supplied, it overrides hgetc/sdir-based band
+    detection entirely — each node processes exactly the bands listed for it.
+    sdir still runs (for VSWR screenshots) and the GSM guard + dedupe steps
+    still apply as safety nets.
+
+    Returns list of generated Excel file paths.
+    """
+    shortcode = config.site.shortcode
+    lte_nr_nodes = config.site.get_node_names()
+    gsm_node = config.site.gsm_node_name if config.site.gsm_node_name else None
+
+    # LTE/NR nodes: hgetc detection + sdir
+    # GSM node: sdir + moshell commands (all GSM bands on that node)
+    all_band_keys = list(all_commands.keys())
+
+    # Collect all nodes that need processing (LTE/NR + GSM)
+    sdir_nodes = list(lte_nr_nodes)
+    if gsm_node:
+        sdir_nodes.append(gsm_node)
+
+    node_bands: dict[str, list[str]] = {}
+    sdir_screenshots: dict[str, str | None] = {}
+
+    # ── Phase 0: Open ONE SSH session per node, run hgetc + sdir ─────────
+    # This avoids opening multiple sessions per node (each doing amos + lt all
+    # which takes 2-5 minutes). One session = one amos + one lt all.
+    print(f"\n{'='*60}")
+    print(f"  Phase 0: Detecting bands + sdir per node (single SSH session)")
+    print(f"  Nodes: {', '.join(sdir_nodes)}")
+    print(f"{'='*60}\n")
+
+    node_sessions: dict[str, MoshellSession | None] = {}
+
+    for node_name in sdir_nodes:
+        print(f"  [{node_name}] Opening SSH session...")
+        logger.info(f"[multi-node] Opening single session for {node_name} (hgetc + sdir + moshell)")
+
+        try:
+            sdir_path, sdir_raw, lte_output, nr_output, session = run_node_setup(config, node_name)
+        except Exception as exc:
+            logger.error(f"[multi-node] Node setup failed for {node_name}: {exc}", exc_info=True)
+            print(f"  [ERROR] {node_name}: setup failed — {exc}")
+            # Try standalone sdir as last resort
+            try:
+                sdir_path, sdir_raw = capture_sdir_for_node(config, node_name)
+            except Exception:
+                sdir_path, sdir_raw = None, ""
+            lte_output, nr_output, session = "", "", None
+
+        sdir_screenshots[node_name] = sdir_path
+        node_sessions[node_name] = session
+
+        # ── Band detection: try hgetc first, fall back to sdir ──────────
+        is_gsm = gsm_node and node_name == gsm_node
+
+        if lte_output or nr_output:
+            detection = detect_bands_from_hgetc(lte_output, nr_output)
+            detected = detection.detected_bands
+            node_band_list = [b for b in detected if b in all_commands]
+
+            if node_band_list:
+                node_bands[node_name] = node_band_list
+                print(f"  [OK] {node_name}: hgetc detected bands = {', '.join(detected)}")
+                print(f"       matching commands = {', '.join(node_band_list)}")
+                if detection.cell_prefixes_found:
+                    prefix_detail = ", ".join(
+                        f"{k}- = {v}" for k, v in detection.cell_prefixes_found.items()
+                    )
+                    print(f"       cell prefixes: {prefix_detail}")
+                # Print band number mapping for transparency
+                for line in lte_output.splitlines():
+                    stripped = line.strip()
+                    if "EUtranCell" in stripped and ";" in stripped:
+                        print(f"       {stripped}")
+                for line in nr_output.splitlines():
+                    stripped = line.strip()
+                    if "NRCellDU" in stripped and ";" in stripped:
+                        print(f"       {stripped}")
+
+        # If hgetc didn't work, try sdir detection
+        if node_name not in node_bands:
+            if sdir_raw:
+                detection = detect_bands_from_sdir(sdir_raw)
+                detected = detection.detected_bands
+                node_band_list = [b for b in detected if b in all_commands]
+                if not node_band_list and not detection.cell_prefixes_found:
+                    if is_gsm:
+                        node_band_list = [b for b in all_band_keys if b.upper().startswith("G")]
+                    else:
+                        node_band_list = all_band_keys
+                node_bands[node_name] = node_band_list
+
+                print(f"  [OK] {node_name}: sdir detected bands = {', '.join(detected)}")
+                print(f"       matching commands = {', '.join(node_band_list)}")
+                if detection.cell_prefixes_found:
+                    prefix_detail = ", ".join(
+                        f"{k}- = {v}" for k, v in detection.cell_prefixes_found.items()
+                    )
+                    print(f"       cell prefixes: {prefix_detail}")
+                if detection.rru_names:
+                    print(f"       RRUs found: {', '.join(detection.rru_names)}")
+            else:
+                # Both hgetc and sdir failed — use fallback bands
+                if is_gsm:
+                    node_bands[node_name] = [b for b in all_band_keys if b.upper().startswith("G")]
+                else:
+                    node_bands[node_name] = all_band_keys
+                print(f"  [WARN] {node_name}: all detection failed — falling back to all bands")
+                logger.warning(f"[multi-node] All detection failed on {node_name}, using all bands as fallback")
+
+    # Hard constraint: GSM node can only process G-prefixed bands.
+    if gsm_node and gsm_node in node_bands:
+        node_bands[gsm_node] = [
+            b for b in node_bands[gsm_node] if b.upper().startswith("G")
+        ]
+        print(f"  [gsm-guard] {gsm_node}: restricted to G-bands = "
+              f"{', '.join(node_bands[gsm_node]) or '(none)'}")
+
+    # Apply band filter if specified
+    if band_filter:
+        filter_set = set(b.strip().upper() for b in band_filter)
+        for node_name in sdir_nodes:
+            node_bands[node_name] = [
+                b for b in node_bands[node_name] if b.upper() in filter_set
+            ]
+            print(f"  [filter] {node_name}: filtered to {', '.join(node_bands[node_name])}")
+
+    # Dedupe bands across nodes: each band must be owned by exactly one node,
+    # otherwise two parallel Phase-1 workers write to the same Excel file
+    # and Phase-3 stacks duplicate screenshots into the workbook. Priority
+    # follows sdir_nodes order (node1 wins over node2, etc.). GSM-only bands
+    # still belong to the GSM node thanks to the GSM-guard above.
+    _claimed_bands: set[str] = set()
+    for node_name in sdir_nodes:
+        kept = []
+        for b in node_bands.get(node_name, []):
+            key = b.upper()
+            if key in _claimed_bands:
+                print(f"  [dedupe] {node_name}: dropping {b} (already owned by earlier node)")
+                continue
+            _claimed_bands.add(key)
+            kept.append(b)
+        node_bands[node_name] = kept
+
+    # Remove GSM bands that have no commands, but process those that do.
+    # PIM category is skipped for GSM bands (BSC access not yet available).
+    for node_name in sdir_nodes:
+        processed_bands = []
+        for band in node_bands.get(node_name, []):
+            if band.upper().startswith("G"):
+                commands = all_commands.get(band, {})
+                if not commands:
+                    print(f"  [SKIP] {band} on {node_name} — no commands defined")
+                    logger.info(f"[{band}] Skipped — no commands defined")
+                    continue
+                # Filter out PIM for GSM (BSC not yet available)
+                filtered = filter_gsm_pim(band, commands)
+                all_commands[band] = filtered
+            processed_bands.append(band)
+        node_bands[node_name] = processed_bands
+
+    # Build flat list of (node_name, band) pairs ordered for processing
+    node_band_pairs: list[tuple[str, str]] = []
+    for node_name in sdir_nodes:
+        for band in node_bands.get(node_name, []):
+            node_band_pairs.append((node_name, band))
+
+    if not node_band_pairs:
+        print("\n  No bands to process. Exiting.")
+        return []
+
+    print(f"\n  Band assignment:")
+    for node_name in sdir_nodes:
+        print(f"    {node_name}: {', '.join(node_bands.get(node_name, [])) or '(none)'}")
+    print()
+
+    # ── Phase 1: Moshell SSH per node — reuse sessions from Phase 0 when available ─
+    phase1_results: dict[str, tuple[str, dict]] = {}
+
+    print(f"{'='*60}")
+    print(f"  Phase 1: Moshell SSH commands")
+    print(f"{'='*60}\n")
+
+    for node_name in sdir_nodes:
+        bands_for_node = node_bands.get(node_name, [])
+        if not bands_for_node:
+            continue
+
+        node_config = create_node_config(config, node_name)
+        shared_sdir = sdir_screenshots.get(node_name)
+        session = node_sessions.get(node_name)
+
+        # Try to reuse the session from Phase 0 (saves 2-5 min of amos + lt all)
+        if session is not None:
+            logger.info(f"[{node_name}] Reusing SSH session from Phase 0 for {len(bands_for_node)} band(s)")
+            for i, band in enumerate(bands_for_node):
+                commands = all_commands.get(band, {})
+                if not commands:
+                    continue
+                try:
+                    excel_path, moshell = run_moshell_for_band(
+                        session,
+                        node_config,
+                        band,
+                        commands,
+                        is_first_band=(i == 0),
+                        shared_sdir_screenshot=shared_sdir,
+                    )
+                    phase1_results[f"{node_name}::{band}"] = (excel_path, moshell)
+                    print(f"  [OK phase1] {node_name}/{band}")
+                except Exception as e:
+                    logger.error(f"[{node_name}/{band}] Phase 1 error: {e}", exc_info=True)
+                    print(f"  [ERROR phase1] {node_name}/{band}: {e}")
+            # Close the reused session since we're done with it
+            try:
+                session.disconnect()
+            except Exception:
+                pass
+            node_sessions[node_name] = None
+        else:
+            # Open a new session for this node
+            logger.info(f"[{node_name}] Opening new SSH session for {len(bands_for_node)} band(s)")
+            try:
+                with MoshellSession(node_config) as new_session:
+                    for i, band in enumerate(bands_for_node):
+                        commands = all_commands.get(band, {})
+                        if not commands:
+                            continue
+                        try:
+                            excel_path, moshell = run_moshell_for_band(
+                                new_session,
+                                node_config,
+                                band,
+                                commands,
+                                is_first_band=(i == 0),
+                                shared_sdir_screenshot=shared_sdir,
+                            )
+                            phase1_results[f"{node_name}::{band}"] = (excel_path, moshell)
+                            print(f"  [OK phase1] {node_name}/{band}")
+                        except Exception as e:
+                            logger.error(f"[{node_name}/{band}] Phase 1 error: {e}", exc_info=True)
+                            print(f"  [ERROR phase1] {node_name}/{band}: {e}")
+            except Exception as e:
+                logger.error(f"[{node_name}] Phase 1 SSH session failed: {e}", exc_info=True)
+                print(f"  [ERROR phase1] {node_name}: {e}")
+
+    # ── Phase 2: Shared ENM artifacts per node (parallel across nodes) ─
+    print(f"\n{'='*60}")
+    print(f"  Phase 2: ENM capture (parallel per node)")
+    print(f"{'='*60}\n")
+
+    enm_artifacts_per_node: dict[str, dict] = {}
+
+    def _phase2_one_node(node_name: str) -> tuple[str, dict]:
+        node_bands_list = node_bands.get(node_name, [])
+        if not node_bands_list:
+            return node_name, {
+                "shm": None, "alarm": None,
+                "cellmgmt_nr": None, "cellmgmt_lte": None, "cellmgmt_gsm": None,
+            }
+        node_config = create_node_config(config, node_name)
+        try:
+            shared_enm = capture_enm_shared_artifacts(node_config)
+        except Exception as e:
+            logger.error(f"[{node_name}] Phase 2 ENM failed: {e}", exc_info=True)
+            print(f"  [ERROR phase2] {node_name}: {e}")
+            shared_enm = {
+                "shm": None, "alarm": None,
+                "cellmgmt_nr": None, "cellmgmt_lte": None, "cellmgmt_gsm": None,
+            }
+        nr_path = shared_enm.get("cellmgmt_nr")
+        lte_path = shared_enm.get("cellmgmt_lte")
+        gsm_path = shared_enm.get("cellmgmt_gsm")
+        print(f"  [OK phase2] {node_name} ENM: NR={nr_path is not None}, LTE={lte_path is not None}, GSM={gsm_path is not None}")
+        return node_name, shared_enm
+
+    if sdir_nodes:
+        with ThreadPoolExecutor(max_workers=max(1, len(sdir_nodes))) as _p2pool:
+            for n, art in _p2pool.map(_phase2_one_node, sdir_nodes):
+                enm_artifacts_per_node[n] = art
+
+    # ── Phase 3: Distribute ENM + insert into Excel ─────────────────────
+    print(f"\n{'='*60}")
+    print(f"  Phase 3: Insert screenshots into Excel")
+    print(f"{'='*60}\n")
+
+    generated_files = []
+    for key, (excel_path, moshell) in phase1_results.items():
+        node_name, band = key.split("::", 1)
+        commands = all_commands.get(band, {})
+        shared_enm = enm_artifacts_per_node.get(node_name, {})
+
+        try:
+            enm_for_band = build_enm_screenshots_for_band(
+                band, commands, shared_enm, config
+            )
+            all_screenshots = {**moshell, **enm_for_band}
+
+            if not os.path.exists(excel_path):
+                logger.warning(f"[{band}] Excel vanished — re-creating")
+                excel_path = create_band_excel(config, band, node_name=node_name)
+
+            try:
+                insert_screenshots_for_band(excel_path, all_screenshots)
+            except FileNotFoundError:
+                logger.warning(f"[{band}] Excel missing at insert — re-creating")
+                excel_path = create_band_excel(config, band, node_name=node_name)
+                insert_screenshots_for_band(excel_path, all_screenshots)
+
+            generated_files.append(excel_path)
+            print(f"  [OK phase3] {node_name}/{band} -> {excel_path}")
+        except Exception as e:
+            logger.error(f"[{node_name}/{band}] Phase 3 error: {e}", exc_info=True)
+            print(f"  [ERROR phase3] {node_name}/{band}: {e}")
+
+    return generated_files
+
+
 def main():
     parser = argparse.ArgumentParser(description="TRFS Automation Tool")
     parser.add_argument(
@@ -664,6 +1089,11 @@ def main():
         default=0,
         help="Process N bands in parallel (each gets its own SSH session). Default: 0 = auto (all non-GSM bands concurrently)",
     )
+    parser.add_argument(
+        "--node2",
+        default="",
+        help="Second LTE/NR node name for multi-node TRFS (overrides config)",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -671,6 +1101,10 @@ def main():
     logger.info(f"Loading config from: {config_path}")
     config = load_config(config_path)
     _apply_shortcode_paths(config)
+
+    # Override node2 name from CLI if provided
+    if args.node2:
+        config.site.node2_name = args.node2
 
     # Parse commands
     commands_file = get_full_path(config, config.paths.commands)
@@ -711,9 +1145,9 @@ def main():
         generated_files = []
 
         for i, (band, categories) in enumerate(bands_to_process.items()):
+            # Filter out PIM for GSM bands
             if band.upper().startswith("G"):
-                print(f"  [SKIP] {band} — GSM flow not implemented yet")
-                continue
+                categories = filter_gsm_pim(band, categories)
             try:
                 excel_path = process_band_demo(config, band, categories, is_first_band=(i == 0))
                 generated_files.append(excel_path)
@@ -730,8 +1164,41 @@ def main():
         print(f"{'='*60}\n")
         return
 
-    # Connect and run
+    # Connect and run — choose multi-node or single-node path.
+    has_node2 = bool(config.site.node2_name)
     start_time = datetime.now()
+
+    if has_node2:
+        # ── Multi-node path: auto-detect bands from sdir ──────────────
+        print(f"\n{'='*60}")
+        print(f"  TRFS Automation Tool (Multi-Node)")
+        print(f"  Site: {config.site.shortcode}")
+        print(f"  Node 1: {config.site.node_name}")
+        if config.site.node2_name:
+            print(f"  Node 2: {config.site.node2_name}")
+        if config.site.gsm_node_name:
+            print(f"  GSM Node: {config.site.gsm_node_name}")
+        print(f"  Server: {config.ssh.host}")
+        print(f"  Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}\n")
+
+        generated_files = run_multi_node(
+            config, all_commands,
+            band_filter=args.band.split(",") if args.band else None,
+        )
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print(f"\n{'='*60}")
+        print(f"  Multi-Node TRFS Complete!")
+        print(f"  Duration: {duration}")
+        print(f"  Generated files ({len(generated_files)}):")
+        for f in generated_files:
+            print(f"    -> {f}")
+        print(f"{'='*60}\n")
+        return
+
+    # ── Single-node path (original flow) ─────────────────────────────
     generated_files = []
 
     print(f"\n{'='*60}")
@@ -742,13 +1209,13 @@ def main():
     print(f"  Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # Filter out GSM bands — GSM flow not implemented yet.
+    # Filter bands: process all including GSM, but skip PIM for GSM.
     all_items = list(bands_to_process.items())
-    gsm_items = [(b, c) for b, c in all_items if b.upper().startswith("G")]
-    band_items = [(b, c) for b, c in all_items if not b.upper().startswith("G")]
-    for gsm_band, _ in gsm_items:
-        print(f"  [SKIP] {gsm_band} — GSM flow not implemented yet")
-        logger.info(f"[{gsm_band}] Skipped — GSM flow not implemented yet")
+    band_items = [(b, filter_gsm_pim(b, c) if b.upper().startswith("G") else c) for b, c in all_items]
+    for b, c in band_items:
+        if b.upper().startswith("G") and "PIM" in all_commands.get(b, {}):
+            print(f"  [INFO] {b} — PIM skipped (GSM requires BSC access)")
+            logger.info(f"[{b}] PIM skipped — GSM requires BSC access")
 
     # Default: run every non-GSM band in parallel. User can still override
     # with --parallel to cap concurrency (useful for debugging / rate limits).

@@ -35,6 +35,7 @@ ENM_PARENT_CATEGORY = {
 def create_band_excel(
     config: AppConfig,
     band: str,
+    node_name: str = "",   # accepted for API stability but intentionally unused
 ) -> str:
     """
     Copy the template Excel file for a specific band.
@@ -42,6 +43,10 @@ def create_band_excel(
     Args:
         config: Application configuration
         band: Band key (e.g., "L900", "NR700")
+        node_name: Accepted but unused — filename uses only shortcode+band by
+            user request. Uniqueness across nodes is guaranteed upstream by
+            de-duplicating bands in ``run_multi_node`` so two nodes never
+            process the same band.
 
     Returns:
         Path to the new Excel file
@@ -62,6 +67,17 @@ def create_band_excel(
         output_path = os.path.join(output_dir, filename)
         shutil.copy2(template_path, output_path)
         logger.warning(f"Original file was locked, using: {filename}")
+
+    # Template ships with a hardcoded "VSWR MIN3117: All PASSED" in VSWR!A1.
+    # Rewrite it to match the current run's shortcode so the report never
+    # shows a stale site code from the template's original author.
+    try:
+        wb = load_workbook(output_path)
+        if "VSWR" in wb.sheetnames:
+            wb["VSWR"]["A1"] = f"VSWR {config.site.shortcode}: All PASSED"
+            wb.save(output_path)
+    except Exception as exc:
+        logger.warning(f"Could not update VSWR!A1 shortcode in {output_path}: {exc}")
 
     logger.info(f"Created Excel file: {output_path}")
     return output_path
@@ -157,12 +173,25 @@ def insert_screenshots_for_band(
 
         start_row = next_row_by_sheet[sheet_name]
 
+        # Target size for ENM screenshots (per user-provided reference):
+        # Height = 17.62 cm, Width = 29.25 cm. openpyxl XlImage uses pixels
+        # at 96 DPI, so 1 cm ≈ 37.7953 px.
+        ENM_WIDTH_PX = int(29.25 * 37.7953)   # ≈ 1105
+        ENM_HEIGHT_PX = int(17.62 * 37.7953)  # ≈  666
+
         for img_path in image_paths:
             if not os.path.exists(img_path):
                 logger.warning(f"Screenshot not found: {img_path}")
                 continue
 
             img = XlImage(img_path)
+
+            # Normalize ENM screenshots to the requested size so every browser
+            # capture lands with the same dimensions in Excel (matches the
+            # "Format Picture" reference: H 17.62 cm / W 29.25 cm).
+            if category.endswith("_ENM"):
+                img.width = ENM_WIDTH_PX
+                img.height = ENM_HEIGHT_PX
 
             # Label row above the image
             label_row = start_row

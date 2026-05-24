@@ -41,56 +41,113 @@ def ensure_chromium_installed() -> bool:
     """Check if Playwright Chromium is installed; auto-install if missing.
 
     Returns True if Chromium is ready to use, False otherwise.
+
+    Strategy:
+        1. Look on disk for the Playwright Chromium cache directory. If we
+           find one with an ``INSTALLATION_COMPLETE`` marker, trust it —
+           this is the fastest and most reliable check and does not need
+           to spawn a subprocess (which is fragile in PyInstaller bundles).
+        2. If on-disk check is inconclusive, try launching Chromium via
+           Playwright. On success, we're ready.
+        3. If launch fails, attempt ``playwright install chromium`` and
+           retry the launch.
+
+    Every failure path logs its reason so the UI can tell the user
+    **why** Chromium was reported missing.
     """
     if not PLAYWRIGHT_AVAILABLE:
+        logger.warning(
+            "[ENM] Playwright package is not importable in this Python "
+            "interpreter (sys.executable=%s). ENM screenshots will be SKIPPED. "
+            "FIX: launch the GUI with the project venv — "
+            "`venv\\Scripts\\python.exe src\\gui_app.py` (or use run_gui.bat).",
+            sys.executable,
+        )
         return False
 
-    import subprocess
-    from playwright._impl._driver import compute_driver_executable, get_driver_env
+    # ── Step 1: on-disk probe ────────────────────────────────────────
+    def _browsers_dir() -> str:
+        env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        if env_path and env_path != "0":
+            return env_path
+        if os.name == "nt":
+            return os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+        return os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
 
-    node_exe, cli_js = compute_driver_executable()
-    env = get_driver_env()
-
-    # Quick check: ask Playwright for the browser path
+    browsers_dir = _browsers_dir()
     try:
-        result = subprocess.run(
-            [node_exe, cli_js, "install", "--dry-run", "chromium"],
-            env=env, capture_output=True, text=True, timeout=15,
-        )
-        # If dry-run shows "browser is already installed" there's nothing to do.
-        if result.returncode == 0 and "already installed" in result.stdout.lower():
-            return True
-    except Exception:
-        pass
+        if os.path.isdir(browsers_dir):
+            # Any dir starting with "chromium-" that has INSTALLATION_COMPLETE
+            # is a valid install.
+            for entry in os.listdir(browsers_dir):
+                if not entry.startswith("chromium-"):
+                    continue
+                full = os.path.join(browsers_dir, entry)
+                if os.path.isfile(os.path.join(full, "INSTALLATION_COMPLETE")):
+                    logger.info(f"[ENM] Chromium found on disk: {full}")
+                    return True
+            logger.info(
+                f"[ENM] No Chromium cache under {browsers_dir} — will try launching"
+            )
+        else:
+            logger.info(f"[ENM] Playwright browsers dir does not exist: {browsers_dir}")
+    except Exception as exc:
+        logger.warning(f"[ENM] On-disk chromium probe failed: {exc}")
 
-    # Try launching chromium directly — fastest real check
+    # ── Step 2: live launch test ─────────────────────────────────────
     try:
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
-        browser.close()
-        pw.stop()
+        try:
+            browser = pw.chromium.launch(headless=True)
+            browser.close()
+        finally:
+            pw.stop()
+        logger.info("[ENM] Chromium launch test passed")
         return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"[ENM] Chromium launch test failed: {exc!r}")
 
-    # Chromium not found — install it
-    logger.info("[ENM] Chromium not found, installing automatically...")
+    # ── Step 3: attempt auto-install then retry ──────────────────────
+    import subprocess
+    try:
+        from playwright._impl._driver import compute_driver_executable, get_driver_env
+        node_exe, cli_js = compute_driver_executable()
+        env = get_driver_env()
+    except Exception as exc:
+        logger.warning(f"[ENM] Cannot locate Playwright driver for install: {exc!r}")
+        return False
+
+    logger.info("[ENM] Chromium not usable — attempting auto-install...")
     try:
         result = subprocess.run(
             [node_exe, cli_js, "install", "chromium"],
             env=env, capture_output=True, text=True, timeout=300,
         )
-        if result.returncode == 0:
-            logger.info("[ENM] Chromium installed successfully")
-            return True
-        else:
-            logger.warning(f"[ENM] Chromium install failed: {result.stderr}")
+        if result.returncode != 0:
+            logger.warning(
+                f"[ENM] Chromium install failed (rc={result.returncode}): "
+                f"stdout={result.stdout[-400:]!r} stderr={result.stderr[-400:]!r}"
+            )
             return False
+        logger.info("[ENM] Chromium installed — re-verifying launch")
     except subprocess.TimeoutExpired:
         logger.warning("[ENM] Chromium install timed out after 5 minutes")
         return False
     except Exception as exc:
-        logger.warning(f"[ENM] Chromium install error: {exc}")
+        logger.warning(f"[ENM] Chromium install error: {exc!r}")
+        return False
+
+    # Re-verify after install
+    try:
+        pw = sync_playwright().start()
+        try:
+            browser = pw.chromium.launch(headless=True)
+            browser.close()
+        finally:
+            pw.stop()
+        return True
+    except Exception as exc:
+        logger.warning(f"[ENM] Chromium still not launchable after install: {exc!r}")
         return False
 
 try:
@@ -409,6 +466,69 @@ def _open_add_topology_data(page, timeout_ms: int) -> None:
         raise RuntimeError("Could not find the Add Topology Data button.")
     button.evaluate("(el) => el.click()")
     page.wait_for_timeout(2000)
+
+
+def _clear_existing_nodes_from_panel(page, timeout_ms: int) -> int:
+    """Right-click every node currently in the left Network panel and pick
+    "Remove" from the context menu, so we start from a clean panel before
+    adding the intended site.
+
+    Returns the number of nodes removed. Failures are logged but not raised —
+    we'd rather proceed with topology add than abort on a stale node.
+    """
+    removed = 0
+    # Safety cap — don't loop forever if Remove doesn't actually take effect
+    for _ in range(20):
+        items = page.locator('.elUmpLib-NodeItem').all()
+        visible_items = []
+        for it in items:
+            try:
+                if it.is_visible():
+                    visible_items.append(it)
+            except Exception:
+                continue
+        if not visible_items:
+            break
+
+        target = visible_items[0]
+        try:
+            label = (target.locator('.elUmpLib-NodeItem-label').first
+                     .inner_text(timeout=1000))
+        except Exception:
+            label = "<unknown>"
+
+        try:
+            target.click(button="right", timeout=timeout_ms, force=True)
+        except Exception as exc:
+            logger.warning(f"[ENM] right-click on node '{label}' failed: {exc}")
+            break
+
+        # Wait for context menu, then click "Remove"
+        try:
+            remove_item = page.locator(
+                '.ebComponentList-item-name', has_text="Remove"
+            ).first
+            remove_item.wait_for(state="visible", timeout=5000)
+            remove_item.click(timeout=timeout_ms)
+            removed += 1
+            logger.info(f"[ENM] Removed node '{label}' from Network panel")
+            page.wait_for_timeout(800)
+        except Exception as exc:
+            logger.warning(
+                f"[ENM] 'Remove' menu item not clickable for '{label}': {exc}"
+            )
+            # Dismiss the open menu before giving up
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            break
+
+    if removed:
+        logger.info(f"[ENM] Cleared {removed} existing node(s) from Network panel")
+    else:
+        logger.info("[ENM] Network panel was already empty — nothing to clear")
+    return removed
 
 
 def _add_topology_for_site(page, site_name: str, timeout_ms: int) -> None:
@@ -964,7 +1084,14 @@ class EnmBrowserSession:
             raise RuntimeError(f"Cell Management setup failed: {exc}") from exc
 
         tabs_to_capture = tabs_override if tabs_override else self.config.enm.tabs
-        screenshots: list[str] = []
+        # IMPORTANT: per-tab failures must NOT abort the whole Cell Management
+        # pass. Under parallel multi-node load we have seen the 2nd tab
+        # (e.g. "LTE Cells") occasionally timeout on element render while the
+        # 1st tab ("NR Cells") captured fine. Previously we raised on the
+        # first failure, losing every sibling tab and the alarm/SHM siblings
+        # too (because the caller wraps this whole call in one try/except).
+        # Now we log, save a debug dump, append None, and continue.
+        screenshots: list[str | None] = []
         for idx, tab_name in enumerate(tabs_to_capture, start=1):
             try:
                 _click_tab(page, tab_name, timeout_ms)
@@ -981,9 +1108,11 @@ class EnmBrowserSession:
                 logger.info(f"[ENM] Cell Management screenshot saved: {save_path}")
             except Exception as exc:
                 self._save_debug(f"cellmgmt_tab_{band}_{tab_name}")
-                raise RuntimeError(
-                    f"Cell Management tab capture failed for '{tab_name}': {exc}"
-                ) from exc
+                logger.warning(
+                    f"[ENM] Cell Management tab capture failed for "
+                    f"'{tab_name}' (continuing to next tab): {exc}"
+                )
+                screenshots.append(None)
 
         return screenshots
 
@@ -1003,12 +1132,20 @@ class EnmBrowserSession:
         logger.info(f"[ENM] Alarm Viewer URL after load: {page.url}")
 
         try:
-            if _is_site_already_in_network_panel(page, self.config.site.node_name):
-                logger.info(f"[ENM] Site already in Network panel, skipping Add Topology")
-            else:
-                logger.info(f"[ENM] Adding topology for alarm viewer")
-                _open_add_topology_data(page, timeout_ms)
-                _add_topology_for_site(page, self.config.site.node_name, timeout_ms)
+            # Always clear whatever is already in the left Network panel
+            # before adding the target node — otherwise the alarm view shows
+            # alarms for the previously-added site(s) instead of (or alongside)
+            # the one we actually want.
+            try:
+                _clear_existing_nodes_from_panel(page, timeout_ms)
+            except Exception as clear_exc:
+                logger.warning(
+                    f"[ENM] Clearing existing nodes failed (continuing): {clear_exc}"
+                )
+
+            logger.info(f"[ENM] Adding topology for alarm viewer")
+            _open_add_topology_data(page, timeout_ms)
+            _add_topology_for_site(page, self.config.site.node_name, timeout_ms)
         except Exception as exc:
             self._save_debug("alarm_addtopo")
             raise RuntimeError(f"Alarm Viewer topology add failed: {exc}") from exc

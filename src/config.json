@@ -1,27 +1,44 @@
 {
-    "_comment": "NodeCraft dynamic configuration — edit values here instead of changing code.",
+    "_comment_top": "NodeCraft dynamic configuration. Every script path is an absolute Unix path on the gateway. Edit any single line to point at a different location — scripts no longer need to live under one shared 'scripts_path' root. The legacy 'scripts_path' is kept as a fallback for any value that doesn't start with '/'.",
 
     "scripts_path": "/home/shared/ESETARI/INOC/SCRIPTS",
+
+    "_comment_cli": "ENM CLI helper. Used by almost every step via 'python <cli_py> \"cmedit ...\"'.",
     "cli_py": "/home/shared/ESETARI/INOC/SCRIPTS/cli.py",
 
-    "create_arne_script": "ES/create_arne_2.py",
-    "entity_maker_script": "ES/entity_maker.sh",
-    "exe_entity_script": "ES/exe_entity.py",
-    "enrollment_mos": "ES/enroll/lhgenm1.mos",
-    "sgw_check_mos": "SGW_Check.mos",
+    "_comment_arne_enroll": "Add Node in ENM + enrollment flow scripts.",
+    "create_arne_script":  "/home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne_2.py",
+    "entity_maker_script": "/home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh",
+    "exe_entity_script":   "/home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py",
+    "enrollment_mos":      "/home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos",
 
-    "lkf_import_script": "lkfimport.py",
-    "lkf_install_script": "lkfinstall.py",
-    "lkf_status_script": "lkfstatus.py",
+    "_comment_sgw": "Verify SGw Reachability — multi-ping moshell script (run on LTE/NR nodes).",
+    "sgw_check_mos": "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos",
 
+    "_comment_lkf": "Install LKF (License File) — import / install / status scripts.",
+    "lkf_import_script":  "/home/shared/ESETARI/INOC/SCRIPTS/lkfimport.py",
+    "lkf_install_script": "/home/shared/ESETARI/INOC/SCRIPTS/lkfinstall.py",
+    "lkf_status_script":  "/home/shared/ESETARI/INOC/SCRIPTS/lkfstatus.py",
+
+    "_comment_lkf_smrs": "Directory ENM SMRS uses to persist per-node license XMLs. Checked for the LKF fast-path (skip import if file already there).",
+    "smrs_licence_dir": "/ericsson/tor/smrs/smrsroot/licence",
+
+    "_comment_baseline": "Load Baseline Scripts — moshell .mos invoked by the framework. Can live anywhere (different folder than the ENM CLI scripts).",
+    "baseline_script_path": "/home/shared/common/INTEGRATION_TEAM/script/Baseline_script.mos",
+
+    "_comment_baseline_files": "Reference list of baseline batch files per RAT (informational, not invoked directly by the framework).",
     "baseline_files": {
         "L":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
         "LN": "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
         "N":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt"
     },
 
+    "_comment_external_alarm": "Pre-define External Alarm — moshell template that creates the 8 AlarmPort MOs on the primary BB. LTE primary only.",
+    "external_alarm_template": "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
+
+    "_comment_uri": "URI Reconfig — ENM REST endpoints + default UpgradePackage ID (auto-detected via 'pr UpgradePackage' at runtime; this is a fallback only).",
     "uri_setting": {
-        "enm_login_url": "https://lhgenm1.globetel.com/login",
+        "enm_login_url":      "https://lhgenm1.globetel.com/login",
         "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
         "upgrade_package_id": "CXP2010174/2-R42H05"
     }

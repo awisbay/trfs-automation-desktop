@@ -6,17 +6,33 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# First-run asset seed for frozen single-exe build: copy
+# user-editable defaults from the embedded _MEIPASS dir to the exe
+# directory if they don't exist there yet. No-op when running from
+# source. Done BEFORE importing GUI modules in case any of them want
+# to read config.yaml at import time.
+from app_path import ensure_assets_in_app_dir
+ensure_assets_in_app_dir([
+    "config.yaml",          # site shortcode + SSH credentials
+    "config.json",          # integration script paths (ENM cli.py, baseline, …)
+    "TEMPLATE_REPORT.xlsx",
+    "TRFS commands.txt",
+    "snapshot.ico",
+])
+
 import flet as ft
 from gui.form_page import FormPage
 from gui.integration_page import IntegrationPage, IntegrationRunPage
 from gui.license_page import LicensePage
 from gui.progress_page import ProgressPage
 from gui.result_page import ResultPage
+from gui.terminal_page import TerminalPage
 from gui.theme import BG_TOP
 from license_manager import load_saved_license
 
 
 def main(page: ft.Page):
+    # Default title; updated below with the licensed user's name once verified.
     page.title = "NodeCraft v1.0 — ewisbay"
     from app_path import get_app_dir
     # Icon can live next to the exe OR inside _internal/ (PyInstaller COLLECT)
@@ -75,6 +91,8 @@ def main(page: ft.Page):
             return IntegrationRunPage(page).build()
         elif route == "/result":
             return ResultPage(page).build()
+        elif route == "/terminal":
+            return TerminalPage(page).build()
         return FormPage(page).build()
 
     def route_change(e):
@@ -95,32 +113,68 @@ def main(page: ft.Page):
     page.on_route_change = route_change
     page.on_view_pop = view_pop
 
-    # Kill every live SSH session when the window is closed so worker
-    # threads unwind immediately and the process exits cleanly instead
-    # of lingering in the background.
+    # Kill every live SSH session and force-exit when the window is closed
+    # so worker threads (paramiko readers, ThreadPoolExecutor workers,
+    # Playwright drivers) unwind immediately and the process exits cleanly
+    # instead of lingering in the background.
+    _shutdown_called = {"done": False}
+
+    def _shutdown(reason: str):
+        if _shutdown_called["done"]:
+            return
+        _shutdown_called["done"] = True
+        print(f"[EXIT] shutting down ({reason})")
+        # Kill every registered SSH channel — unblocks paramiko readers so
+        # their worker threads don't stall the interpreter shutdown.
+        try:
+            import ssh_registry
+            n = ssh_registry.kill_all()
+            print(f"[EXIT] killed {n} live SSH session(s)")
+        except Exception as exc:
+            print(f"[EXIT] ssh_registry.kill_all failed: {exc}")
+        # Force the whole process to die. Worker threads are now daemon=True
+        # so os._exit takes them down with us, along with any Playwright
+        # node.exe child that was mid-capture.
+        try:
+            page.window.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
     def _on_window_event(e):
         data = getattr(e, "data", None)
-        if data == "close":
-            try:
-                import ssh_registry
-                n = ssh_registry.kill_all()
-                print(f"[EXIT] killed {n} live SSH session(s)")
-            except Exception as exc:
-                print(f"[EXIT] ssh_registry.kill_all failed: {exc}")
-            # Force the whole process to die — Flet keeps non-daemon
-            # threads (paramiko readers, ThreadPoolExecutor workers)
-            # alive otherwise.
-            try:
-                page.window.destroy()
-            except Exception:
-                pass
-            os._exit(0)
+        # Flet versions differ: data can be "close", a WindowEventType-ish
+        # string, or a dict. Match any close-ish signal defensively.
+        if data == "close" or (isinstance(data, str) and "close" in data.lower()):
+            _shutdown("window close")
+
+    def _on_disconnect(e):
+        # Fires when the Flet client disconnects (tab closed, window killed
+        # via taskbar, OS shutdown). Belt-and-braces against missed
+        # window.on_event fires.
+        _shutdown("page disconnect")
 
     try:
         page.window.prevent_close = False
         page.window.on_event = _on_window_event
     except Exception:
         pass
+    try:
+        page.on_disconnect = _on_disconnect
+    except Exception:
+        pass
+
+    # atexit safety net: if the interpreter is somehow shutting down without
+    # either of the above firing (e.g. Ctrl+C, SIGTERM from parent), still
+    # kill SSH so we don't leak paramiko transports.
+    import atexit
+    def _atexit_kill():
+        try:
+            import ssh_registry
+            ssh_registry.kill_all()
+        except Exception:
+            pass
+    atexit.register(_atexit_kill)
 
     # Initial render — check license first
     license_result = load_saved_license()
@@ -129,6 +183,9 @@ def main(page: ft.Page):
     if license_result["valid"]:
         p = license_result["payload"]
         print(f"[LICENSE] Valid — user={p.get('user')}, expires={p.get('expires')}")
+        _user = p.get("user") or p.get("name")
+        if _user:
+            page.title = f"NodeCraft v1.0 — Welcome, {_user}"
     else:
         print(f"[LICENSE] {license_result['error']} — showing activation screen")
 

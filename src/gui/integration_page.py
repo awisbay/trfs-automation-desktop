@@ -9,14 +9,18 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import sys
 import threading
+import time
 from datetime import datetime
+from typing import Optional
 
 import flet as ft
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from baseline_log_parser import build_baseline_log_excel, parse_baseline_summary
 from relation_log_parser import build_relation_log_excel
 
 from gui.theme import (
@@ -44,40 +48,106 @@ logger = logging.getLogger(__name__)
 # Each tuple: (key, display_label, applies_to, log_suffix)
 #   applies_to: "both" | "lte_nr" | "gsm"
 #   log_suffix: short name used in the log filename
+# All steps that appear in the summary table (including remark-only rows).
+#
+# applies_to values:
+#   "both"        — runs on every node type
+#   "lte_nr"      — runs on every LTE/NR node (primary + secondary)
+#   "lte_primary" — runs on the primary LTE/NR node ONLY (skips lte2 + gsm).
+#                   Used for one-shot per-site setup that doesn't need to
+#                   be repeated for the second BB / GSM node — e.g. the
+#                   External Alarm template install.
+#   "gsm"         — runs on GSM node only
 INTEGRATION_STEPS = [
-    ("create_arne",      "Create ARNE",              "both",    "ARNE"),
-    ("enrollment",       "Enrollment",               "both",    "ENROLLMENT"),
-    ("install_lkf",      "Install LKF",              "both",    "LKF"),
-    ("relation",         "Relation",                 "lte_nr",  "RELATION"),
-    ("baseline",         "Baseline Running",         "lte_nr",  "BASELINE"),
-    ("ret_scripts",      "RET Scripts",              "both",    "RET"),
-    ("uri_setting",      "URI Setting",              "both",    "URI"),
-    ("verify_mme",       "Verify MME",               "lte_nr",  "MME"),
-    ("sgw_check",        "SGW Check",                "both",    "SGW_CHECK"),
-    ("gsm_cell_define",  "GSM Cell Define in BSC",   "gsm",     "GSM_CELL_DEFINE"),
-    ("pm_measurement",   "PM Measurement",           "both",    "PM"),
-    ("backup_cv",        "Backup CV",                "both",    "BACKUP_CV"),
-    ("take_dump",        "Take Dump",                "both",    "DUMP"),
-    ("take_cm_dump",     "Take CM Dump",             "both",    "CM_DUMP"),
+    ("sw_package_check",  "SW Package Check",              "both",    "SW_PACKAGE"),
+    ("bb_power_on",       "BB Power On Onsite",            "both",    "BB_POWER_ON"),
+    ("bb_transport",      "BB Transport Connectivity",     "both",    "BB_TRANSPORT"),
+    ("create_arne",       "Add Node in ENM",              "both",    "ARNE"),
+    ("enrollment",       "Perform Site Enrollment in ENM", "both",    "ENROLLMENT"),
+    ("uri_setting",       "URI Reconfig",                 "both",    "URI"),
+    ("enrollment_sync",   "Node Synchronized in ENM",    "both",    "ENROLLMENT"),
+    ("install_lkf",       "Install LKF (License File)",    "both",   "LKF"),
+    ("relation",          "Load Neighbour Relation Scripts", "lte_nr", "RELATION"),
+    ("baseline",          "Load Baseline Scripts",         "lte_nr",  "BASELINE"),
+    ("ret_scripts",       "Load RET Scripts",              "both",    "RET"),
+    ("pm_measurement",    "Validate Performance Counter",  "both",    "PM"),
+    ("external_alarm",    "Pre-define External Alarm",     "lte_primary", "EXTERNAL_ALARM"),
+    ("verify_mme",        "Verify Core Connectivity (MME)", "lte_nr", "MME"),
+    ("sgw_check",         "Verify SGw Reachability",      "both",    "SGW_CHECK"),
+    ("gsm_cell_define",  "GSM Cells and MO Defined in BSC", "gsm",   "GSM_CELL_DEFINE"),
+    ("bsc_neighbours",    "BSC Neighbours Defined",        "gsm",     "BSC_NEIGHBOURS"),
+    ("network_audit",     "Network Configuration Audit (NAT)", "both", "NAT"),
+    ("backup_cv",         "Configuration Backup and Upload to ENM", "both", "BACKUP_CV"),
+    ("take_cm_dump",      "Take CM Dump",                  "both",    "CM_DUMP"),
+    ("take_dump",         "Take Dump",                     "both",    "DUMP"),
 ]
+
+# Steps that only appear in the summary table (not as checkboxes, not run).
+# Their status is derived from alias steps or hardcoded.
+REMARK_STEPS = {
+    "sw_package_check",   # pre-verified manual check → always Yes
+    "bb_power_on",        # pre-verified manual check → always Yes
+    "enrollment_sync",
+    "bb_transport",
+    "bsc_neighbours",
+    "network_audit",
+}
+
+# Summary-only rows that should stay out of the live progress columns and
+# always display as N/A in the final summary.
+SUMMARY_NA_STEPS = {
+    "bsc_neighbours",
+    "network_audit",
+}
 
 
 SUMMARY_LABELS = {
-    "create_arne":     "Add Node in ENM",
-    "enrollment":      "Node Synchronized in ENM",
-    "install_lkf":     "Install LKF (License File)",
-    "relation":        "Load Neighbour Relation Scripts",
-    "baseline":        "Load Baseline Scripts",
-    "ret_scripts":     "Load RET Scripts",
-    "uri_setting":     "URI Reconfig",
-    "verify_mme":      "Verify Core Connectivity (MME)",
-    "sgw_check":       "Verify SGw Reachability",
-    "gsm_cell_define": "GSM Cells and MO Defined in BSC",
-    "pm_measurement":  "Validate Performance Counter",
-    "backup_cv":       "Configuration Backup and Upload to ENM",
-    "take_dump":       "Take Dump",
-    "take_cm_dump":    "CM Dump Validated by NDO",
+    "sw_package_check":  "SW Package Check",
+    "bb_power_on":       "BB Power On Onsite",
+    "bb_transport":      "BB Transport Connectivity",
+    "create_arne":       "Add Node in ENM",
+    "enrollment":        "Perform Site Enrollment in ENM",
+    "uri_setting":       "URI Reconfig",
+    "enrollment_sync":   "Node Synchronized in ENM",
+    "install_lkf":       "Install LKF (License File)",
+    "relation":          "Load Neighbour Relation Scripts",
+    "baseline":          "Load Baseline Scripts",
+    "ret_scripts":       "Load RET Scripts",
+    "external_alarm":    "Pre-define External Alarm",
+    "verify_mme":        "Verify Core Connectivity (MME)",
+    "sgw_check":         "Verify SGw Reachability",
+    "gsm_cell_define":   "GSM Cells and MO Defined in BSC",
+    "bsc_neighbours":    "BSC Neighbours Defined",
+    "network_audit":     "Network Configuration Audit (NAT)",
+    "pm_measurement":    "Validate Performance Counter",
+    "backup_cv":         "Configuration Backup and Upload to ENM",
+    "take_cm_dump":      "Take CM Dump",
+    "take_dump":         "Take Dump",
 }
+
+def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
+    """Whether a step with the given ``applies_to`` scope is relevant
+    to the node identified by ``ntag`` (``"lte"`` / ``"lte2"`` / ``"gsm"``).
+
+    Module-level helper so the checklist builder, the progress builder,
+    the run loop, and the summary table all use one consistent rule.
+
+    ``applies_to`` values:
+      ``both``        → every node
+      ``lte_nr``      → ``lte`` or ``lte2``
+      ``lte_primary`` → ``lte`` only (per-site setup that runs once)
+      ``gsm``         → ``gsm``
+    """
+    if applies_to == "both":
+        return True
+    if applies_to == "lte_nr":
+        return ntag in ("lte", "lte2")
+    if applies_to == "lte_primary":
+        return ntag == "lte"
+    if applies_to == "gsm":
+        return ntag == "gsm"
+    return False
+
 
 _RESULT_SYMBOLS = {
     "done":    "✅",
@@ -110,78 +180,181 @@ class IntegrationPage:
         self.has_gsm = bool(self.gsm_name)
         self.shortcode = self.form.get("shortcode", "UNKNOWN")
 
-        # Checkboxes keyed by step key
-        self.checkboxes: dict[str, ft.Checkbox] = {}
+        # Checkboxes are keyed step → node_tag → Checkbox so each node
+        # can independently include/exclude steps. Old shape (step → cb)
+        # is preserved as a flat union in ``self.flat_checkboxes`` for
+        # the global Select All / counter logic.
+        self.checkboxes: dict[str, dict[str, ft.Checkbox]] = {}
+
+        # Determine which node columns to show, with short headers.
+        # A single LTE → "LTE"; two LTEs → "LTE 1", "LTE 2"; plus GSM.
+        self.node_columns: list[tuple[str, str]] = []
+        if self.has_lte2:
+            self.node_columns.append(("lte",  "LTE 1"))
+            self.node_columns.append(("lte2", "LTE 2"))
+        else:
+            self.node_columns.append(("lte", "LTE"))
+        if self.has_gsm:
+            self.node_columns.append(("gsm", "GSM"))
+
+    @staticmethod
+    def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
+        # Thin wrapper over the module-level helper, kept here for
+        # backward compatibility with existing callers in this class.
+        return _step_applies_to_node(applies_to, ntag)
+
+    def _step_disabled_reason(self, key: str) -> Optional[str]:
+        """Return a short reason why a step's checkboxes should be
+        force-unchecked + disabled at checklist build time, or None
+        if the step is selectable.
+
+        Some steps depend on a browsed file from the form page. When
+        that file is empty, there is nothing to install/load, so the
+        checklist hides the choice from the operator entirely:
+        checkbox starts unchecked, disabled (can't be ticked), and a
+        small italic hint explains why.
+        """
+        if key == "install_lkf":
+            if not str(self.form.get("lkf_file", "")).strip():
+                return "no LKF file selected"
+        if key == "relation":
+            if not str(self.form.get("relation_file", "")).strip():
+                return "no relation file selected"
+        return None
 
     def build(self) -> ft.View:
-        # ── Build checkboxes ────────────────────────────────────
-        check_rows = []
-        for key, label, applies_to, _ in INTEGRATION_STEPS:
-            # Determine if this step is relevant
-            relevant = False
-            if applies_to == "both":
-                relevant = True
-            elif applies_to == "lte_nr":
-                relevant = True  # always show LTE steps
-            elif applies_to == "gsm" and self.has_gsm:
-                relevant = True
+        # ── Build the multi-column checklist grid ───────────────
+        # Layout: one row per step, one checkbox column per node.
+        # Cells where the step doesn't apply to the node show "—".
+        CHECKBOX_COL_WIDTH = 70
 
-            if not relevant:
+        def _column_color(ntag: str):
+            if ntag == "gsm":
+                return ACCENT_WARM
+            if ntag == "lte2":
+                return ACCENT
+            return INFO
+
+        # Header row: "Step" label + one column per node
+        header_cells = [
+            ft.Container(
+                content=ft.Text(
+                    "Step", size=12, color=TEXT_MUTED,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                expand=True,
+            ),
+        ]
+        for ntag, nlabel in self.node_columns:
+            header_cells.append(
+                ft.Container(
+                    content=ft.Text(
+                        nlabel, size=12, color=_column_color(ntag),
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    width=CHECKBOX_COL_WIDTH,
+                    alignment=ft.Alignment(0, 0),
+                )
+            )
+        header_row = ft.Container(
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            content=ft.Row(
+                header_cells, spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+
+        check_rows: list = [header_row, ft.Divider(height=1, color=BORDER)]
+
+        for key, label, applies_to, _ in INTEGRATION_STEPS:
+            # Skip remark-only rows: they appear in the summary table
+            # but have no runnable logic, so no checkbox needed.
+            if key in REMARK_STEPS or key in SUMMARY_NA_STEPS:
                 continue
 
-            # Tag for display
-            if applies_to == "lte_nr":
-                tag_text = "LTE/NR"
-                tag_color = INFO
-            elif applies_to == "gsm":
-                tag_text = "GSM"
-                tag_color = ACCENT_WARM
+            # Skip steps that apply to no visible column
+            if not any(
+                self._step_applies_to_node(applies_to, nt)
+                for nt, _ in self.node_columns
+            ):
+                continue
+
+            disabled_reason = self._step_disabled_reason(key)
+
+            # Step label cell — when the step is force-disabled because
+            # of a missing file, the label is dimmed and a small italic
+            # hint is shown underneath so the operator understands why
+            # the checkboxes don't respond.
+            if disabled_reason:
+                label_widget = ft.Column(
+                    [
+                        ft.Text(
+                            label, size=14, color=TEXT_MUTED,
+                            weight=ft.FontWeight.W_500,
+                        ),
+                        ft.Text(
+                            f"({disabled_reason})", size=11,
+                            color=TEXT_MUTED, italic=True,
+                        ),
+                    ],
+                    spacing=2,
+                )
             else:
-                tag_text = "Both"
-                tag_color = ACCENT
+                label_widget = ft.Text(
+                    label, size=14, color=TEXT,
+                    weight=ft.FontWeight.W_500,
+                )
 
-            cb = ft.Checkbox(
-                value=True,
-                label=None,
-                active_color=ACCENT,
-                check_color="#06242A",
-                on_change=self._on_checkbox_change,
-            )
-            self.checkboxes[key] = cb
+            cells = [
+                ft.Container(content=label_widget, expand=True),
+            ]
+            self.checkboxes[key] = {}
 
-            tag = ft.Container(
-                content=ft.Text(tag_text, size=10, color="#06242A",
-                                weight=ft.FontWeight.BOLD),
-                bgcolor=tag_color,
-                border_radius=6,
-                padding=ft.Padding.symmetric(horizontal=8, vertical=2),
-                width=55,
-                alignment=ft.Alignment(0, 0),
-            )
+            for ntag, _ in self.node_columns:
+                if self._step_applies_to_node(applies_to, ntag):
+                    cb = ft.Checkbox(
+                        # Force-uncheck + disable when a required file
+                        # is missing; otherwise default-checked.
+                        value=False if disabled_reason else True,
+                        disabled=bool(disabled_reason),
+                        label=None,
+                        active_color=ACCENT,
+                        check_color="#06242A",
+                        on_change=self._on_checkbox_change,
+                    )
+                    self.checkboxes[key][ntag] = cb
+                    cells.append(
+                        ft.Container(
+                            content=cb,
+                            width=CHECKBOX_COL_WIDTH,
+                            alignment=ft.Alignment(0, 0),
+                        )
+                    )
+                else:
+                    cells.append(
+                        ft.Container(
+                            content=ft.Text(
+                                "—", size=14, color=TEXT_MUTED,
+                            ),
+                            width=CHECKBOX_COL_WIDTH,
+                            alignment=ft.Alignment(0, 0),
+                        )
+                    )
 
             row = ft.Container(
                 padding=ft.Padding.symmetric(horizontal=12, vertical=4),
                 border_radius=10,
-                ink=True,
-                on_click=lambda e, k=key: self._toggle_checkbox(k),
                 content=ft.Row(
-                    [
-                        cb,
-                        ft.Text(label, size=14, color=TEXT,
-                                weight=ft.FontWeight.W_500),
-                        ft.Container(expand=True),
-                        tag,
-                    ],
-                    spacing=10,
+                    cells, spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
             )
             check_rows.append(row)
 
         # ── Counter text ────────────────────────────────────────
-        total = len(self.checkboxes)
+        total_cbs = sum(len(d) for d in self.checkboxes.values())
         self.counter_text = ft.Text(
-            f"{total}/{total} steps selected",
+            f"{total_cbs}/{total_cbs} steps selected",
             size=12, color=TEXT_MUTED,
         )
 
@@ -313,9 +486,18 @@ class IntegrationPage:
         )
 
     # ── Checkbox helpers ────────────────────────────────────────
+    def _iter_checkboxes(self):
+        for per_node in self.checkboxes.values():
+            for cb in per_node.values():
+                yield cb
+
     def _update_counter(self):
-        selected = sum(1 for cb in self.checkboxes.values() if cb.value)
-        total = len(self.checkboxes)
+        total = 0
+        selected = 0
+        for cb in self._iter_checkboxes():
+            total += 1
+            if cb.value:
+                selected += 1
         self.counter_text.value = f"{selected}/{total} steps selected"
         self.run_button.disabled = (selected == 0)
         try:
@@ -326,29 +508,43 @@ class IntegrationPage:
     def _on_checkbox_change(self, e):
         self._update_counter()
 
-    def _toggle_checkbox(self, key: str):
-        cb = self.checkboxes.get(key)
-        if cb:
-            cb.value = not cb.value
-            self._update_counter()
-
     def _select_all(self, e):
-        for cb in self.checkboxes.values():
-            cb.value = True
+        # Skip disabled checkboxes: they're disabled because their
+        # required file isn't selected, so toggling them on would be
+        # misleading — the runtime guard would still skip the step.
+        for cb in self._iter_checkboxes():
+            if not cb.disabled:
+                cb.value = True
         self._update_counter()
 
     def _deselect_all(self, e):
-        for cb in self.checkboxes.values():
-            cb.value = False
+        for cb in self._iter_checkboxes():
+            if not cb.disabled:
+                cb.value = False
         self._update_counter()
 
     # ── Navigation ──────────────────────────────────────────────
     def _on_run(self, e):
-        selected = {k for k, cb in self.checkboxes.items() if cb.value}
-        if not selected:
+        # Build per-node selection: which step keys did the operator
+        # tick for each node column?
+        selected_per_node: dict[str, set[str]] = {}
+        for step_key, per_node in self.checkboxes.items():
+            for ntag, cb in per_node.items():
+                if cb.value:
+                    selected_per_node.setdefault(ntag, set()).add(step_key)
+
+        if not any(selected_per_node.values()):
             return
-        # Store selected steps on the page for the progress page
-        self.page.integration_selected_steps = selected
+
+        # Flat union — kept for any code that doesn't yet know about
+        # per-node selection (counters, "any node selected this step").
+        flat_union: set[str] = set()
+        for s in selected_per_node.values():
+            flat_union |= s
+
+        # Hand off to the progress page via page-level attributes.
+        self.page.integration_selected_steps_per_node = selected_per_node
+        self.page.integration_selected_steps = flat_union
         self.page.go("/integration_run")
 
     def _go_back(self, e):
@@ -371,6 +567,11 @@ class IntegrationRunPage:
         self.form = getattr(page, "integration_form", {})
         self.selected_steps: set = getattr(
             page, "integration_selected_steps", set())
+        # Per-node selection from the multi-column checklist. Keys are
+        # node tags ("lte", "lte2", "gsm"); values are sets of step
+        # keys the operator ticked for that node.
+        self.selected_steps_per_node: dict[str, set] = getattr(
+            page, "integration_selected_steps_per_node", {})
 
         # Node identifiers
         self.lte_name = self.form.get("node_name", "LTE/NR Node")
@@ -435,28 +636,73 @@ class IntegrationRunPage:
         self.lte2_steps: dict[str, _StepRow] = {}
         self.gsm_steps: dict[str, _StepRow] = {}
 
+        # Per-node-tag label override: a few steps want a different
+        # display label depending on whether the column is LTE/NR or
+        # GSM. ``sgw_check`` is the canonical example — the underlying
+        # check is the same, but the user-facing name differs.
+        def _row_label(key: str, default: str, ntag: str) -> str:
+            if key == "sgw_check":
+                return (
+                    "Verify BSC Broker IP Reachability"
+                    if ntag == "gsm"
+                    else "Verify SGw Reachability"
+                )
+            return default
+
+        # Filter rule for progress columns (per-node):
+        #   * Always skip SUMMARY_NA steps (they only live in the summary).
+        #   * REMARK steps always show (bb_transport, enrollment_sync —
+        #     their state is derived, not selected).
+        #   * Otherwise: only show if the operator selected this step
+        #     for THIS node in the multi-column checklist. Un-selected
+        #     steps don't appear in the column.
+        def _should_show_for_node(key: str, ntag: str) -> bool:
+            if key in SUMMARY_NA_STEPS:
+                return False
+            if key in REMARK_STEPS:
+                return True
+            return self.is_step_selected(key, ntag)
+
+        # Pre-verified REMARK rows that should always show as "done".
+        # Distinct from ``enrollment_sync`` which derives its state
+        # from the enrollment step at run time.
+        PRE_VERIFIED = {"bb_transport", "sw_package_check", "bb_power_on"}
+
+        def _apply_remark_state(row, key: str) -> None:
+            if key in PRE_VERIFIED:
+                row.set_state("done", "Pre-verified")
+            elif key == "enrollment_sync":
+                row.set_state("pending", "Waiting for enrollment")
+
         lte_rows = []
         lte2_rows = []
         gsm_rows = []
         for key, label, applies_to, _ in INTEGRATION_STEPS:
-            if applies_to in ("both", "lte_nr"):
-                row = _StepRow(label)
-                self.lte_steps[key] = row
-                lte_rows.append(row.control)
-                if key not in self.selected_steps:
-                    row.set_state("skip", "Not selected")
-                if self.has_lte2:
-                    row2 = _StepRow(label)
+            # Route to the correct column(s) based on the step's
+            # applies_to scope. Uses the module-level helper so the
+            # new ``lte_primary`` scope (primary LTE only) is honoured
+            # — it shows in the lte column but NOT in lte2 or gsm.
+            if _step_applies_to_node(applies_to, "lte"):
+                if _should_show_for_node(key, "lte"):
+                    row = _StepRow(_row_label(key, label, "lte"))
+                    self.lte_steps[key] = row
+                    lte_rows.append(row.control)
+                    if key in REMARK_STEPS:
+                        _apply_remark_state(row, key)
+            if self.has_lte2 and _step_applies_to_node(applies_to, "lte2"):
+                if _should_show_for_node(key, "lte2"):
+                    row2 = _StepRow(_row_label(key, label, "lte2"))
                     self.lte2_steps[key] = row2
                     lte2_rows.append(row2.control)
-                    if key not in self.selected_steps:
-                        row2.set_state("skip", "Not selected")
-            if applies_to in ("both", "gsm"):
-                row = _StepRow(label)
-                self.gsm_steps[key] = row
-                gsm_rows.append(row.control)
-                if key not in self.selected_steps:
-                    row.set_state("skip", "Not selected")
+                    if key in REMARK_STEPS:
+                        _apply_remark_state(row2, key)
+            if _step_applies_to_node(applies_to, "gsm"):
+                if _should_show_for_node(key, "gsm"):
+                    row = _StepRow(_row_label(key, label, "gsm"))
+                    self.gsm_steps[key] = row
+                    gsm_rows.append(row.control)
+                    if key in REMARK_STEPS:
+                        _apply_remark_state(row, key)
 
         columns = []
         lte_column = self._node_card(
@@ -608,9 +854,11 @@ class IntegrationRunPage:
 
     def _save_step_log(self, step_number: int, node_name: str,
                        log_suffix: str, node_tag: str = "lte"):
-        """Save per-node session log snapshot to LOG/<SHORTCODE>/NN_NODE_SUFFIX.txt."""
+        """Save per-node session log snapshot to LOG/<SHORTCODE>/SESSION/."""
         filename = f"{step_number:02d}_{node_name}_{log_suffix}.txt"
-        filepath = os.path.join(self.log_dir, filename)
+        session_dir = os.path.join(self.log_dir, "SESSION")
+        os.makedirs(session_dir, exist_ok=True)
+        filepath = os.path.join(session_dir, filename)
         with self._session_log_lock:
             snapshot = list(self._session_logs.get(node_tag, []))
         try:
@@ -675,6 +923,84 @@ class IntegrationRunPage:
         if key in steps:
             steps[key].set_state(state, detail)
         self._step_results.setdefault(node, {})[key] = state
+
+    def is_step_selected(self, step_key: str, node_tag: str) -> bool:
+        """Whether the operator ticked ``step_key`` for ``node_tag`` in
+        the multi-column checklist. Falls back to the flat union if a
+        per-node selection wasn't provided (older page state)."""
+        per_node = self.selected_steps_per_node.get(node_tag)
+        if per_node is not None:
+            return step_key in per_node
+        return step_key in self.selected_steps
+
+    def _retry_step(
+        self,
+        label: str,
+        fn,
+        node_tag: str,
+        step_key: str,
+        max_attempts: int = 3,
+        backoff: float = 3.0,
+    ) -> tuple[bool, str]:
+        """Run ``fn`` up to ``max_attempts`` times; mark "running (retry N)"
+        on each retry so the operator sees the attempt count live. Returns
+        the last (success, output). Never raises — exceptions are treated
+        as a failed attempt.
+
+        Use only for **idempotent** steps. Side-effecting steps that
+        submit jobs or apply MOs (enrollment, install_lkf, baseline,
+        relation) are NOT wrapped with this — retrying them could create
+        duplicate jobs or backups.
+        """
+        last_output = ""
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self._set_step(
+                    node_tag, step_key, "running",
+                    f"retry {attempt}/{max_attempts}",
+                )
+                self._ui_log(
+                    f"[retry] {label}: attempt {attempt}/{max_attempts}…"
+                )
+            try:
+                success, output = fn()
+                last_output = output if isinstance(output, str) else str(output)
+                if success:
+                    if attempt > 1:
+                        self._ui_log(
+                            f"[retry] {label}: passed on attempt "
+                            f"{attempt}/{max_attempts}."
+                        )
+                    return True, last_output
+                self._ui_log(
+                    f"[retry] {label}: attempt {attempt}/{max_attempts} "
+                    "returned failure."
+                )
+            except Exception as exc:
+                last_output = f"{type(exc).__name__}: {exc}"
+                self._ui_log(
+                    f"[retry] {label}: attempt {attempt}/{max_attempts} "
+                    f"raised {last_output}."
+                )
+            if attempt < max_attempts:
+                time.sleep(backoff)
+        return False, last_output
+
+    def _summary_cell(self, key: str, ntag: str, applies_to: str,
+                      results: dict[str, str]) -> str:
+        if key in SUMMARY_NA_STEPS:
+            return "N/A"
+
+        state = results.get(key, "skip")
+
+        if key == "enrollment_sync":
+            state = results.get("enrollment", state)
+
+        # Pre-verified manual rows — always rendered as done.
+        if key in ("bb_transport", "sw_package_check", "bb_power_on"):
+            state = "done"
+
+        return _RESULT_SYMBOLS.get(state, "—")
 
     # ── Blocking dialogs (called from worker threads) ────────────
     def _ask_user_retry(self, message: str) -> bool:
@@ -807,11 +1133,21 @@ class IntegrationRunPage:
                 if applies_to in ("both", "lte_nr"):
                     self._set_step("lte2", key, "skip", "No 2nd LTE/NR node")
 
-        selected_names = []
-        for key, label, _, _ in INTEGRATION_STEPS:
-            if key in self.selected_steps:
-                selected_names.append(label)
-        self._ui_log(f"Selected steps: {', '.join(selected_names)}")
+        # Log the selection per node so the operator can verify the
+        # multi-column checklist actually got handed off correctly.
+        node_label_map = {"lte": "LTE", "lte2": "LTE 2", "gsm": "GSM"}
+        for ntag in ("lte", "lte2", "gsm"):
+            per_node = self.selected_steps_per_node.get(ntag)
+            if not per_node:
+                continue
+            names = [
+                lbl for k, lbl, _, _ in INTEGRATION_STEPS
+                if k in per_node
+            ]
+            self._ui_log(
+                f"Selected steps for {node_label_map[ntag]}: "
+                f"{', '.join(names)}"
+            )
 
         if self.has_gsm:
             self._ui_log(
@@ -879,6 +1215,450 @@ class IntegrationRunPage:
         except Exception:
             pass
 
+    # ── Spreadsheet-styled summary table ───────────────────────
+    def _build_summary_table_flet(
+        self, node_order: list, node_labels: dict,
+    ) -> ft.Control:
+        """Build a spreadsheet-style summary table matching the
+        operator's ``PRE INTEGRATION CHECK LIST`` template:
+
+          - Left column: step labels on bright-yellow background, bold
+          - One column per node, white background, value text
+          - Cell values: ``Yes`` (green) / ``No`` (red) / ``N/A`` (black)
+            / ``pending`` (black)
+          - Thin black borders between every cell
+
+        Visual mirrors the screenshot the operator pasted; we reuse
+        the existing INTEGRATION_STEPS list and the existing filter
+        rules (no new rows, no new step keys)."""
+        # Colour palette — matches the operator's reference template
+        # (light blue row labels, conditional-format style cell fills).
+        HEADER_BG = "#D9D9D9"        # light gray for top-left + node headers
+        LABEL_BG = "#B6DDE8"         # light blue for row-label column
+        YES_BG = "#C6EFCE"           # light green fill for "Yes"
+        YES_FG = "#006100"           # dark green text for "Yes"
+        NO_BG = "#FFC7CE"            # light pink fill for "No"
+        NO_FG = "#9C0006"            # dark red text for "No"
+        NA_BG = "#FFFF00"            # bright yellow fill for "N/A"
+        NA_FG = "#000000"            # black text on yellow
+        PENDING_BG = "#FFEB9C"       # muted yellow for "pending"
+        PENDING_FG = "#9C5700"       # dark amber text for "pending"
+        NEUTRAL_FG = "#000000"
+        BORDER_C = "#000000"
+
+        LABEL_COL_W = 340
+        CELL_COL_W = 210
+        ROW_H = 30
+
+        def make_cell(
+            text: str, bg: str, fg: str,
+            weight=ft.FontWeight.NORMAL,
+            width: int = CELL_COL_W,
+            align_left: bool = False,
+        ) -> ft.Container:
+            return ft.Container(
+                content=ft.Text(
+                    text, color=fg, weight=weight, size=13,
+                    text_align=ft.TextAlign.LEFT if align_left
+                              else ft.TextAlign.CENTER,
+                ),
+                bgcolor=bg,
+                width=width,
+                height=ROW_H,
+                alignment=ft.Alignment(-1.0 if align_left else 0, 0),
+                border=ft.Border.all(0.5, BORDER_C),
+                padding=ft.Padding(
+                    left=10 if align_left else 6, top=0,
+                    right=6, bottom=0,
+                ),
+            )
+
+        rows: list = []
+
+        # ── Header row ──────────────────────────────────────────
+        header_cells = [
+            make_cell(
+                "", HEADER_BG, NEUTRAL_FG,
+                weight=ft.FontWeight.BOLD,
+                width=LABEL_COL_W, align_left=True,
+            ),
+        ]
+        for ntag in node_order:
+            header_cells.append(
+                make_cell(
+                    node_labels[ntag], HEADER_BG, NEUTRAL_FG,
+                    weight=ft.FontWeight.BOLD,
+                )
+            )
+        rows.append(ft.Row(header_cells, spacing=0, tight=True))
+
+        # ── Step rows ───────────────────────────────────────────
+        for key, label, applies_to, _ in INTEGRATION_STEPS:
+            # Same filter as the prettytable path: REMARK + SUMMARY_NA
+            # always show; everything else only if selected for at
+            # least one node.
+            if key not in REMARK_STEPS and key not in SUMMARY_NA_STEPS:
+                if not any(
+                    self.is_step_selected(key, nt)
+                    for nt in node_order
+                ):
+                    continue
+
+            # Label: same as the prettytable path (sgw_check varies
+            # by node type composition).
+            if key == "sgw_check":
+                if len(node_order) == 1 and node_order[0] == "gsm":
+                    row_label = "Verify BSC Broker IP Reachability"
+                else:
+                    row_label = "Verify SGw Reachability"
+                if len(node_order) > 1:
+                    row_label = "Verify SGw / BSC Broker Reachability"
+            else:
+                row_label = SUMMARY_LABELS.get(key, label)
+
+            row_cells = [
+                make_cell(
+                    row_label, LABEL_BG, NEUTRAL_FG,
+                    weight=ft.FontWeight.BOLD,
+                    width=LABEL_COL_W, align_left=False,  # centered like screenshot
+                ),
+            ]
+
+            for ntag in node_order:
+                # Step doesn't apply to this node type → N/A (yellow).
+                if not _step_applies_to_node(applies_to, ntag):
+                    row_cells.append(
+                        make_cell("N/A", NA_BG, NA_FG)
+                    )
+                    continue
+                # Operator didn't select for this node → pending (amber).
+                if (key not in REMARK_STEPS
+                        and key not in SUMMARY_NA_STEPS
+                        and not self.is_step_selected(key, ntag)):
+                    row_cells.append(
+                        make_cell("pending", PENDING_BG, PENDING_FG)
+                    )
+                    continue
+                # SUMMARY_NA rows always render N/A.
+                if key in SUMMARY_NA_STEPS:
+                    row_cells.append(
+                        make_cell("N/A", NA_BG, NA_FG)
+                    )
+                    continue
+
+                # Resolve run state — same derivations the existing
+                # ``_summary_cell`` uses, but emit text not emoji.
+                results = self._step_results.get(ntag, {})
+                state = results.get(key, "skip")
+                if key == "enrollment_sync":
+                    state = results.get("enrollment", state)
+                # Pre-verified manual rows: always show Yes
+                if key in ("bb_transport", "sw_package_check", "bb_power_on"):
+                    state = "done"
+
+                if state == "done":
+                    txt, bg, fg, w = "Yes", YES_BG, YES_FG, ft.FontWeight.BOLD
+                elif state == "error":
+                    txt, bg, fg, w = "No", NO_BG, NO_FG, ft.FontWeight.BOLD
+                elif state == "skip":
+                    txt, bg, fg, w = "N/A", NA_BG, NA_FG, ft.FontWeight.NORMAL
+                else:
+                    # "running" or anything unknown → pending
+                    txt, bg, fg, w = "pending", PENDING_BG, PENDING_FG, ft.FontWeight.NORMAL
+
+                row_cells.append(make_cell(txt, bg, fg, weight=w))
+
+            rows.append(ft.Row(row_cells, spacing=0, tight=True))
+
+        return ft.Column(rows, spacing=0, tight=True)
+
+    def _build_summary_grid_data(
+        self, node_order: list, node_labels: dict,
+    ) -> list[list[str]]:
+        """Return the summary table as a list of rows (each row = list
+        of plain strings). Reused by both the clipboard-copy helper
+        (which joins with tabs for Excel paste) and the XLSX export.
+
+        Layout matches the on-screen ``_build_summary_table_flet``
+        exactly, so what the operator sees == what gets copied / saved.
+        """
+        rows: list[list[str]] = []
+
+        # Header
+        header = ["PRE INTEGRATION CHECK LIST"] + [
+            node_labels[nt] for nt in node_order
+        ]
+        rows.append(header)
+
+        for key, label, applies_to, _ in INTEGRATION_STEPS:
+            # Visibility filter — same rule as the on-screen table
+            if key not in REMARK_STEPS and key not in SUMMARY_NA_STEPS:
+                if not any(
+                    self.is_step_selected(key, nt) for nt in node_order
+                ):
+                    continue
+
+            # Row label (sgw_check varies by node composition)
+            if key == "sgw_check":
+                if len(node_order) == 1 and node_order[0] == "gsm":
+                    row_label = "Verify BSC Broker IP Reachability"
+                else:
+                    row_label = "Verify SGw Reachability"
+                if len(node_order) > 1:
+                    row_label = "Verify SGw / BSC Broker Reachability"
+            else:
+                row_label = SUMMARY_LABELS.get(key, label)
+
+            row = [row_label]
+            for ntag in node_order:
+                if not _step_applies_to_node(applies_to, ntag):
+                    row.append("N/A")
+                    continue
+                if (key not in REMARK_STEPS
+                        and key not in SUMMARY_NA_STEPS
+                        and not self.is_step_selected(key, ntag)):
+                    row.append("pending")
+                    continue
+                if key in SUMMARY_NA_STEPS:
+                    row.append("N/A")
+                    continue
+
+                results = self._step_results.get(ntag, {})
+                state = results.get(key, "skip")
+                if key == "enrollment_sync":
+                    state = results.get("enrollment", state)
+                if key in ("bb_transport", "sw_package_check", "bb_power_on"):
+                    state = "done"
+
+                if state == "done":
+                    cell = "Yes"
+                elif state == "error":
+                    cell = "No"
+                elif state == "skip":
+                    cell = "N/A"
+                else:
+                    cell = "pending"
+                row.append(cell)
+            rows.append(row)
+        return rows
+
+    # ── Copy summary to clipboard ──────────────────────────────
+    # Flet's clipboard service is async (``await page.clipboard.set(s)``),
+    # so we dispatch via ``page.run_task`` from the sync button handler.
+    # The async core lives in ``_copy_summary_to_clipboard_async``.
+    def _copy_summary_to_clipboard(
+        self, node_order: list, node_labels: dict,
+    ) -> None:
+        try:
+            self.page.run_task(
+                self._copy_summary_to_clipboard_async,
+                node_order, node_labels,
+            )
+        except Exception as exc:
+            self._ui_log(f"✗ Copy dispatch failed: {exc}")
+
+    async def _copy_summary_to_clipboard_async(
+        self, node_order: list, node_labels: dict,
+    ) -> None:
+        """Build TSV (tab-separated values) and push to the OS
+        clipboard via Flet's async ``page.clipboard.set()``. TSV is
+        the format Excel/Sheets paste natively — tab = next column,
+        newline = next row."""
+        rows = self._build_summary_grid_data(node_order, node_labels)
+        tsv = "\n".join("\t".join(r) for r in rows)
+
+        # 1. Flet native clipboard — preferred path
+        try:
+            clipboard = getattr(self.page, "clipboard", None)
+            if clipboard is not None and hasattr(clipboard, "set"):
+                await clipboard.set(tsv)
+                self._ui_log(
+                    "✓ Summary copied to clipboard "
+                    "(paste into Excel: Ctrl+V on cell A1)."
+                )
+                return
+        except Exception as exc:
+            self._ui_log(
+                f"(Flet clipboard failed: {exc}; trying tkinter…)"
+            )
+
+        # 2. tkinter fallback — sync, off the UI thread to avoid hang.
+        # On some Windows setups, creating a Tk root from inside the
+        # main UI thread can lock up; run in a worker thread.
+        def _tk_copy():
+            try:
+                import tkinter as _tk
+                root = _tk.Tk()
+                root.withdraw()
+                root.clipboard_clear()
+                root.clipboard_append(tsv)
+                root.update()
+                root.destroy()
+                self._ui_log(
+                    "✓ Summary copied to clipboard (tkinter fallback)."
+                )
+            except Exception as exc:
+                self._ui_log(f"✗ Copy fallback failed: {exc}")
+        try:
+            self.page.run_thread(_tk_copy)
+        except Exception as exc:
+            self._ui_log(f"✗ Copy dispatch failed: {exc}")
+
+    # ── Save summary to xlsx ───────────────────────────────────
+    # Flet's modern ``FilePicker.save_file()`` is an async coroutine
+    # that RETURNS the chosen path directly (no ``on_result`` callback
+    # — that was the old API). Dispatch via ``page.run_task``.
+    def _save_summary_xlsx(
+        self, node_order: list, node_labels: dict,
+    ) -> None:
+        try:
+            self.page.run_task(
+                self._save_summary_xlsx_async,
+                node_order, node_labels,
+            )
+        except Exception as exc:
+            self._ui_log(f"✗ Save dispatch failed: {exc}")
+
+    async def _save_summary_xlsx_async(
+        self, node_order: list, node_labels: dict,
+    ) -> None:
+        """Pop the OS save dialog, await the chosen path, then write
+        the styled xlsx via openpyxl.
+
+        Flet 0.84+ note: ``FilePicker`` is a Service, not a Control.
+        It must be attached to ``page.services``, not ``page.overlay``
+        — otherwise the renderer complains "Unknown control: FilePicker"
+        and the dialog never opens. The old overlay placement worked
+        in pre-0.80 Flet but was deprecated in the same release that
+        introduced the async ``save_file()`` return-value API.
+        """
+        picker = ft.FilePicker()
+        attached_to = None
+        try:
+            services = getattr(self.page, "services", None)
+            if services is not None:
+                services.append(picker)
+                attached_to = "services"
+            else:
+                # Fallback for older Flet where FilePicker WAS a Control
+                self.page.overlay.append(picker)
+                attached_to = "overlay"
+            self.page.update()
+        except Exception as exc:
+            self._ui_log(f"✗ Could not mount file picker: {exc}")
+            return
+
+        default_name = (
+            f"INTEGRATION_SUMMARY_"
+            f"{re.sub(r'[^A-Za-z0-9._-]', '_', self.shortcode)}_"
+            f"{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        path = None
+        try:
+            path = await picker.save_file(
+                dialog_title="Save integration summary",
+                file_name=default_name,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["xlsx"],
+            )
+        except Exception as exc:
+            self._ui_log(f"✗ Save dialog failed: {exc}")
+
+        # Remove the transient picker from wherever we put it.
+        try:
+            if attached_to == "services":
+                services = getattr(self.page, "services", None)
+                if services is not None and picker in services:
+                    services.remove(picker)
+            elif attached_to == "overlay":
+                if picker in (self.page.overlay or []):
+                    self.page.overlay.remove(picker)
+            self.page.update()
+        except Exception:
+            pass
+
+        if not path:
+            # Operator cancelled — silent.
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            self._write_summary_xlsx(path, node_order, node_labels)
+            self._ui_log(f"✓ Saved summary → {path}")
+        except Exception as exc:
+            self._ui_log(f"✗ Save failed: {exc}")
+
+    def _write_summary_xlsx(
+        self, path: str, node_order: list, node_labels: dict,
+    ) -> None:
+        """openpyxl-based writer that mirrors the on-screen style:
+        yellow bold row labels, white data cells, green ``Yes`` / red
+        ``No`` / black ``N/A`` / ``pending``, thin black borders."""
+        from openpyxl import Workbook
+        from openpyxl.styles import (
+            Font, PatternFill, Alignment, Border, Side,
+        )
+        from openpyxl.utils import get_column_letter
+
+        rows = self._build_summary_grid_data(node_order, node_labels)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Pre Integration Check List"
+
+        # Palette — matches the on-screen Flet table exactly.
+        thin = Side(border_style="thin", color="000000")
+        cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill("solid", fgColor="D9D9D9")   # light gray
+        label_fill = PatternFill("solid", fgColor="B6DDE8")    # light blue
+        yes_fill = PatternFill("solid", fgColor="C6EFCE")      # light green
+        no_fill = PatternFill("solid", fgColor="FFC7CE")       # light pink
+        na_fill = PatternFill("solid", fgColor="FFFF00")       # bright yellow
+        pending_fill = PatternFill("solid", fgColor="FFEB9C")  # muted yellow
+        center = Alignment(horizontal="center", vertical="center")
+
+        for r_idx, row in enumerate(rows, start=1):
+            for c_idx, value in enumerate(row, start=1):
+                cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                cell.border = cell_border
+                if r_idx == 1:
+                    # Header row — bold black on light gray, centered
+                    cell.font = Font(bold=True, color="000000")
+                    cell.fill = header_fill
+                    cell.alignment = center
+                elif c_idx == 1:
+                    # Label column — bold black on light blue, centered
+                    cell.font = Font(bold=True, color="000000")
+                    cell.fill = label_fill
+                    cell.alignment = center
+                else:
+                    # Data cell — bg + text colour depend on value
+                    if value == "Yes":
+                        cell.font = Font(bold=True, color="006100")
+                        cell.fill = yes_fill
+                    elif value == "No":
+                        cell.font = Font(bold=True, color="9C0006")
+                        cell.fill = no_fill
+                    elif value == "N/A":
+                        cell.font = Font(color="000000")
+                        cell.fill = na_fill
+                    elif value == "pending":
+                        cell.font = Font(color="9C5700")
+                        cell.fill = pending_fill
+                    else:
+                        cell.font = Font(color="000000")
+                    cell.alignment = center
+
+        # Column widths
+        ws.column_dimensions["A"].width = 40
+        for c in range(2, len(rows[0]) + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 26
+
+        # Row heights (subtle — keep table compact)
+        for r in range(1, len(rows) + 1):
+            ws.row_dimensions[r].height = 20
+
+        wb.save(path)
+
     def _show_summary_popup(self):
         node_order = []
         node_labels = {}
@@ -891,27 +1671,139 @@ class IntegrationRunPage:
             node_order.append("gsm")
             node_labels["gsm"] = self.gsm_name or "GSM"
 
-        lines = []
-        for ntag in node_order:
-            nname = node_labels[ntag]
-            results = self._step_results.get(ntag, {})
-            if len(node_order) > 1:
-                lines.append(f"── {nname} ──")
-            for key, label, applies_to, _ in INTEGRATION_STEPS:
-                if applies_to not in ("both", "lte_nr" if ntag != "gsm" else "gsm"):
-                    continue
-                if key not in self.selected_steps:
-                    continue
-                state = results.get(key, "skip")
-                sym = _RESULT_SYMBOLS.get(state, "—")
-                summary_name = SUMMARY_LABELS.get(key, label)
-                lines.append(f"{summary_name}\t{sym}")
-            dur = self._node_durations.get(ntag, 0)
-            mins, secs = divmod(int(dur), 60)
-            lines.append(f"⏱ Total Time\t{mins:02d}:{secs:02d}")
-            lines.append("")
+        # Build a prettytable with columns: Check List | Node1 | Node2 | ...
+        try:
+            from prettytable import PrettyTable
+            use_prettytable = True
+        except ImportError:
+            use_prettytable = False
 
-        summary_text = "\n".join(lines).strip()
+        if use_prettytable:
+            col_names = ["Pre Integration Check List"] + [
+                node_labels[ntag] for ntag in node_order
+            ]
+            table = PrettyTable(col_names)
+            table.align = "l"
+            table.align["Pre Integration Check List"] = "l"
+            for ntag in node_order:
+                table.align[node_labels[ntag]] = "c"
+
+            for key, label, applies_to, _ in INTEGRATION_STEPS:
+                # Filter rule for the summary table:
+                #   * REMARK steps (bb_transport, enrollment_sync) always
+                #     show — their value is derived from other steps.
+                #   * SUMMARY_NA steps (bsc_neighbours, network_audit)
+                #     always show as N/A — they're documentation rows.
+                #   * Everything else only shows if the operator
+                #     selected this step for AT LEAST ONE node in the
+                #     multi-column checklist. Skipping un-selected
+                #     rows keeps the summary aligned with what was
+                #     actually attempted.
+                if key not in REMARK_STEPS and key not in SUMMARY_NA_STEPS:
+                    if not any(
+                        self.is_step_selected(key, nt)
+                        for nt in node_order
+                    ):
+                        continue
+
+                row = []
+                # Build label that varies by node type for sgw_check
+                if key == "sgw_check":
+                    # Show "Verify SGw Reachability" for LTE/NR,
+                    # "Verify BSC Broker IP Reachability" for GSM
+                    row_label = "Verify BSC Broker IP Reachability" if len(node_order) == 1 and node_order[0] == "gsm" else "Verify SGw Reachability"
+                else:
+                    row_label = SUMMARY_LABELS.get(key, label)
+
+                # For multi-node tables, infer the row label from the
+                # first applicable node type
+                if key == "sgw_check" and len(node_order) > 1:
+                    row_label = "Verify SGw / BSC Broker Reachability"
+
+                row = [row_label]
+                for ntag in node_order:
+                    # Steps that don't apply to this node type
+                    if applies_to not in ("both", "lte_nr" if ntag != "gsm" else "gsm"):
+                        row.append("N/A")
+                        continue
+                    # Operator opted out of this step for THIS node →
+                    # show "—" instead of forcing a misleading status.
+                    if (key not in REMARK_STEPS
+                            and key not in SUMMARY_NA_STEPS
+                            and not self.is_step_selected(key, ntag)):
+                        row.append("—")
+                        continue
+                    results = self._step_results.get(ntag, {})
+                    row.append(self._summary_cell(key, ntag, applies_to, results))
+                table.add_row(row)
+
+            # Add summary footer: total time and overall status
+            for ntag in node_order:
+                nname = node_labels[ntag]
+                results = self._step_results.get(ntag, {})
+                done_count = sum(1 for v in results.values() if v == "done")
+                total = len(self.selected_steps)
+                dur = self._node_durations.get(ntag, 0)
+                mins, secs = divmod(int(dur), 60)
+
+            summary_text = table.get_string()
+
+            # Add per-node status lines below the table
+            for ntag in node_order:
+                nname = node_labels[ntag]
+                results = self._step_results.get(ntag, {})
+                done_count = sum(1 for v in results.values() if v == "done")
+                # Total = steps selected for THIS node specifically
+                total_steps = len([
+                    k for k, _, a, _ in INTEGRATION_STEPS
+                    if self.is_step_selected(k, ntag)
+                    and a in ("both", "lte_nr" if ntag != "gsm" else "gsm")
+                ])
+                dur = self._node_durations.get(ntag, 0)
+                mins, secs = divmod(int(dur), 60)
+
+                any_error = any(v == "error" for v in results.values())
+                any_skip = any(v == "skip" for v in results.values())
+
+                if done_count == total_steps and not any_error:
+                    status = "Done"
+                elif any_error:
+                    status = "Completed with errors"
+                else:
+                    status = f"{done_count}/{total_steps} steps"
+                summary_text += f"\n{nname} {status}"
+                summary_text += f"\ntime {mins:02d}:{secs:02d}"
+        else:
+            lines = []
+            for ntag in node_order:
+                nname = node_labels[ntag]
+                results = self._step_results.get(ntag, {})
+                if len(node_order) > 1:
+                    lines.append(f"── {nname} ──")
+                for key, label, applies_to, _ in INTEGRATION_STEPS:
+                    if applies_to not in ("both", "lte_nr" if ntag != "gsm" else "gsm"):
+                        continue
+                    # Per-node filter: REMARK + SUMMARY_NA always show;
+                    # everything else only if selected for THIS node.
+                    if (key not in REMARK_STEPS
+                            and key not in SUMMARY_NA_STEPS
+                            and not self.is_step_selected(key, ntag)):
+                        continue
+                    if key == "sgw_check":
+                        summary_name = (
+                            "Verify BSC Broker IP Reachability"
+                            if ntag == "gsm"
+                            else "Verify SGw Reachability"
+                        )
+                    else:
+                        summary_name = SUMMARY_LABELS.get(key, label)
+                    cell = self._summary_cell(key, ntag, applies_to, results)
+                    lines.append(f"{summary_name}\t{cell}")
+                dur = self._node_durations.get(ntag, 0)
+                mins, secs = divmod(int(dur), 60)
+                lines.append(f"⏱ Total Time\t{mins:02d}:{secs:02d}")
+                lines.append("")
+            summary_text = "\n".join(lines).strip()
 
         close_event = threading.Event()
 
@@ -923,35 +1815,120 @@ class IntegrationRunPage:
                 pass
             close_event.set()
 
-        text_field = ft.TextField(
-            value=summary_text,
-            multiline=True,
-            read_only=True,
-            min_lines=12,
-            max_lines=30,
-            border_color=BORDER,
-            focused_border_color=ACCENT,
-            text_style=ft.TextStyle(size=13, font_family="Consolas"),
-            bgcolor=ft.Colors.with_opacity(0.15, PANEL),
-            border_radius=14,
-            filled=True,
-            expand=True,
+        window = getattr(self.page, "window", None)
+        window_width = getattr(window, "width", None) or 1380
+        window_height = getattr(window, "height", None) or 920
+        dialog_width = max(920, min(int(window_width * 0.92), 1320))
+        dialog_height = max(520, min(int(window_height * 0.82), 720))
+
+        # Spreadsheet-style table (per the operator's reference image).
+        # Replaces the previous monospace text-blob rendering.
+        summary_table = self._build_summary_table_flet(node_order, node_labels)
+
+        # Per-node footer: total time + completion ratio. Plain text
+        # under the table, no styling beyond muted colour.
+        footer_lines: list[str] = []
+        for ntag in node_order:
+            nname = node_labels[ntag]
+            results = self._step_results.get(ntag, {})
+            done_count = sum(1 for v in results.values() if v == "done")
+            total_steps = len([
+                k for k, _, a, _ in INTEGRATION_STEPS
+                if self.is_step_selected(k, ntag)
+                and a in ("both", "lte_nr" if ntag != "gsm" else "gsm")
+            ])
+            dur = self._node_durations.get(ntag, 0)
+            mins, secs = divmod(int(dur), 60)
+            any_error = any(v == "error" for v in results.values())
+            if done_count == total_steps and not any_error:
+                status = "Done"
+            elif any_error:
+                status = "Completed with errors"
+            else:
+                status = f"{done_count}/{total_steps} steps"
+            footer_lines.append(
+                f"{nname} — {status}    ⏱ {mins:02d}:{secs:02d}"
+            )
+
+        footer_text = ft.Text(
+            "\n".join(footer_lines),
+            size=12,
+            color=TEXT_MUTED,
+            selectable=True,
+            font_family="Consolas",
         )
+
+        summary_panel = ft.Container(
+            content=ft.Column(
+                [
+                    # Horizontal scroll wrapper for the table — keeps
+                    # wide multi-node layouts usable on small windows.
+                    ft.Row(
+                        [summary_table],
+                        scroll=ft.ScrollMode.AUTO,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    ft.Container(height=12),
+                    footer_text,
+                ],
+                spacing=4,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+            ),
+            bgcolor=ft.Colors.with_opacity(0.15, PANEL),
+            border=ft.Border.all(1, BORDER),
+            border_radius=14,
+            padding=12,
+            width=dialog_width,
+            height=dialog_height,
+        )
+
+        # Capture node_order / labels in closures so the action
+        # buttons don't need to recompute them.
+        _node_order_snap = list(node_order)
+        _node_labels_snap = dict(node_labels)
+
+        def _on_copy(e):
+            self._copy_summary_to_clipboard(
+                _node_order_snap, _node_labels_snap,
+            )
+
+        def _on_save_xlsx(e):
+            self._save_summary_xlsx(
+                _node_order_snap, _node_labels_snap,
+            )
 
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Text("Integration Summary", color=SUCCESS,
                           weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                content=ft.Column(
-                    [text_field],
-                    tight=True,
-                    scroll=ft.ScrollMode.AUTO,
-                ),
-                width=520,
-                height=460,
-            ),
+            content=summary_panel,
             actions=[
+                # Copy to clipboard (TSV) — paste into Excel/Sheets
+                # directly with Ctrl+V on cell A1. Each tab becomes a
+                # column, each newline a new row.
+                ft.TextButton(
+                    "Copy to Clipboard",
+                    icon=ft.Icons.CONTENT_COPY,
+                    tooltip=(
+                        "Copy table as tab-separated values. "
+                        "Paste into Excel/Google Sheets with Ctrl+V."
+                    ),
+                    style=ft.ButtonStyle(color=ACCENT),
+                    on_click=_on_copy,
+                ),
+                # Save as .xlsx with the same styling as the on-screen
+                # table (yellow row labels, green Yes / red No)
+                ft.TextButton(
+                    "Save as Excel",
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    tooltip=(
+                        "Save as a styled .xlsx file (same layout "
+                        "and colours as the on-screen table)."
+                    ),
+                    style=ft.ButtonStyle(color=ACCENT),
+                    on_click=_on_save_xlsx,
+                ),
                 ft.TextButton("Close",
                               style=ft.ButtonStyle(color=TEXT_MUTED),
                               on_click=_on_close),
@@ -984,6 +1961,7 @@ class IntegrationRunPage:
             run_backup_cv, run_take_dump, run_gsm_cell_define,
             run_take_cm_dump,
             run_uri_setting, run_pm_measurement, run_sgw_check,
+            run_external_alarm,
         )
 
         label = "LTE/NR" if node_tag == "lte" else ("LTE/NR #2" if node_tag == "lte2" else "GSM")
@@ -1014,7 +1992,7 @@ class IntegrationRunPage:
             ui_cb(f"SSH connection failed: {exc}")
             for key, _, applies_to, _ in INTEGRATION_STEPS:
                 if applies_to in ("both", node_type) and \
-                        key in self.selected_steps:
+                        self.is_step_selected(key, node_tag):
                     self._set_step(node_tag, key, "error", "SSH failed")
             return
 
@@ -1023,8 +2001,9 @@ class IntegrationRunPage:
             "enrollment", "install_lkf", "baseline", "ret_scripts",
             "relation", "uri_setting", "verify_mme", "sgw_check",
             "backup_cv", "take_dump", "take_cm_dump", "gsm_cell_define",
-            "pm_measurement",
+            "pm_measurement", "external_alarm",
         }
+        custom_moshell_log_steps = {"relation", "sgw_check"}
         in_amos = False
 
         try:
@@ -1032,11 +2011,19 @@ class IntegrationRunPage:
             for key, step_label, applies_to, log_suffix in INTEGRATION_STEPS:
                 if self.cancelled:
                     break
-                if applies_to not in ("both", node_type):
+                # Scope filter: the step's applies_to must include
+                # this node. The module-level helper handles "both",
+                # "lte_nr", "lte_primary" (lte only) and "gsm".
+                if not _step_applies_to_node(applies_to, node_tag):
                     continue
 
-                # Skip if not selected
-                if key not in self.selected_steps:
+                # Skip if the operator didn't select this step for THIS
+                # node in the multi-column checklist.
+                if not self.is_step_selected(key, node_tag):
+                    continue
+
+                # Skip summary-only steps: they have no runner logic.
+                if key in REMARK_STEPS or key in SUMMARY_NA_STEPS:
                     continue
 
                 # Enter AMOS lazily before the first step that needs it
@@ -1048,12 +2035,13 @@ class IntegrationRunPage:
                         ui_cb("AMOS session ready.")
                     except Exception as exc:
                         ui_cb(f"Failed to enter AMOS: {exc}")
-                        # Mark remaining selected steps as error
+                        # Mark remaining selected steps (for THIS node)
+                        # as error
                         remaining = False
                         for rk, _, ra, _ in INTEGRATION_STEPS:
                             if ra not in ("both", node_type):
                                 continue
-                            if rk not in self.selected_steps:
+                            if not self.is_step_selected(rk, node_tag):
                                 continue
                             if rk == key:
                                 remaining = True
@@ -1079,12 +2067,52 @@ class IntegrationRunPage:
                 except Exception as _exc:
                     ui_cb(f"(could not start session log: {_exc})")
 
+                remote_step_log_path = None
+                if key in amos_steps and key not in custom_moshell_log_steps:
+                    safe_node = (
+                        node_name.replace("/", "_")
+                        .replace("\\", "_")
+                        .replace(" ", "_")
+                    )
+                    remote_step_log_path = (
+                        f"/home/shared/{ssh.username}/{key.upper()}_{safe_node}.log"
+                    )
+                    try:
+                        ssh.run_amos_command_safe(
+                            f"!rm -f {remote_step_log_path}",
+                            node_name,
+                            timeout=15,
+                        )
+                        ssh.run_amos_command_safe(
+                            f"l+ {remote_step_log_path}",
+                            node_name,
+                            timeout=15,
+                        )
+                    except Exception as _exc:
+                        remote_step_log_path = None
+                        ui_cb(f"(could not start MOSHELL capture: {_exc})")
+
                 stopped = False
                 try:
                     if key == "create_arne":
+                        # Spec: continue on fail, retry only via user prompt
+                        # (no auto-retry). The runner's internal
+                        # ``wait_for_user`` re-checks ``cmedit get`` after
+                        # the user clicks Retry.
+                        #
+                        # GSM only: pass the BSC name so the runner also
+                        # sets ``controllingBsc`` →
+                        # ``NetworkElement=<bsc>`` after the ARNE entry
+                        # is verified.
+                        bsc_for_create = (
+                            self.form.get("bsc_name", "")
+                            if node_tag == "gsm"
+                            else None
+                        )
                         success, output = run_create_arne(
                             ssh, node_name, node_ip, subnetwork, detail_cb,
-                            wait_for_user=None,
+                            wait_for_user=self._ask_user_retry,
+                            bsc_name=bsc_for_create,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Verified")
@@ -1095,6 +2123,12 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — failed, continuing.")
 
                     elif key == "enrollment":
+                        # Spec: enrollment STOPS the workflow on failure
+                        # (no point running URI/LKF/baseline against an
+                        # un-enrolled node). Internal retries on
+                        # credential-status and sync checks are handled
+                        # inside ``run_enrollment`` (2 attempts, ~2 min
+                        # apart).
                         success, output = run_enrollment(
                             ssh, node_name, detail_cb,
                             wait_for_user=self._ask_user_retry,
@@ -1102,33 +2136,75 @@ class IntegrationRunPage:
                         if success:
                             self._set_step(node_tag, key, "done",
                                            "SYNCHRONIZED")
+                            self._set_step(node_tag, "enrollment_sync",
+                                           "done", "Auto-synced")
                             ui_cb(f"{step_label} — SYNCHRONIZED.")
                         else:
                             self._set_step(node_tag, key, "error",
                                            "Stopped by user")
+                            self._set_step(node_tag, "enrollment_sync",
+                                           "error", "Enrollment failed")
                             ui_cb(f"{step_label} — stopped by user.")
                             stopped = True
 
                     elif key == "install_lkf":
+                        # Spec: auto-retry 3 times, THEN fall back to a
+                        # user prompt — but never stop the workflow either
+                        # way. Inside the auto-retry loop we pass
+                        # ``wait_for_user=None`` so each attempt fails
+                        # cleanly without a dialog; the dialog is shown
+                        # only after all 3 auto-attempts have failed.
+                        #
+                        # Note: ``lkfinstall.py`` does submit an ENM job,
+                        # so a retry can in theory create a duplicate.
+                        # In practice the previous job either COMPLETED
+                        # (in which case the retry is a no-op verification)
+                        # or FAILED (in which case re-submitting is what
+                        # we want). Operator can still cancel via the
+                        # post-retry prompt if duplication is a concern.
                         lkf_file = self.form.get("lkf_file", "")
                         if not lkf_file:
                             self._set_step(node_tag, key, "skip",
                                            "No LKF file")
                             ui_cb(f"{step_label} — skipped (no file).")
                         else:
-                            success, output = run_install_lkf(
-                                ssh, node_name, lkf_file, detail_cb,
-                                wait_for_user=self._ask_user_retry,
+                            success, output = self._retry_step(
+                                step_label,
+                                lambda: run_install_lkf(
+                                    ssh, node_name, lkf_file, detail_cb,
+                                    wait_for_user=None,
+                                ),
+                                node_tag, key,
+                                max_attempts=3,
                             )
+                            # If all 3 auto-attempts failed, give the
+                            # operator one user-driven retry before
+                            # giving up — but still continue to the next
+                            # step regardless of their choice.
+                            if not success:
+                                ui_cb(
+                                    f"{step_label} — 3 auto-attempts "
+                                    "failed; asking operator."
+                                )
+                                self._set_step(
+                                    node_tag, key, "running",
+                                    "manual retry?",
+                                )
+                                success, output = run_install_lkf(
+                                    ssh, node_name, lkf_file, detail_cb,
+                                    wait_for_user=self._ask_user_retry,
+                                )
                             if success:
                                 self._set_step(node_tag, key, "done",
                                                "COMPLETED")
                                 ui_cb(f"{step_label} — completed.")
                             else:
                                 self._set_step(node_tag, key, "error",
-                                               "Failed")
-                                ui_cb(f"{step_label} — failed.")
-                                stopped = True
+                                               "Failed (continued)")
+                                ui_cb(
+                                    f"{step_label} — failed, continuing "
+                                    "to next step."
+                                )
 
                     elif key == "baseline":
                         success, output = run_baseline(
@@ -1144,6 +2220,10 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "relation":
+                        # Spec: continue on fail, no auto-retry — but if
+                        # any per-file error is detected, prompt the user
+                        # to check the log first, then continue (the
+                        # runner exposes this via wait_for_user).
                         relation_file = self.form.get("relation_file", "")
                         if not relation_file:
                             self._set_step(node_tag, key, "skip",
@@ -1153,7 +2233,7 @@ class IntegrationRunPage:
                             success, output = run_relation(
                                 ssh, node_name, self.shortcode,
                                 relation_file, self.log_dir, detail_cb,
-                                wait_for_user=None,
+                                wait_for_user=self._ask_user_retry,
                             )
                             if success:
                                 self._set_step(node_tag, key, "done",
@@ -1169,10 +2249,13 @@ class IntegrationRunPage:
                         ui_cb(f"{step_label} — skipped (coming soon).")
 
                     elif key == "uri_setting":
-                        success, output = run_uri_setting(
-                            ssh, node_name, username, password,
-                            detail_cb,
-                            wait_for_user=None,
+                        success, output = self._retry_step(
+                            step_label,
+                            lambda: run_uri_setting(
+                                ssh, node_name, username, password,
+                                detail_cb, wait_for_user=None,
+                            ),
+                            node_tag, key,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -1184,6 +2267,7 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "verify_mme":
+                        # Spec: no internal retry — single attempt.
                         success, output = run_verify_mme(
                             ssh, node_name, detail_cb,
                             wait_for_user=None,
@@ -1198,6 +2282,7 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — DISABLED found, continuing.")
 
                     elif key == "sgw_check":
+                        # Spec: no internal retry — single attempt.
                         success, output = run_sgw_check(
                             ssh, node_name, detail_cb,
                             wait_for_user=None,
@@ -1227,9 +2312,15 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — 0 instances, continuing.")
 
                     elif key == "backup_cv":
-                        success, output = run_backup_cv(
-                            ssh, node_name, detail_cb,
-                            wait_for_user=None,
+                        # Spec: 2 attempts.
+                        success, output = self._retry_step(
+                            step_label,
+                            lambda: run_backup_cv(
+                                ssh, node_name, detail_cb,
+                                wait_for_user=None,
+                            ),
+                            node_tag, key,
+                            max_attempts=2,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "SUCCESS")
@@ -1239,10 +2330,16 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} â€” failed, continuing to next step.")
 
                     elif key == "take_dump":
-                        success, output = run_take_dump(
-                            ssh, node_name, self.shortcode,
-                            self.log_dir, detail_cb,
-                            wait_for_user=None,
+                        # Spec: 2 attempts.
+                        success, output = self._retry_step(
+                            step_label,
+                            lambda: run_take_dump(
+                                ssh, node_name, self.shortcode,
+                                self.log_dir, detail_cb,
+                                wait_for_user=None,
+                            ),
+                            node_tag, key,
+                            max_attempts=2,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -1253,10 +2350,16 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "take_cm_dump":
-                        success, output = run_take_cm_dump(
-                            ssh, node_name, self.shortcode,
-                            self.log_dir, detail_cb,
-                            wait_for_user=None,
+                        # Spec: 2 attempts.
+                        success, output = self._retry_step(
+                            step_label,
+                            lambda: run_take_cm_dump(
+                                ssh, node_name, self.shortcode,
+                                self.log_dir, detail_cb,
+                                wait_for_user=None,
+                            ),
+                            node_tag, key,
+                            max_attempts=2,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -1267,11 +2370,16 @@ class IntegrationRunPage:
                             ui_cb(f"{step_label} — failed, continuing to next step.")
 
                     elif key == "pm_measurement":
+                        # Spec: 3 attempts, 2-minute pause between retries.
                         pm_type = "gsm" if node_tag == "gsm" else "lte_nr"
-                        success, output = run_pm_measurement(
-                            ssh, node_name, pm_type,
-                            detail_cb,
-                            wait_for_user=None,
+                        success, output = self._retry_step(
+                            step_label,
+                            lambda: run_pm_measurement(
+                                ssh, node_name, pm_type, detail_cb,
+                                wait_for_user=None,
+                            ),
+                            node_tag, key,
+                            max_attempts=3, backoff=120.0,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Active")
@@ -1279,6 +2387,27 @@ class IntegrationRunPage:
                         else:
                             self._set_step(node_tag, key, "error", "Failed (continued)")
                             ui_cb(f"{step_label} — failed, continuing to next step.")
+
+                    elif key == "external_alarm":
+                        # applies_to="lte_primary" — the run-loop scope
+                        # filter above already prevents this from
+                        # firing on lte2/gsm, so we don't double-check
+                        # here. Verify-only retry via user prompt.
+                        success, output = run_external_alarm(
+                            ssh, node_name, detail_cb,
+                            wait_for_user=self._ask_user_retry,
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done",
+                                           "8 AlarmPort MOs")
+                            ui_cb(f"{step_label} — verified (8 MOs).")
+                        else:
+                            self._set_step(node_tag, key, "error",
+                                           "Failed (continued)")
+                            ui_cb(
+                                f"{step_label} — failed, continuing to "
+                                "next step."
+                            )
 
                     else:
                         time.sleep(0.3)
@@ -1290,13 +2419,18 @@ class IntegrationRunPage:
                     self._set_step(node_tag, key, "error",
                                    str(exc)[:40])
                     ui_cb(f"{step_label} — FAILED: {exc}")
-                    # Only stop the whole workflow for pre-LKF-inclusive steps.
-                    # Everything after LKF continues on error.
-                    if key in ("enrollment", "install_lkf"):
-                        stopped = True
-                    else:
-                        ui_cb(f"{step_label} — continuing to next step despite error.")
+                    # Per user spec: a failed step never stops the
+                    # workflow. Every step continues to the next so the
+                    # operator gets a full status matrix at the end
+                    # rather than a half-finished run.
+                    ui_cb(f"{step_label} — continuing to next step despite error.")
                 finally:
+                    if remote_step_log_path:
+                        try:
+                            ssh.run_amos_command_safe("l-", node_name, timeout=15)
+                            ssh.register_remote_log(remote_step_log_path)
+                        except Exception as _exc:
+                            ui_cb(f"(could not finalize MOSHELL capture: {_exc})")
                     # Close the session log for this step (always, even on error)
                     try:
                         ssh.stop_step_log()
@@ -1346,6 +2480,140 @@ class IntegrationRunPage:
                                     ui_cb(
                                         f"(remote cleanup skipped: {_clean_exc})"
                                     )
+                            elif key == "baseline":
+                                # Multi-source fallback chain for baseline
+                                # log parsing:
+                                #
+                                #   1. Wrapped l+/l- log from server
+                                #      (already downloaded). Best case —
+                                #      clean isolated log of just the
+                                #      baseline run.
+                                #   2. SESSION log file at
+                                #      ``LOG/<node>/SESSION/SESSION_BASELINE_<node>.log``.
+                                #      Captured locally by
+                                #      ``start_step_log`` (tees every byte
+                                #      from the SSH channel), so it always
+                                #      contains the full live output —
+                                #      even when moshell's l+/l- inside
+                                #      the baseline script rebinds logging
+                                #      away from our wrapper.
+                                #
+                                # Detection rule: we want a log that
+                                # CONTAINS actual MO operations (the
+                                # parser looks for "Total: N MOs
+                                # attempted" / "MOs set" lines). Byte
+                                # size alone isn't enough — sometimes
+                                # the wrapped log captures just the
+                                # script source being echoed back (lots
+                                # of bytes, zero useful content) when
+                                # the operator's baseline.mos does its
+                                # own ``l-``/``l+`` right at the top.
+                                # If the wrapped log has ZERO MO
+                                # markers, we fall back to the SESSION
+                                # log unconditionally.
+                                MO_MARKERS = (
+                                    "MOs attempted",
+                                    "MOs set",
+                                    "MOs unchanged",
+                                )
+
+                                def _has_mo_content(path: str) -> bool:
+                                    try:
+                                        if (not os.path.exists(path)
+                                                or os.path.getsize(path) < 200):
+                                            return False
+                                        with open(path, "r",
+                                                  encoding="utf-8",
+                                                  errors="replace") as _fh:
+                                            content = _fh.read()
+                                        return any(
+                                            m in content for m in MO_MARKERS
+                                        )
+                                    except Exception:
+                                        return False
+
+                                parse_sources = list(downloaded)
+                                use_fallback = (
+                                    not parse_sources
+                                    or not any(
+                                        _has_mo_content(p)
+                                        for p in parse_sources
+                                    )
+                                )
+
+                                if use_fallback:
+                                    # Diagnostic — surface why we fell back
+                                    for p in parse_sources:
+                                        try:
+                                            sz = (
+                                                os.path.getsize(p)
+                                                if os.path.exists(p) else 0
+                                            )
+                                            ui_cb(
+                                                f"Wrapped log {os.path.basename(p)} "
+                                                f"({sz} bytes) has no MO-set "
+                                                "markers — likely captured "
+                                                "only the script source echo."
+                                            )
+                                        except Exception:
+                                            pass
+                                    ui_cb(
+                                        "Falling back to local SESSION log "
+                                        "for baseline parsing."
+                                    )
+                                    if os.path.exists(session_log_path):
+                                        parse_sources = [session_log_path]
+                                        sz = os.path.getsize(session_log_path)
+                                        ui_cb(
+                                            f"Using session log "
+                                            f"({sz} bytes): "
+                                            f"{session_log_path}"
+                                        )
+                                    else:
+                                        ui_cb(
+                                            f"(session log also missing: "
+                                            f"{session_log_path} — parser "
+                                            "will get nothing)"
+                                        )
+
+                                try:
+                                    parsed_path = build_baseline_log_excel(
+                                        parse_sources,
+                                        self.log_dir,
+                                        node_name,
+                                        log_cb=ui_cb,
+                                    )
+                                    ui_cb(
+                                        "Baseline log Excel created: "
+                                        f"{os.path.basename(parsed_path)}"
+                                    )
+                                    try:
+                                        bsummary = parse_baseline_summary(
+                                            parse_sources,
+                                        )
+                                        if bsummary:
+                                            ui_cb(
+                                                f"Baseline summary: "
+                                                f"{bsummary['total_commands']} commands — "
+                                                f"{bsummary['success']} OK, "
+                                                f"{bsummary['zero_mo']} zero MOs, "
+                                                f"{bsummary['error']} errors"
+                                            )
+                                            self._set_step(
+                                                node_tag, key,
+                                                self._step_results.get(node_tag, {}).get(key, "done"),
+                                                (
+                                                    f"{bsummary['success']} OK / "
+                                                    f"{bsummary['zero_mo']} zero / "
+                                                    f"{bsummary['error']} err"
+                                                ),
+                                            )
+                                    except Exception:
+                                        pass
+                                except Exception as parse_exc:
+                                    ui_cb(
+                                        f"(baseline log parsing skipped: {parse_exc})"
+                                    )
                     except Exception as _exc:
                         ui_cb(f"(could not download moshell logs: {_exc})")
 
@@ -1359,7 +2627,7 @@ class IntegrationRunPage:
                     for rkey, rlabel, rapplies, _ in INTEGRATION_STEPS:
                         if rapplies not in ("both", node_type):
                             continue
-                        if rkey not in self.selected_steps:
+                        if not self.is_step_selected(rkey, node_tag):
                             continue
                         if remaining:
                             self._set_step(
@@ -1479,4 +2747,3 @@ class _StepRow:
             ft.Colors.with_opacity(0.08, ACCENT)
             if state == "running" else None
         )
-
