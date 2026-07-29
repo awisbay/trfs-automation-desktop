@@ -225,46 +225,65 @@ def _display_ldn(ldn: str) -> str:
 #  CMDUMP (3GPP XML) — ported from CmdumpXMLParser
 # ══════════════════════════════════════════════════════════════════
 def _parse_cmdump_bytes(data: bytes) -> Dict[str, Dict[str, str]]:
+    """Parse cmdump XML by STREAMING with iterparse — never holds the whole
+    DOM (or the decompressed XML) in memory. For a zip we stream the entry
+    straight out of the archive; each MO subtree is cleared once emitted, so
+    peak RAM stays a fraction of the file size even for 300 MB+ bulk exports."""
     if zipfile.is_zipfile(io.BytesIO(data)):
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            xmls = [n for n in zf.namelist() if n.lower().endswith(".xml")]
-            if not xmls:
-                raise ValueError("cmdump zip has no .xml")
-            xml_bytes = zf.read(xmls[0])
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        xmls = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+        if not xmls:
+            raise ValueError("cmdump zip has no .xml")
+        source = zf.open(xmls[0])          # streaming, decompress on the fly
     else:
-        xml_bytes = data
-    root = ET.fromstring(xml_bytes)
-    config_data = root.find("{configData.xsd}configData")
-    if config_data is None:
-        # some exports nest differently — search anywhere
-        for el in root.iter():
-            if _local(el.tag) == "configData":
-                config_data = el
-                break
-    if config_data is None:
-        raise ValueError("cmdump XML has no configData")
+        source = io.BytesIO(data)
+    return _parse_cmdump_stream(source)
 
-    parent_map = {c: p for p in config_data.iter() for c in p}
+
+def _build_dn_stack(stack) -> str:
+    """Reconstruct the MO FDN from the live ancestor element stack (replaces
+    the old parent_map walk — same output, no giant parent dict)."""
+    parts = []
+    for cur in stack:
+        tag = _local(cur.tag)
+        mo_id = cur.get("id")
+        if tag == "VsDataContainer":
+            vt = _vs_data_type(cur)
+            if vt and mo_id:
+                parts.append((vt.replace("vsData", "", 1), mo_id))
+        elif tag != "attributes" and mo_id:
+            parts.append((tag, mo_id))
+    norm = []
+    for cls, mid in parts:
+        if norm and norm[-1] == (cls, mid):
+            continue
+        norm.append((cls, mid))
+    return _display_ldn(",".join(f"{c}={i}" for c, i in norm))
+
+
+def _parse_cmdump_stream(source) -> Dict[str, Dict[str, str]]:
     records: Dict[str, Dict[str, str]] = {}
-    for el in config_data.iter():
-        if _local(el.tag) != "VsDataContainer":
+    stack = []
+    for event, el in ET.iterparse(source, events=("start", "end")):
+        if event == "start":
+            stack.append(el)
             continue
-        vtype = _vs_data_type(el)
-        if not vtype:
-            continue
-        dn = _build_dn(el, parent_map)
-        attrs = _vs_attributes(el)
-        # Generic 3GPP attributes (e.g. <xn:userLabel>) live in the MO wrapper's
-        # own <xn:attributes> block — a sibling of the VsDataContainer, NOT
-        # inside <es:vsData…>. Merge them so attributes like ManagedElement's
-        # userLabel aren't lost. Ericsson (es:) values take priority on clash.
-        parent = parent_map.get(el)
-        if parent is not None:
-            for k, v in _generic_attributes(parent).items():
-                if not attrs.get(k):
-                    attrs[k] = v
-        if dn:
-            records.setdefault(dn, {}).update(attrs)
+        # end
+        if _local(el.tag) == "VsDataContainer":
+            vtype = _vs_data_type(el)
+            if vtype:
+                dn = _build_dn_stack(stack)
+                attrs = _vs_attributes(el)
+                # Generic 3GPP attributes (e.g. <xn:userLabel>) live on the MO
+                # wrapper (the immediate parent), not inside <es:vsData…>.
+                if len(stack) >= 2:
+                    for k, v in _generic_attributes(stack[-2]).items():
+                        if not attrs.get(k):
+                            attrs[k] = v
+                if dn:
+                    records.setdefault(dn, {}).update(attrs)
+            el.clear()          # release this MO's subtree
+        stack.pop()
     return records
 
 

@@ -324,8 +324,53 @@ def _write_summary(summ, results, meta):
     for cell in (lc, vc):
         cell.border = _BORDER
 
-    summ.column_dimensions["A"].width = 34
-    summ.column_dimensions["B"].width = 26
+    # ── Per-node breakdown (batch/cluster audits) ────────────────
+    nodes = {}
+    for res in results:
+        n = res.node or res.key or "-"
+        nd = nodes.setdefault(n, {"Match": 0, "Mismatch": 0,
+                                  "NotFound": 0, "MO_NotFound": 0})
+        nd[res.status] = nd.get(res.status, 0) + 1
+    if len(nodes) > 1:
+        r += 2
+        summ.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+        h = summ.cell(r, 1, "Per-node breakdown")
+        h.font = Font(bold=True, size=13, color="FFFFFF")
+        h.fill = PatternFill("solid", fgColor="4472C4")
+        h.alignment = _CENTER
+        r += 1
+        for c, txt in enumerate(("Node", "Match", "Mismatch",
+                                 "Not found", "MO not found", "Compliance"), 1):
+            cc = summ.cell(r, c, txt)
+            cc.font = Font(bold=True, color="FFFFFF")
+            cc.fill = PatternFill("solid", fgColor="8EA9DB")
+            cc.alignment = _CENTER
+            cc.border = _BORDER
+        r += 1
+        for n in sorted(nodes):
+            nd = nodes[n]
+            tot = sum(nd.values())
+            pc = nd["Match"] / tot * 100 if tot else 0.0
+            g, w = pc >= 95, pc >= 80
+            pfill = "C6EFCE" if g else ("FFEB9C" if w else "FFC7CE")
+            pfcol = "006100" if g else ("9C6500" if w else "9C0006")
+            vals = [n, nd["Match"], nd["Mismatch"], nd["NotFound"],
+                    nd["MO_NotFound"], f"{pc:.1f}%"]
+            for c, v in enumerate(vals, 1):
+                cc = summ.cell(r, c, v)
+                cc.border = _BORDER
+                cc.alignment = _LEFT if c == 1 else _CENTER
+            summ.cell(r, 2).fill = PatternFill("solid", fgColor="C6EFCE")
+            summ.cell(r, 3).fill = PatternFill("solid", fgColor="FFC7CE")
+            pcell = summ.cell(r, 6)
+            pcell.fill = PatternFill("solid", fgColor=pfill)
+            pcell.font = Font(bold=True, color=pfcol)
+            r += 1
+        for col, wdt in (("D", 14), ("E", 16), ("F", 14)):
+            summ.column_dimensions[col].width = wdt
+
+    summ.column_dimensions["A"].width = 40
+    summ.column_dimensions["B"].width = 24
     summ.column_dimensions["C"].width = 22
 
 
@@ -446,6 +491,9 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             # contiguous — easy to review or delete a whole parameter at once.
             for mo, param, val in sorted(groups[g], key=lambda x: (x[1], x[0])):
                 lines.append(f"set {mo}$ {param} {val}")
+        # Close the log opened with l+ at the top.
+        lines.append("")
+        lines.append("l-")
         path = os.path.join(out_dir, f"{node}_SetParameter_{stamp}.mos")
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")

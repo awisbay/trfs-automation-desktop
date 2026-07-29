@@ -57,6 +57,25 @@ def load_map(explicit_path: str = "") -> dict:
     raise FileNotFoundError("audit_map.json not found in: " + ", ".join(candidates))
 
 
+def resolve_map_path() -> str:
+    """Path of the audit_map.json the app actually uses (for the in-app editor):
+    the exe-dir copy if present, else the bundled/source copy. Prefers a
+    writable exe-dir location when running frozen."""
+    candidates = []
+    try:
+        from app_path import get_app_dir
+        candidates.append(os.path.join(get_app_dir(), "audit_map.json"))
+    except Exception:
+        pass
+    pkg_copy = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "audit_map.json"))
+    candidates.append(pkg_copy)
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return candidates[0] if candidates else pkg_copy
+
+
 _PLACEHOLDER = re.compile(r"\{([^}]+)\}")
 
 

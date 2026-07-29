@@ -4552,6 +4552,189 @@ def run_take_cm_dump(
     return True, all_output
 
 
+def run_take_cm_dump_batch(
+    ssh: IntegrationSSH,
+    node_list: list,
+    cluster: str,
+    local_zip_path: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Export CM config for MANY nodes in one ENM job → one combined zip.
+
+    Same ``cmedit export`` as the single-node take, but ``--ne`` receives a
+    semicolon-separated node list, so ENM produces one bulk file containing
+    every node's MOs. Run over the plain shell (cli.py talks to ENM directly —
+    no AMOS/node attach needed). Downloads to ``local_zip_path``.
+
+    Returns (success, full_output).
+    """
+    import re
+    all_output = ""
+    ne_scope = ";".join(n.strip() for n in node_list if n.strip())
+    date_str = time.strftime("%y%m%d_%H%M%S")
+    safe_cluster = re.sub(r"[^A-Za-z0-9._-]", "_", cluster or "BATCH")
+    job_name = f"{safe_cluster}_{date_str}_XML"
+
+    export_cmd = (f'python {CLI_PY} "cmedit export --ne {ne_scope} '
+                  f'--filetype 3GPP --jobname {job_name}"')
+    log_cb(f"Starting batch CM export for {len(node_list)} node(s) "
+           f"(job: {job_name})...")
+    out = ssh.run_command(export_cmd, timeout=180)
+    all_output += out
+    log_cb(f"Export output:\n{out}")
+
+    status_cmd = f'python {CLI_PY} "cmedit export --status --jobname {job_name}"'
+    log_cb("Checking export status...")
+    max_attempts = 30          # batch can take longer than a single node
+    remote_file = None
+    for attempt in range(1, max_attempts + 1):
+        out = ssh.run_command(status_cmd, timeout=90)
+        all_output += out
+        low = out.lower()
+        if "completed" in low:
+            for line in out.split("\n"):
+                m = re.search(r"(/\S+\.zip)", line)
+                if m:
+                    remote_file = m.group(1)
+                    break
+            log_cb("✓ Batch CM export completed.")
+            break
+        if "failed" in low:
+            log_cb(f"✗ Batch CM export failed (job {job_name}).")
+            if wait_for_user and wait_for_user("Batch export failed. Retry?"):
+                continue
+            return False, all_output
+        delay = 15 if attempt <= 6 else 30
+        log_cb(f"Export in progress ({attempt}/{max_attempts}), waiting {delay}s...")
+        time.sleep(delay)
+    else:
+        log_cb("✗ Batch CM export did not complete in time.")
+        return False, all_output
+
+    if not remote_file:
+        remote_file = f"/ericsson/batch/data/export/3gpp_export/{job_name}.zip"
+        log_cb(f"Using expected path: {remote_file}")
+
+    os.makedirs(os.path.dirname(local_zip_path), exist_ok=True)
+    log_cb(f"Downloading {os.path.basename(remote_file)} → {local_zip_path}...")
+    try:
+        ssh.sftp_download(remote_file, local_zip_path)
+        size = os.path.getsize(local_zip_path)
+        log_cb(f"✓ Batch dump saved: {local_zip_path} ({size:,} bytes)")
+    except Exception as exc:
+        log_cb(f"✗ SFTP download failed: {exc}")
+        all_output += f"[SFTP] {exc}\n"
+        return False, all_output
+
+    return True, all_output
+
+
+def run_moshell_script(ssh: IntegrationSSH, node_name: str, local_mos: str,
+                       log_cb: Callable[[str], None]) -> str:
+    """Upload a generated ``.mos`` script and run it against ``node_name`` with
+    ``amos <node> <script>`` (batch moshell). Returns the command output.
+
+    Used by the audit 'Run Scripts' flow — the user reviews/edits the .mos file
+    first, then explicitly runs it. This SETS parameters on the live node."""
+    import os as _os
+    sftp = ssh.client.open_sftp()
+    try:
+        home = sftp.normalize(".")
+        rdir = f"{home}/NODECRAFT_SCRIPTS"
+        try:
+            sftp.stat(rdir)
+        except FileNotFoundError:
+            sftp.mkdir(rdir)
+        remote = f"{rdir}/{_os.path.basename(local_mos)}"
+        sftp.put(local_mos, remote)
+        log_cb(f"Uploaded → {remote}")
+    finally:
+        sftp.close()
+    log_cb(f"Running: amos {node_name} {remote}")
+    out = ssh.run_command(f"amos {node_name} {remote}", timeout=1200)
+    return out
+
+
+def run_mobatch_scripts(ssh: IntegrationSSH, node_files: list, stamp: str,
+                        label: str, log_cb: Callable[[str], None],
+                        parallel_cap: int = 30) -> tuple:
+    """Run all generated per-node ``.mos`` in PARALLEL via ``mobatch``.
+
+    ``node_files`` = list of (node_name, local_mos_path). Every file shares the
+    same timestamp and is named ``<node>_SetParameter_<stamp>.mos``, so a single
+    mobatch command with the ``$nodename`` variable runs each node's own script:
+
+        mobatch -p <N> <sitelist> <dir>/$nodename_SetParameter_<stamp>.mos <logdir>
+
+    ``$nodename`` is single-quoted so the local bash doesn't expand it — mobatch
+    on the gateway substitutes it per node. Returns (output, remote_logdir)."""
+    import os as _os
+    sftp = ssh.client.open_sftp()
+    try:
+        home = sftp.normalize(".")
+        rdir = f"{home}/NODECRAFT_SCRIPTS"
+        try:
+            sftp.stat(rdir)
+        except FileNotFoundError:
+            sftp.mkdir(rdir)
+        for node, local in node_files:
+            sftp.put(local, f"{rdir}/{_os.path.basename(local)}")
+        sitelist = f"{rdir}/sitelist_{label}_{stamp}.txt"
+        with sftp.open(sitelist, "w") as fh:
+            fh.write("\n".join(n for n, _ in node_files) + "\n")
+        log_cb(f"Uploaded {len(node_files)} script(s) + sitelist → {rdir}")
+    finally:
+        sftp.close()
+
+    p = max(1, min(len(node_files), parallel_cap))
+    logdir = f"{home}/mobatch_logs/{label}"
+    script_tmpl = f"'{rdir}/$nodename_SetParameter_{stamp}.mos'"
+    # 'yes |' auto-answers mobatch's y/n confirmation so the run doesn't hang.
+    cmd = (f"mkdir -p {logdir}; yes | mobatch -p {p} {sitelist} "
+           f"{script_tmpl} {logdir}")
+    log_cb(f"Running: mobatch -p {p} {sitelist} "
+           f"$nodename_SetParameter_{stamp}.mos {logdir}")
+    out = ssh.run_command(cmd, timeout=5400)
+    return out, logdir
+
+
+def download_remote_dir(ssh: IntegrationSSH, remote_dir: str, local_dir: str,
+                        log_cb: Callable[[str], None]) -> list:
+    """Recursively SFTP-download every file under ``remote_dir`` into
+    ``local_dir`` (flattened structure preserved). Returns local file paths."""
+    import os as _os
+    from stat import S_ISDIR
+    sftp = ssh.client.open_sftp()
+    downloaded = []
+
+    def _walk(rdir, ldir):
+        _os.makedirs(ldir, exist_ok=True)
+        try:
+            entries = sftp.listdir_attr(rdir)
+        except FileNotFoundError:
+            log_cb(f"Remote dir not found: {rdir}")
+            return
+        for ent in entries:
+            rp = f"{rdir}/{ent.filename}"
+            lp = _os.path.join(ldir, ent.filename)
+            if S_ISDIR(ent.st_mode):
+                _walk(rp, lp)
+            else:
+                try:
+                    sftp.get(rp, lp)
+                    downloaded.append(lp)
+                except Exception as exc:
+                    log_cb(f"  ✗ download {ent.filename}: {exc}")
+
+    try:
+        _walk(remote_dir, local_dir)
+    finally:
+        sftp.close()
+    log_cb(f"Downloaded {len(downloaded)} file(s) → {local_dir}")
+    return downloaded
+
+
 # ── PM Measurement step ─────────────────────────────────────────
 # ── External Alarm step ──────────────────────────────────────────
 _EXTERNAL_ALARM_TEMPLATE = _resolve_script_path(_CFG.get(

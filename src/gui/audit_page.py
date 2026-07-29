@@ -11,10 +11,13 @@ Just enter the Site ID + browse the CDD(s). The page then:
   * compares everything against the config-driven mapping (audit_map.json)
     and exports a single Excel report.
 """
+import asyncio
 import glob
+import json
 import os
 import re
 import threading
+import time
 from datetime import datetime
 
 import flet as ft
@@ -50,10 +53,28 @@ class AuditPage:
         self.dump_field = self._tf(
             "Dump file(s) — optional; cm/modump. Blank = auto-find in "
             "LOG/<SiteID>/DUMP/", "", expand=3)
+        self.cluster_field = self._tf("Cluster name", "", expand=None)
+        self.cluster_field.width = 260
+        self.batch_count_text = ft.Text("", size=12, color=ACCENT,
+                                        weight=ft.FontWeight.BOLD)
+        self.batch_field = ft.TextField(
+            label="Batch nodes — node1;node2;node3;…  (live cmedit export). "
+                  "Leave blank to use the single-site Site ID above.",
+            value="", multiline=True, min_lines=2, max_lines=5, expand=True,
+            filled=True, border_radius=14, on_change=self._on_batch_change,
+            bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+            border_color=BORDER, focused_border_color=ACCENT,
+            label_style=ft.TextStyle(color=TEXT_MUTED),
+            text_style=ft.TextStyle(color=TEXT, size=13))
 
         self.status_text = ft.Text("", size=13, color=TEXT_MUTED)
+        self.timer_text = ft.Text("", size=13, color=ACCENT,
+                                  weight=ft.FontWeight.BOLD)
+        # Fixed, generous height so the LOG is spacious; the whole page
+        # scrolls if the window is short. Toggle button grows it further.
         self.log_col = ft.Column(
-            [], spacing=2, scroll=ft.ScrollMode.AUTO, expand=True, auto_scroll=True)
+            [], spacing=2, scroll=ft.ScrollMode.AUTO, height=460,
+            auto_scroll=True)
         self.run_btn = ft.ElevatedButton(
             "Run Audit", icon=ft.Icons.FACT_CHECK,
             style=primary_button_style(), on_click=self._run_audit)
@@ -63,6 +84,11 @@ class AuditPage:
         self.gen_btn = ft.ElevatedButton(
             "Generate Scripts", icon=ft.Icons.TERMINAL, visible=False,
             style=secondary_button_style(), on_click=self._generate_scripts)
+        self.runscript_btn = ft.ElevatedButton(
+            "Run Scripts", icon=ft.Icons.PLAY_ARROW, visible=False,
+            style=secondary_button_style(), on_click=self._open_run_scripts)
+        self.editmap_btn = ft.OutlinedButton(
+            "Edit Map", icon=ft.Icons.EDIT_NOTE, on_click=self._open_map_editor)
 
         def browse_row(field, handler, label):
             return ft.Row([
@@ -87,6 +113,7 @@ class AuditPage:
                     ft.Icon(ft.Icons.FACT_CHECK, size=26, color=ACCENT),
                     ft.Text("CDD Audit", size=22, weight=ft.FontWeight.BOLD, color=TEXT),
                     ft.Container(expand=True),
+                    self.editmap_btn,
                     ft.TextButton("← Back", on_click=lambda e: self.page.go("/form")),
                 ]),
                 ft.Text("Enter the Site ID and pick the CDD(s). Node dumps are "
@@ -99,20 +126,47 @@ class AuditPage:
                     browse_row(self.nr_field, self._browse_nr, "NR CDD"),
                     browse_row(self.gsm_field, self._browse_gsm, "GSM CDD"),
                     browse_row(self.dump_field, self._browse_dump, "Dump(s)"),
+                    ft.Divider(height=1, color=BORDER),
+                    ft.Text("Batch / Cluster audit — export many nodes live "
+                            "into one dump, then audit all at once:",
+                            size=11, color=TEXT_MUTED),
+                    ft.Row([self.cluster_field, self.batch_count_text,
+                            ft.Container(expand=True)],
+                           spacing=12,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([self.batch_field], spacing=10),
                     ft.Text(creds_line, size=11,
                             color=(TEXT_MUTED if creds_ok else ACCENT_WARM)),
                     ft.Row([self.run_btn, self.open_btn, self.gen_btn,
-                            self.status_text],
-                           spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            self.runscript_btn,
+                            self.timer_text, self.status_text],
+                           spacing=14, wrap=True,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=12), bgcolor=PANEL, padding=18),
                 panel(ft.Column([
-                    ft.Text("LOG", size=11, color=TEXT_MUTED, weight=ft.FontWeight.BOLD),
+                    ft.Row([
+                        ft.Text("LOG", size=11, color=TEXT_MUTED,
+                                weight=ft.FontWeight.BOLD),
+                        ft.Container(expand=True),
+                        ft.IconButton(
+                            icon=ft.Icons.OPEN_IN_FULL, icon_size=16,
+                            tooltip="Expand / shrink the log",
+                            on_click=self._toggle_log_height),
+                    ]),
                     self.log_col,
-                ], spacing=6, expand=True), bgcolor=PANEL, padding=12, expand=True),
-            ], spacing=12, expand=True),
+                ], spacing=6), bgcolor=PANEL, padding=12),
+            ], spacing=12, scroll=ft.ScrollMode.AUTO),
         )
         return ft.View(route="/audit", padding=0, spacing=0, bgcolor=BG_TOP,
                        controls=[body], services=[self.file_picker])
+
+    def _toggle_log_height(self, e):
+        self._log_big = not getattr(self, "_log_big", False)
+        self.log_col.height = 900 if self._log_big else 460
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     def _tf(self, label, value, expand=None):
         return ft.TextField(
@@ -139,6 +193,16 @@ class AuditPage:
 
     async def _browse_gsm(self, e):
         await self._pick_cdd(self.gsm_field, "Select GSM CDD")
+
+    def _on_batch_change(self, e):
+        nodes = [n for n in re.split(r"[;\n]+", self.batch_field.value)
+                 if n.strip()]
+        self.batch_count_text.value = (
+            f"→ {len(nodes)} node(s) to audit" if nodes else "")
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     async def _browse_dump(self, e):
         files = await self.file_picker.pick_files(
@@ -168,8 +232,15 @@ class AuditPage:
         nr = self.nr_field.value.strip()
         gsm = self.gsm_field.value.strip()
         dumps = [p.strip() for p in self.dump_field.value.split("|") if p.strip()]
-        if not site:
-            self._set_status("Site ID is required.", DANGER)
+        cluster = self.cluster_field.value.strip()
+        batch_nodes = [n.strip() for n in re.split(r"[;\n]+", self.batch_field.value)
+                       if n.strip()]
+        is_batch = bool(batch_nodes)
+        if not is_batch and not site:
+            self._set_status("Site ID (or batch nodes) is required.", DANGER)
+            return
+        if is_batch and not cluster:
+            self._set_status("Cluster name is required for batch audit.", DANGER)
             return
         if not (lte or nr or gsm):
             self._set_status("Pick at least one CDD (LTE / NR / GSM).", DANGER)
@@ -177,34 +248,120 @@ class AuditPage:
         self.run_btn.disabled = True
         self.open_btn.visible = False
         self.gen_btn.visible = False
-        self.status_text.value = "Running audit..."
+        self.status_text.value = ("Running batch audit..." if is_batch
+                                  else "Running audit...")
         self.status_text.color = ACCENT
+        self._start_timer()
         self.page.update()
-        threading.Thread(target=self._worker, args=(site, lte, nr, gsm, dumps),
-                         daemon=True).start()
+        threading.Thread(
+            target=self._worker,
+            args=(site, lte, nr, gsm, dumps, cluster, batch_nodes),
+            daemon=True).start()
+
+    # ── Elapsed timer ────────────────────────────────────────────
+    # Cross-thread page.update() is unreliable in this Flet build, so — like
+    # the integration progress page — the worker/timer threads only mutate
+    # control values and a single async loop on the event loop repaints.
+    def _start_timer(self):
+        self._t0 = time.time()
+        self._timer_on = True
+        threading.Thread(target=self._tick, daemon=True).start()
+        try:
+            self.page.run_task(self._ui_loop)
+        except Exception:
+            pass
+
+    def _tick(self):
+        while getattr(self, "_timer_on", False):
+            self.timer_text.value = f"⏱ {self._fmt_elapsed(time.time() - self._t0)}"
+            time.sleep(1)
+
+    async def _ui_loop(self):
+        while getattr(self, "_timer_on", False):
+            try:
+                self.page.update()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _stop_timer(self):
+        self._timer_on = False
+        if hasattr(self, "_t0"):
+            self.timer_text.value = f"⏱ {self._fmt_elapsed(time.time() - self._t0)}"
+
+    @staticmethod
+    def _fmt_elapsed(sec: float) -> str:
+        sec = int(sec)
+        m, s = divmod(sec, 60)
+        return f"{m}m {s:02d}s" if m else f"{s}s"
 
     def _set_status(self, msg, color):
         self.status_text.value = msg
         self.status_text.color = color
         self.page.update()
 
-    def _worker(self, site, lte, nr, gsm, dumps=None):
+    def _worker(self, site, lte, nr, gsm, dumps=None, cluster="", batch_nodes=None):
         ssh = None
         dumps = dumps or []
+        batch_nodes = batch_nodes or []
+        is_batch = bool(batch_nodes)
         try:
             from audit import dump_parser, cdd_reader, audit_core, cmedit_source
             from app_path import get_app_dir
 
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", site)
+            label = cluster if is_batch else site
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", label)
             records = {}
             nodes = []
+
+            # ── 0. BATCH: export all nodes live into one combined dump ─────
+            if is_batch:
+                from integration_runner import IntegrationSSH, run_take_cm_dump_batch
+                host = self._form.get("host", "")
+                user = self._form.get("username", "")
+                pwd = self._form.get("password", "")
+                if not (host and user and pwd):
+                    self._fail("Batch audit needs SSH credentials from the main "
+                               "form (host/username/password).")
+                    return
+                try:
+                    port = int(self._form.get("port", 5023) or 5023)
+                except (ValueError, TypeError):
+                    port = 5023
+                self._log(f"Batch: {len(batch_nodes)} node(s) → live cmedit "
+                          f"export (cluster '{cluster}').")
+                zip_path = os.path.join(get_app_dir(), "LOG", safe, "DUMP",
+                                        f"{safe}_batch_cmdump.zip")
+                ssh = IntegrationSSH(host=host, port=port, username=user,
+                                     password=pwd, log_callback=self._log)
+                ssh.connect(timeout=30)
+                ok, _out = run_take_cm_dump_batch(
+                    ssh, batch_nodes, cluster, zip_path, self._log)
+                if not ok:
+                    self._fail("Batch CM export failed — see log.")
+                    return
+                self._log(f"Parsing combined dump: {os.path.basename(zip_path)} ...")
+                records.update(dump_parser.parse_dump(zip_path))
+                # Nodes come from the records themselves (one file, many nodes).
+                seen = set()
+                for ldn in records:
+                    m = re.search(r"ManagedElement=([^,]+)", ldn)
+                    if m:
+                        seen.add(m.group(1))
+                nodes = sorted(seen)
+                self._log(f"  → {len(records)} MO(s) across {len(nodes)} node(s): "
+                          f"{', '.join(nodes[:6])}{' …' if len(nodes) > 6 else ''}")
 
             # ── 1. Parse node dumps — browsed file(s) first, then auto-find ──
             # Browsed dumps let you audit a node whose dump isn't in the site
             # folder, or point at a specific cm/modump. Both formats are
             # auto-detected by the parser. Auto-find still runs for LTE/NR.
             found = list(dumps)
-            if lte or nr:
+            if not is_batch and (lte or nr):
                 dump_dir = os.path.join(get_app_dir(), "LOG", safe, "DUMP")
                 auto = (sorted(glob.glob(os.path.join(dump_dir, "*_cmdump.zip")))
                         + sorted(glob.glob(os.path.join(dump_dir, "*_modump.zip"))))
@@ -249,7 +406,10 @@ class AuditPage:
             audit_map = cdd_reader.load_map()
 
             # ── 2. GSM: live cmedit (BSC), SSH creds from main form ──
-            if gsm:
+            # Single-site only — GSM is scoped by one Site ID; batch is LTE/NR.
+            if gsm and is_batch:
+                self._log("⚠ GSM CDD ignored in batch mode (batch = LTE/NR dump).")
+            if gsm and not is_batch:
                 gsm_cmedit = [p for p in audit_map.get("profiles", [])
                               if p.get("tech") == "gsm" and p.get("source") == "cmedit"]
                 host = self._form.get("host", "")
@@ -328,16 +488,18 @@ class AuditPage:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out = os.path.join(out_dir, f"{safe}_audit_{ts}.xlsx")
             audit_core.write_excel(results, out, {
-                "Site ID": site,
-                "Nodes": ", ".join(nodes),
+                ("Cluster" if is_batch else "Site ID"): label,
+                "Nodes": f"{len(nodes)} node(s): " + ", ".join(nodes),
                 "LTE CDD": os.path.basename(lte) if lte else "-",
                 "NR CDD": os.path.basename(nr) if nr else "-",
-                "GSM CDD": os.path.basename(gsm) if gsm else "-",
+                "GSM CDD": ("(n/a in batch)" if is_batch
+                            else (os.path.basename(gsm) if gsm else "-")),
+                "Mode": "Batch / Cluster" if is_batch else "Single site",
                 "Generated": ts,
             })
             self._result_path = out
             self._results = results
-            self._gen_ctx = {"site": site, "out_dir": out_dir, "xlsx": out}
+            self._gen_ctx = {"site": label, "out_dir": out_dir, "xlsx": out}
             self._log(f"✓ Report saved: {out}")
             self.status_text.value = (
                 f"Done — {c['Mismatch']} mismatch, "
@@ -348,6 +510,7 @@ class AuditPage:
         except Exception as exc:
             self._fail(f"Audit failed: {exc}")
         finally:
+            self._stop_timer()
             if ssh is not None:
                 try:
                     ssh.exit_amos()
@@ -395,10 +558,401 @@ class AuditPage:
             for p in paths:
                 self._log("   " + os.path.basename(p))
             self._set_status(f"Generated {len(paths)} script(s).", SUCCESS)
+            self._script_dir = script_dir
+            self.runscript_btn.visible = True
+            self.page.update()
             try:
-                os.startfile(script_dir)   # open the folder (Windows)
+                os.startfile(script_dir)   # open the folder (Windows) to edit
             except Exception:
                 pass
         except Exception as exc:
             self._log(f"✗ Script generation failed: {exc}")
             self._set_status("Script generation failed.", DANGER)
+
+    # ── Dialog helpers (Flet 0.84 managed dialog stack) ──────────
+    def _show_dialog(self, dlg):
+        if hasattr(self.page, "show_dialog"):
+            try:
+                self.page.show_dialog(dlg)
+                return
+            except Exception:
+                pass
+        try:
+            self.page.overlay.append(dlg)
+            dlg.open = True
+            self.page.update()
+        except Exception:
+            pass
+
+    def _close_dialog(self, dlg):
+        if hasattr(self.page, "pop_dialog"):
+            try:
+                self.page.pop_dialog()
+                return
+            except Exception:
+                pass
+        try:
+            dlg.open = False
+            if dlg in (self.page.overlay or []):
+                self.page.overlay.remove(dlg)
+            self.page.update()
+        except Exception:
+            pass
+
+    # ── #5: Audit-map editor — friendly table (saves as JSON) ────
+    def _mini_tf(self, label, value, width, read_only=False):
+        return ft.TextField(
+            label=label, value=value, width=width, dense=True, read_only=read_only,
+            filled=True, bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+            border_color=BORDER, focused_border_color=ACCENT,
+            label_style=ft.TextStyle(color=TEXT_MUTED, size=11),
+            text_style=ft.TextStyle(color=TEXT, size=12))
+
+    def _open_map_editor(self, e):
+        from audit import cdd_reader
+        path = cdd_reader.resolve_map_path()
+        self._map_path = path
+        try:
+            self._map_data = json.loads(open(path, encoding="utf-8").read())
+        except Exception as ex:
+            self._set_status(f"Map load failed: {ex}", DANGER)
+            return
+        profiles = self._map_data.get("profiles", [])
+        if not profiles:
+            self._set_status("Map has no profiles.", ACCENT_WARM)
+            return
+
+        self._map_prof_rows = {}   # profile index -> list of row states
+        containers = {}            # profile index -> ft.Column of rows
+
+        def make_row(i, col=None):
+            col = col or {}
+            is_split = "split" in col
+            cdd = self._mini_tf("CDD column", col.get("cdd", ""), 230)
+            if is_split:
+                lbl = "split → " + "/".join(
+                    s.get("attr", "") for s in col.get("split", []))
+                attr = self._mini_tf("MO attribute", lbl, 210, read_only=True)
+            else:
+                attr = self._mini_tf("MO attribute", col.get("attr", ""), 210)
+            via = self._mini_tf("via_ref (optional)", col.get("via_ref", ""), 160)
+            norm = self._mini_tf("norm (optional)", col.get("norm", ""), 120)
+            st = {"orig": col, "cdd": cdd, "attr": attr, "via": via,
+                  "norm": norm, "split": is_split, "prof": i}
+            st["row"] = ft.Row(
+                [cdd, attr, via, norm,
+                 ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=DANGER,
+                               tooltip="Remove parameter",
+                               on_click=lambda ev, s=st: remove_row(s))],
+                spacing=8, wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            return st
+
+        def render_prof(i):
+            containers[i].controls = [s["row"] for s in self._map_prof_rows[i]]
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        def add_row(i):
+            self._map_prof_rows[i].append(make_row(i))
+            render_prof(i)
+
+        def remove_row(st):
+            i = st["prof"]
+            self._map_prof_rows[i] = [s for s in self._map_prof_rows[i]
+                                      if s is not st]
+            render_prof(i)
+
+        def collect(i):
+            cols = []
+            for s in self._map_prof_rows[i]:
+                cdd = s["cdd"].value.strip()
+                if not cdd:
+                    continue
+                nc = dict(s["orig"]) if s["orig"] else {}
+                nc["cdd"] = cdd
+                if not s["split"]:
+                    attr = s["attr"].value.strip()
+                    if not attr:
+                        continue
+                    nc["attr"] = attr
+                v, n = s["via"].value.strip(), s["norm"].value.strip()
+                if v:
+                    nc["via_ref"] = v
+                elif "via_ref" in nc:
+                    del nc["via_ref"]
+                if n:
+                    nc["norm"] = n
+                elif "norm" in nc:
+                    del nc["norm"]
+                cols.append(nc)
+            profiles[i]["columns"] = cols
+
+        def save(ev):
+            for i in range(len(profiles)):
+                collect(i)
+            try:
+                txt = json.dumps(self._map_data, indent=2, ensure_ascii=False)
+                json.loads(txt)
+                with open(self._map_path, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                self._log(f"✓ Saved audit map: {self._map_path}")
+                self._set_status("Audit map saved (used on next Run).", SUCCESS)
+                self._close_dialog(dlg)
+            except Exception as ex:
+                self._set_status(f"Save failed: {ex}", DANGER)
+
+        def open_raw(ev):
+            self._close_dialog(dlg)
+            self._open_map_editor_raw()
+
+        # Build a section per profile — all shown at once.
+        sections = []
+        for i, p in enumerate(profiles):
+            self._map_prof_rows[i] = [make_row(i, c)
+                                      for c in p.get("columns", [])]
+            containers[i] = ft.Column(
+                [s["row"] for s in self._map_prof_rows[i]], spacing=6)
+            header = ft.Row([
+                ft.Text(p.get("name", "?"), weight=ft.FontWeight.BOLD,
+                        color=ACCENT, size=13),
+                ft.Text(f"[{p.get('tech','')}/{p.get('category','')}] "
+                        f"sheet={p.get('sheet','')}", size=10, color=TEXT_MUTED),
+                ft.Container(expand=True),
+                ft.TextButton("+ Add parameter",
+                              on_click=lambda ev, i=i: add_row(i)),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            sections.append(ft.Container(
+                content=ft.Column([header, containers[i]], spacing=6),
+                padding=10, border_radius=10,
+                bgcolor=ft.Colors.with_opacity(0.15, BG_BOTTOM)))
+        body_col = ft.Column(sections, spacing=14, scroll=ft.ScrollMode.AUTO,
+                             height=520)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Audit Map — all profiles ({len(profiles)})"),
+            content=ft.Container(width=1000, height=560, content=ft.Column([
+                ft.Text("All profiles and their parameters (CDD column ↔ MO "
+                        "attribute). Edit inline, Add/remove rows. Saved as "
+                        "audit_map.json; applies on the next Run.",
+                        size=11, color=TEXT_MUTED),
+                body_col,
+            ], spacing=10, tight=True)),
+            actions=[
+                ft.ElevatedButton("Save", icon=ft.Icons.SAVE,
+                                  style=primary_button_style(), on_click=save),
+                ft.TextButton("Raw JSON", on_click=open_raw),
+                ft.TextButton("Close",
+                              on_click=lambda ev: self._close_dialog(dlg)),
+            ],
+        )
+        self._show_dialog(dlg)
+
+    def _open_map_editor_raw(self):
+        from audit import cdd_reader
+        path = cdd_reader.resolve_map_path()
+        self._map_path = path
+        try:
+            content = open(path, encoding="utf-8").read()
+        except Exception:
+            content = "{}"
+        editor = ft.TextField(
+            value=content, multiline=True, min_lines=24, max_lines=24,
+            text_style=ft.TextStyle(font_family="Consolas", size=12, color=TEXT),
+            filled=True, bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+            border_color=BORDER, focused_border_color=ACCENT)
+        status = ft.Text("", size=12)
+        save_btn = ft.ElevatedButton("Save", icon=ft.Icons.SAVE,
+                                     style=primary_button_style())
+
+        def validate(_=None):
+            try:
+                json.loads(editor.value)
+                status.value, status.color = "✓ Valid JSON", SUCCESS
+                save_btn.disabled = False
+            except json.JSONDecodeError as ex:
+                status.value = f"✗ line {ex.lineno}, col {ex.colno}: {ex.msg}"
+                status.color = DANGER
+                save_btn.disabled = True
+            self.page.update()
+
+        def save(_):
+            try:
+                json.loads(editor.value)
+                with open(self._map_path, "w", encoding="utf-8") as f:
+                    f.write(editor.value)
+                self._log(f"✓ Saved audit map: {self._map_path}")
+                self._set_status("Audit map saved (used on next Run).", SUCCESS)
+                self._close_dialog(dlg)
+            except Exception as ex:
+                status.value, status.color = f"✗ {ex}", DANGER
+                self.page.update()
+
+        editor.on_change = validate
+        save_btn.on_click = save
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Audit Map — raw JSON ({os.path.basename(path)})"),
+            content=ft.Container(width=920, height=560, content=ft.Column([
+                ft.Text("Advanced: full JSON (profiles, cell_expand, split, …). "
+                        "Save is blocked while JSON is invalid.",
+                        size=11, color=TEXT_MUTED),
+                editor, status,
+            ], spacing=8, tight=True)),
+            actions=[save_btn,
+                     ft.TextButton("Close",
+                                   on_click=lambda e: self._close_dialog(dlg))],
+        )
+        validate()
+        self._show_dialog(dlg)
+
+    # ── #3: Run generated scripts (review/edit first, then run) ──
+    def _open_run_scripts(self, e):
+        sd = getattr(self, "_script_dir", "")
+        files = sorted(glob.glob(os.path.join(sd, "*.mos"))) if sd else []
+        if not files:
+            self._set_status("No scripts found — Generate first.", ACCENT_WARM)
+            return
+        checks = [ft.Checkbox(label=os.path.basename(p), value=True)
+                  for p in files]
+        rows = ft.Column(checks, spacing=2, scroll=ft.ScrollMode.AUTO,
+                         height=min(260, 40 + 24 * len(files)))
+        parallel_cb = ft.Checkbox(
+            label="Run in parallel via mobatch (-p up to 30) — recommended "
+                  "for many nodes", value=len(files) > 1)
+
+        def do_run(_):
+            selected = [files[i] for i, c in enumerate(checks) if c.value]
+            if not selected:
+                return
+            parallel = bool(parallel_cb.value)
+            self._close_dialog(dlg)
+            threading.Thread(target=self._run_scripts_worker,
+                             args=(selected, parallel), daemon=True).start()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Run Scripts on live node(s)"),
+            content=ft.Container(width=640, content=ft.Column([
+                ft.Text("⚠ This SETS parameters on the LIVE node(s). Review/edit "
+                        "the .mos files first (Generate opened the folder).",
+                        size=12, color=ACCENT_WARM),
+                ft.Text("Parallel = one mobatch job (light on the app, runs on "
+                        "the gateway). Sequential = amos, one node at a time.",
+                        size=11, color=TEXT_MUTED),
+                parallel_cb,
+                ft.Text("Select scripts to run:", size=12, color=TEXT_MUTED),
+                rows,
+            ], spacing=10, tight=True)),
+            actions=[
+                ft.ElevatedButton("Open folder", icon=ft.Icons.FOLDER_OPEN,
+                                  on_click=lambda e: os.startfile(sd)),
+                ft.ElevatedButton("Confirm & Run", icon=ft.Icons.PLAY_ARROW,
+                                  style=primary_button_style(), on_click=do_run),
+                ft.TextButton("Cancel", on_click=lambda e: self._close_dialog(dlg)),
+            ],
+        )
+        self._show_dialog(dlg)
+
+    @staticmethod
+    def _node_and_stamp(basename):
+        m = re.search(r"^(.*)_SetParameter_(\d{8}_\d{6})\.mos$", basename)
+        if m:
+            return m.group(1), m.group(2)
+        return re.sub(r"\.mos$", "", basename), ""
+
+    def _run_scripts_worker(self, files, parallel=False):
+        ssh = None
+        self._start_timer()
+        try:
+            from integration_runner import (IntegrationSSH, run_moshell_script,
+                                            run_mobatch_scripts,
+                                            download_remote_dir)
+            host = self._form.get("host", "")
+            user = self._form.get("username", "")
+            pwd = self._form.get("password", "")
+            if not (host and user and pwd):
+                self._fail("Run Scripts needs SSH credentials from the main form.")
+                return
+            try:
+                port = int(self._form.get("port", 5023) or 5023)
+            except (ValueError, TypeError):
+                port = 5023
+            label = (self._gen_ctx or {}).get("site", "SCRIPTS")
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", label)
+            self._log(f"SSH → {host}:{port} as {user} to run {len(files)} script(s)"
+                      f"{' via mobatch (parallel)' if parallel else ' (sequential)'}...")
+            ssh = IntegrationSSH(host=host, port=port, username=user,
+                                 password=pwd, log_callback=self._log)
+            ssh.connect(timeout=30)
+
+            if parallel and len(files) > 1:
+                node_files = []
+                stamp = ""
+                for p in files:
+                    n, s = self._node_and_stamp(os.path.basename(p))
+                    node_files.append((n, p))
+                    stamp = stamp or s
+                out, logdir = run_mobatch_scripts(
+                    ssh, node_files, stamp, safe, self._log, parallel_cap=30)
+                for line in out.splitlines()[-60:]:
+                    self._log("   " + line)
+                self._log(f"✓ mobatch done. Per-node logs on gateway: {logdir}")
+
+                # Download the mobatch logs into one local folder, then parse
+                # them (same engine as the relation logs) → a result Excel.
+                out_dir = (self._gen_ctx or {}).get("out_dir", "")
+                local_logs_dir = os.path.join(out_dir, "MOBATCH_LOGS", stamp or safe)
+                self._log(f"Downloading mobatch logs → {local_logs_dir} ...")
+                local_files = download_remote_dir(ssh, logdir, local_logs_dir,
+                                                  self._log)
+                logs = [p for p in local_files if p.lower().endswith(".log")]
+                if logs:
+                    try:
+                        from relation_log_parser import build_relation_log_excel
+                        xlsx = build_relation_log_excel(logs, local_logs_dir,
+                                                        safe, self._log)
+                        self._result_path = xlsx
+                        self.open_btn.visible = True
+                        self._log(f"✓ Parsed {len(logs)} log(s) → {xlsx}")
+                        self._set_status(
+                            f"mobatch done, {len(logs)} log(s) parsed — "
+                            "Open Report.", SUCCESS)
+                    except Exception as ex:
+                        self._log(f"✗ Log parse failed: {ex}")
+                        self._set_status("mobatch ran; log parse failed.",
+                                         ACCENT_WARM)
+                else:
+                    self._log("⚠ No .log files downloaded to parse.")
+                    self._set_status(f"mobatch ran {len(files)} node(s); "
+                                     "no logs found.", ACCENT_WARM)
+            else:
+                ok = 0
+                for path in files:
+                    node, _ = self._node_and_stamp(os.path.basename(path))
+                    self._log(f"── Running {os.path.basename(path)} on {node} ──")
+                    try:
+                        out = run_moshell_script(ssh, node, path, self._log)
+                        for line in out.splitlines()[-40:]:
+                            self._log("   " + line)
+                        ok += 1
+                    except Exception as ex:
+                        self._log(f"   ✗ failed: {ex}")
+                self._set_status(f"Ran {ok}/{len(files)} script(s) — check log.",
+                                 SUCCESS if ok == len(files) else ACCENT_WARM)
+        except Exception as exc:
+            self._fail(f"Run scripts failed: {exc}")
+        finally:
+            self._stop_timer()
+            if ssh is not None:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+            try:
+                self.page.update()
+            except Exception:
+                pass
