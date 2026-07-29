@@ -36,10 +36,16 @@
     "_comment_external_alarm": "Pre-define External Alarm — moshell template that creates the 8 AlarmPort MOs on the primary BB. LTE primary only.",
     "external_alarm_template": "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
 
-    "_comment_uri": "URI Reconfig — ENM REST endpoints + default UpgradePackage ID (auto-detected via 'pr UpgradePackage' at runtime; this is a fallback only).",
+    "_comment_bsc": "BSC name -> expected broker IP. Used by the GSM SGW check to verify the node's AbisIp bscBrokerIpAddress points at the RIGHT BSC. Edit here when a BSC is added/changed (no rebuild).",
+    "bsc_broker_map": {
+        "MINBS00": "10.14.194.131",
+        "MINBS01": "10.14.204.3"
+    },
+
+    "_comment_uri": "URI Reconfig + SW Level Check — ENM REST endpoints + target UpgradePackage ID. This value is used DIRECTLY (no auto-detect) for both URI Setting and SW Level Check. Edit it to the expected software version.",
     "uri_setting": {
         "enm_login_url":      "https://lhgenm1.globetel.com/login",
         "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
-        "upgrade_package_id": "CXP2010174/2-R42H05"
+        "upgrade_package_id": "CXP2010174/2-R42J13"
     }
 }

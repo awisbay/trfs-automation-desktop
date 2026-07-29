@@ -109,6 +109,23 @@ _SGW_CHECK_MOS = _resolve_script_path(
              "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos")
 )
 
+# New comprehensive ping tests. Two distinct scripts now:
+#   * LTE/NR — backhaul + MME + SGW reachability
+#   * GSM    — BSC broker IP reachability
+# When a single node hosts BOTH (co-located LTE+GSM / NR+GSM, no
+# separate GSM DN) we run BOTH scripts back-to-back on that one
+# node; the parser merges results so the 4-level status still
+# reflects the combined outcome.
+_PING_TEST_LTE_NR = _resolve_script_path(
+    _CFG.get("ping_test_lte_nr",
+             "/home/shared/ESETARI/INOC/SCRIPTS/DM/ping.txt")
+)
+_PING_TEST_GSM = _resolve_script_path(
+    _CFG.get("ping_test_gsm",
+             "/home/shared/common/INTEGRATION_TEAM/script/"
+             "Ping_Test_BSC_brokerIP.txt")
+)
+
 # LKF management scripts (typically at SCRIPTS_PATH root)
 _LKF_IMPORT = _resolve_script_path(
     _CFG.get("lkf_import_script",
@@ -213,7 +230,19 @@ ENM_URI_UPDATE_URL = _URI_CFG.get(
     "enm_uri_update_url",
     "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/"
     "updateUpMoFtpServerDetails")
-_UPGRADE_PKG_ID = _URI_CFG.get("upgrade_package_id", "CXP2010174/2-R42H05")
+_UPGRADE_PKG_ID = _URI_CFG.get("upgrade_package_id", "CXP2010174/2-R42J13")
+
+# BSC name → expected broker IP (config.json ``bsc_broker_map``). The GSM
+# SGW check verifies the node's own AbisIp bscBrokerIpAddress against this,
+# so a node configured with the WRONG BSC's broker (ping still succeeds!)
+# gets flagged instead of passing silently. Keys upper-cased for lookup.
+_BSC_BROKER_MAP = {
+    str(k).upper(): str(v).strip()
+    for k, v in _CFG.get("bsc_broker_map", {
+        "MINBS00": "10.14.194.131",
+        "MINBS01": "10.14.204.3",
+    }).items()
+}
 
 ANSI_ESCAPE = re.compile(
     r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]|\x1b\(B"
@@ -257,6 +286,12 @@ class IntegrationSSH:
         # is appended to this file (full moshell-style terminal capture).
         self._step_log_fp = None
         self._step_log_path: Optional[str] = None
+        # Optional live sink — when set, every decoded recv chunk is ALSO
+        # handed to this callback (in addition to the file tee) so the
+        # GUI can mirror the real moshell terminal stream per node. Kept
+        # deliberately dumb (raw chunk in, no parsing) so the SSH read
+        # hot-path stays cheap; the GUI side does any cleanup at render.
+        self._live_sink: Optional[Callable[[str], None]] = None
         # Server-side log files produced during a step; downloaded to
         # LOG/{SHORTCODE}/MOSHELL/ after the step completes.
         # Each entry: (remote_path, subfolder_or_None)
@@ -318,7 +353,16 @@ class IntegrationSSH:
         except Exception:
             pass
         try:
-            self._step_log_fp = open(path, "w", encoding="utf-8", buffering=1)
+            # Block buffering (not line-buffered): the tee writes every
+            # SSH byte here, so for multi-MB baseline/relation output a
+            # line-buffered file (``buffering=1``) flushes thousands of
+            # times — heavy disk I/O, especially with 3 nodes streaming
+            # at once. 64 KB block buffering cuts that to a handful of
+            # writes. The file is flushed + closed by stop_step_log
+            # before anything reads it back (e.g. baseline fallback).
+            self._step_log_fp = open(
+                path, "w", encoding="utf-8", buffering=65536,
+            )
             self._step_log_path = path
             header = (
                 f"# Live moshell session log\n"
@@ -346,11 +390,24 @@ class IntegrationSSH:
         self._step_log_fp = None
         self._step_log_path = None
 
+    def set_live_sink(self, sink: Optional[Callable[[str], None]]) -> None:
+        """Register a callback that mirrors every recv chunk (for the GUI
+        live terminal). Pass ``None`` to detach."""
+        self._live_sink = sink
+
     def _tee(self, chunk: str) -> None:
-        """Write a decoded recv chunk to the step log, if open."""
-        if self._step_log_fp is not None and chunk:
+        """Write a decoded recv chunk to the step log, if open, and
+        mirror it to the live sink (GUI terminal), if set."""
+        if not chunk:
+            return
+        if self._step_log_fp is not None:
             try:
                 self._step_log_fp.write(chunk)
+            except Exception:
+                pass
+        if self._live_sink is not None:
+            try:
+                self._live_sink(chunk)
             except Exception:
                 pass
 
@@ -555,7 +612,11 @@ class IntegrationSSH:
 
     def _read_until_prompt(self, timeout: int = 60) -> str:
         """Read output until a shell prompt is detected."""
-        buf = ""
+        # O(n²) avoidance: rolling tail for last-line prompt detection
+        # (see run_amos_blocking_with_sentinel for the rationale).
+        SCAN_MAX = 4096
+        buf_parts: list[str] = []
+        scan = ""
         start = time.time()
         while True:
             if self._channel_dead():
@@ -565,19 +626,22 @@ class IntegrationSSH:
                 logger.warning("Timeout (%ds) waiting for shell prompt", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
-                buf += chunk
-                clean = strip_ansi(buf)
-                last = clean.strip().split("\n")[-1].strip()
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                buf_parts.append(chunk)
+                scan = (scan + strip_ansi(chunk))[-SCAN_MAX:]
+                last = scan.strip().split("\n")[-1].strip() if scan.strip() else ""
                 if _is_shell_prompt(last):
                     # Drain any trailing bytes
                     time.sleep(0.3)
                     while self.shell.recv_ready():
-                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                        extra = self.shell.recv(65536).decode("utf-8", errors="replace")
+                        self._tee(extra)
+                        buf_parts.append(extra)
                     break
             else:
                 time.sleep(0.3)
-        return buf
+        return "".join(buf_parts)
 
     def _channel_dead(self) -> bool:
         """True if the shell channel has been closed/EOF'd — used so wait
@@ -628,7 +692,13 @@ class IntegrationSSH:
         import re
         self.send(command)
         prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
-        buf = ""
+        # Rolling-tail detection (O(1)/chunk). The ``[y/n]`` prompt
+        # appears right after the command (before any large output), so
+        # an 8 KB tail always catches it; the final AMOS prompt is one
+        # short line at the end.
+        SCAN_MAX = 8192
+        buf_parts: list[str] = []
+        scan = ""
         start = time.time()
         answered = False
         while True:
@@ -640,28 +710,29 @@ class IntegrationSSH:
                     "Timeout (%ds) waiting for AMOS prompt (autoyes)", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = (lambda _c=self.shell.recv(65536).decode(
-                    "utf-8", errors="replace"): (self._tee(_c), _c)[1])()
-                buf += chunk
-                clean = strip_ansi(buf)
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                buf_parts.append(chunk)
+                scan = (scan + strip_ansi(chunk))[-SCAN_MAX:]
                 # Auto-answer y/n confirmation
-                if not answered and "[y/n]" in clean.lower():
+                if not answered and "[y/n]" in scan.lower():
                     self._log("  auto-answering [y/n] prompt with 'y'")
                     self.send("y")
                     answered = True
                     continue
-                last = clean.strip().split("\n")[-1].strip()
+                last = scan.strip().split("\n")[-1].strip() if scan.strip() else ""
                 if (prompt_re.match(last)
                         and "<" not in last
                         and "/" not in last):
                     time.sleep(0.3)
                     while self.shell.recv_ready():
-                        buf += (lambda _c=self.shell.recv(65536).decode(
-                            "utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                        extra = self.shell.recv(65536).decode("utf-8", errors="replace")
+                        self._tee(extra)
+                        buf_parts.append(extra)
                     break
             else:
                 time.sleep(0.3)
-        return strip_ansi(buf)
+        return strip_ansi("".join(buf_parts))
 
     def drain_after_command(self, wait: float = 5.0, read_timeout: int = 300) -> str:
         """After a long-running command, drain any remaining output.
@@ -706,6 +777,8 @@ class IntegrationSSH:
         node_name: str,
         timeout: int = 3600,
         quiet_after: float = 10.0,
+        idle_timeout: float = 300.0,
+        on_activity: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Run a long-running AMOS command and wait for a sentinel echo
         AND a quiescence window to prove it *really* finished.
@@ -749,105 +822,143 @@ class IntegrationSSH:
         sentinel = f"__TRFS_DONE_{nonce}__"
         self._log(
             f"[sentinel] '{command}' → waiting for {sentinel} "
-            f"+ {quiet_after:.0f}s quiet"
+            f"(quiet={quiet_after:.0f}s, idle-timeout={idle_timeout:.0f}s, "
+            f"hard-timeout={timeout}s)"
         )
         self.send(command)
         # Small gap so moshell reads the command line before the echo.
         time.sleep(0.4)
         self.send(f"!echo {sentinel}")
 
-        prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
-        buf = ""
+        # PERFORMANCE: relation / baseline output can be many MB. We must
+        # NOT re-strip + re-split the whole accumulated buffer on every
+        # 64 KB recv — that's O(n²) and pegs a CPU core, starving the UI
+        # thread. We keep a small rolling ``scan`` window for detection.
+        SCAN_MAX = 8192
+        buf_parts: list[str] = []
+        scan = ""
+
         start = time.time()
         saw_sentinel = False
-        saw_prompt_after_sentinel = False
+        sentinel_time = 0.0
         last_byte_time = start
         last_progress = start
+        done_reason = "hard-timeout"
         while True:
             if self._channel_dead():
                 self._log("[sentinel] channel dead — aborting wait.")
+                done_reason = "channel-dead"
                 break
-            if time.time() - start > timeout:
+
+            now = time.time()
+            # Hard upper bound.
+            if now - start > timeout:
                 self._log(
-                    f"[sentinel] TIMEOUT after {timeout}s — "
+                    f"[sentinel] HARD TIMEOUT after {timeout}s — "
                     f"sentinel {'seen' if saw_sentinel else 'NOT seen'}. "
                     "Returning what we have."
                 )
+                done_reason = "hard-timeout"
                 break
+
             if self.shell.recv_ready():
                 chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
                 self._tee(chunk)
-                buf += chunk
+                buf_parts.append(chunk)
                 now = time.time()
                 last_byte_time = now
                 last_progress = now
-                clean = strip_ansi(buf)
-                if not saw_sentinel:
-                    # IMPORTANT: distinguish PTY input-echo from real
-                    # output. When we ``send("!echo SENTINEL")``, the PTY
-                    # may echo those bytes back to us *immediately* —
-                    # long before moshell actually executes the echo.
-                    # The input-echo line looks like
-                    #     "!echo __TRFS_DONE_xxx__"
-                    # while the real output line is
-                    #     "__TRFS_DONE_xxx__"   (on its own).
-                    # We only count the latter; otherwise we could flip
-                    # ``saw_sentinel`` true while the batch is still
-                    # running and a slow MO commit (>10s without output)
-                    # would falsely satisfy the quiescence gate.
-                    for line in clean.splitlines():
-                        s = line.strip()
-                        if s == sentinel:
-                            saw_sentinel = True
-                            elapsed = int(now - start)
-                            self._log(
-                                f"[sentinel] nonce seen on its own line "
-                                f"after {elapsed}s — script finished; "
-                                f"waiting for AMOS prompt + "
-                                f"{quiet_after:.0f}s of idle."
-                            )
-                            break
-                if saw_sentinel:
-                    last_line = ""
-                    for line in reversed(clean.splitlines()):
-                        if line.strip():
-                            last_line = line.strip()
-                            break
-                    if (prompt_re.match(last_line)
-                            and "<" not in last_line
-                            and "/" not in last_line):
-                        saw_prompt_after_sentinel = True
+                # Only strip ANSI when something actually needs it: the
+                # activity callback, or the still-running sentinel scan.
+                # After the sentinel is found (and with no on_activity),
+                # we skip the per-chunk strip entirely — the trailing
+                # settling bytes don't need scanning. Saves a full
+                # strip_ansi() per 64 KB chunk during the quiet window.
+                if on_activity or not saw_sentinel:
+                    stripped_chunk = strip_ansi(chunk)
+                    # Live activity callback (e.g. relation step detecting
+                    # "run <script>" lines for per-script UI progress).
+                    if on_activity:
+                        try:
+                            on_activity(stripped_chunk)
+                        except Exception:
+                            pass
+                    if not saw_sentinel:
+                        # Roll the small detection window (O(1) per chunk).
+                        scan = (scan + stripped_chunk)[-SCAN_MAX:]
+                        # Only the bare ``__TRFS_DONE_xxx__`` on its own
+                        # line counts (not the PTY echo of "!echo …").
+                        for line in scan.splitlines():
+                            if line.strip() == sentinel:
+                                saw_sentinel = True
+                                sentinel_time = now
+                                self._log(
+                                    f"[sentinel] nonce seen after "
+                                    f"{int(now - start)}s — script finished; "
+                                    f"settling {quiet_after:.0f}s for trailing "
+                                    "output."
+                                )
+                                break
+                # Yield the GIL so the asyncio UI event loop gets to run
+                # between chunks. Without this, 3 nodes streaming MB-large
+                # relation/baseline output keep the GIL busy back-to-back
+                # and the Flet window stops receiving render frames (goes
+                # black). sleep(0) is a near-zero-cost scheduler yield.
+                time.sleep(0)
             else:
                 now = time.time()
-                # Quiescence gate: sentinel fired, prompt returned, and
-                # channel has been silent for ``quiet_after`` seconds.
-                if (saw_sentinel
-                        and saw_prompt_after_sentinel
-                        and (now - last_byte_time) >= quiet_after):
+                # ── Completion gates (checked while idle) ──────────
+                # 1) Sentinel seen → the run genuinely returned to the
+                #    AMOS prompt and executed !echo. Once it's been
+                #    quiet for ``quiet_after`` seconds, return. We do
+                #    NOT additionally require a prompt-regex match — that
+                #    extra gate was fragile and caused hangs when the
+                #    final prompt line didn't match exactly.
+                if saw_sentinel and (now - last_byte_time) >= quiet_after:
                     self._log(
-                        f"[sentinel] prompt idle for {quiet_after:.0f}s — "
-                        "baseline/relation confirmed complete."
+                        f"[sentinel] complete — sentinel + "
+                        f"{quiet_after:.0f}s quiet."
                     )
+                    done_reason = "sentinel"
                     break
-                # Periodic heartbeat during multi-minute waits
-                if now - last_progress > 60:
-                    phase = (
-                        "pending sentinel"
-                        if not saw_sentinel
-                        else (
-                            "waiting for AMOS prompt"
-                            if not saw_prompt_after_sentinel
-                            else f"waiting for {quiet_after:.0f}s idle "
-                                 f"(last byte {int(now-last_byte_time)}s ago)"
-                        )
+                # 2) Sentinel NOT seen but the channel has been totally
+                #    silent for ``idle_timeout`` — the command is stuck
+                #    (moshell waiting on input, or hung). Give up rather
+                #    than block until the hours-long hard timeout. This
+                #    is the key fix for "one node stuck forever on
+                #    relation while others progress".
+                if (not saw_sentinel
+                        and (now - last_byte_time) >= idle_timeout):
+                    self._log(
+                        f"[sentinel] NO OUTPUT for {idle_timeout:.0f}s and "
+                        "no sentinel — assuming the command is stuck or "
+                        "finished without echoing. Proceeding with "
+                        "whatever output was captured."
                     )
+                    done_reason = "idle-timeout"
+                    break
+                # Heartbeat so the SESSION log shows it's alive + where.
+                if now - last_progress > 60:
+                    idle_for = int(now - last_byte_time)
+                    if saw_sentinel:
+                        phase = (
+                            f"sentinel seen, settling "
+                            f"(quiet {idle_for}/{int(quiet_after)}s)"
+                        )
+                    else:
+                        phase = (
+                            f"running, last output {idle_for}s ago "
+                            f"(stuck if reaches {int(idle_timeout)}s)"
+                        )
                     self._log(
                         f"[sentinel] still alive — {phase}, "
-                        f"elapsed={int(now-start)}s"
+                        f"elapsed={int(now - start)}s"
                     )
                     last_progress = now
                 time.sleep(0.5)
-        return strip_ansi(buf)
+
+        self._log(f"[sentinel] returning (reason={done_reason}).")
+        return strip_ansi("".join(buf_parts))
 
     def _read_until_amos(self, timeout: int = 120) -> str:
         """Read output until an AMOS/moshell prompt (``NODENAME>``) appears.
@@ -858,7 +969,13 @@ class IntegrationSSH:
         """
         import re
         prompt_re = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$")
-        buf = ""
+        # Same O(n²) avoidance as run_amos_blocking_with_sentinel: keep a
+        # small rolling tail for the last-line prompt check instead of
+        # re-stripping the whole buffer each chunk. Only the LAST line
+        # matters for prompt detection, so a few KB tail is plenty.
+        SCAN_MAX = 4096
+        buf_parts: list[str] = []
+        scan = ""
         start = time.time()
         while True:
             if self._channel_dead():
@@ -868,21 +985,24 @@ class IntegrationSSH:
                 logger.warning("Timeout (%ds) waiting for AMOS prompt", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
-                buf += chunk
-                clean = strip_ansi(buf)
-                last = clean.strip().split("\n")[-1].strip()
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                buf_parts.append(chunk)
+                scan = (scan + strip_ansi(chunk))[-SCAN_MAX:]
+                last = scan.strip().split("\n")[-1].strip() if scan.strip() else ""
                 # Real AMOS prompt: word-only token + '>', no XML chars
                 if (prompt_re.match(last)
                         and "<" not in last
                         and "/" not in last):
                     time.sleep(0.5)
                     while self.shell.recv_ready():
-                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                        extra = self.shell.recv(65536).decode("utf-8", errors="replace")
+                        self._tee(extra)
+                        buf_parts.append(extra)
                     break
             else:
                 time.sleep(0.3)
-        return buf
+        return "".join(buf_parts)
 
     def run_command(self, command: str, timeout: int = 60) -> str:
         """Run a command and wait for the shell prompt to return."""
@@ -908,8 +1028,16 @@ class IntegrationSSH:
         return strip_ansi(output)
 
     def _read_until_amos_or_prompt(self, timeout: int = 120) -> str:
-        """Read until AMOS prompt, handling username/password prompts with 'rbs'/'rbs'."""
-        buf = ""
+        """Read until AMOS prompt, handling username/password prompts with 'rbs'/'rbs'.
+
+        ``lt all`` loads tens of thousands of MOs — huge output — so we
+        use the rolling-tail technique (O(1) per chunk) instead of
+        re-stripping the whole buffer each time.
+        """
+        import re as _re
+        SCAN_MAX = 4096
+        buf_parts: list[str] = []
+        scan = ""
         start = time.time()
         sent_user = False
         sent_pass = False
@@ -921,10 +1049,11 @@ class IntegrationSSH:
                 logger.warning("Timeout (%ds) waiting for AMOS prompt", timeout)
                 break
             if self.shell.recv_ready():
-                chunk = (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
-                buf += chunk
-                clean = strip_ansi(buf)
-                tail = clean[-500:].lower()
+                chunk = self.shell.recv(65536).decode("utf-8", errors="replace")
+                self._tee(chunk)
+                buf_parts.append(chunk)
+                scan = (scan + strip_ansi(chunk))[-SCAN_MAX:]
+                tail = scan[-500:].lower()
                 if not sent_user and "enter username" in tail:
                     self._log("lt all: sending username 'rbs'")
                     self.send("rbs")
@@ -937,17 +1066,18 @@ class IntegrationSSH:
                     sent_pass = True
                     time.sleep(0.3)
                     continue
-                last = clean.strip().split("\n")[-1].strip()
-                import re as _re
+                last = scan.strip().split("\n")[-1].strip() if scan.strip() else ""
                 if (_re.match(r"^[A-Za-z][A-Za-z0-9_\-]*>\s*$", last)
                         and "<" not in last and "/" not in last):
                     time.sleep(0.5)
                     while self.shell.recv_ready():
-                        buf += (lambda _c=self.shell.recv(65536).decode("utf-8", errors="replace"): (self._tee(_c), _c)[1])()
+                        extra = self.shell.recv(65536).decode("utf-8", errors="replace")
+                        self._tee(extra)
+                        buf_parts.append(extra)
                     break
             else:
                 time.sleep(0.3)
-        return buf
+        return "".join(buf_parts)
 
     def exit_amos(self) -> str:
         """Exit AMOS session back to bash."""
@@ -970,17 +1100,52 @@ class IntegrationSSH:
             node_name: Node name (needed to re-enter AMOS after reconnect)
             timeout:   Command timeout
             in_amos:   If True, we're inside AMOS and should re-enter after reconnect.
+
+        Resilience: if the SSH socket has DIED (e.g. the gateway dropped
+        the session right after a long baseline run), we reconnect and
+        re-enter AMOS BEFORE running the command, then run it — so the
+        pending verification (cvls, st mme, etc.) resumes on a fresh
+        session instead of failing on a dead socket.
         """
+        # Pre-flight: dead socket → reconnect + re-enter AMOS first.
+        if self._channel_dead():
+            self._log(
+                "⚠ SSH socket is closed before command — reconnecting "
+                "and re-entering AMOS to resume..."
+            )
+            try:
+                self.reconnect()
+                if in_amos:
+                    self.enter_amos(node_name, timeout=90)
+            except Exception as exc:
+                self._log(f"✗ Reconnect failed: {exc}")
+                return ""
+
         output = self.run_amos_command(command, timeout=timeout)
-        if not self.is_session_expired(output):
+
+        # Post-flight: session-expired string OR the channel died mid /
+        # right-after the command → reconnect, re-enter AMOS, retry once.
+        if not self.is_session_expired(output) and not self._channel_dead():
             return output
 
-        self._log("⚠ Session expired detected — reconnecting SSH and re-entering AMOS...")
-        self.reconnect()
-        if in_amos:
-            self.enter_amos(node_name, timeout=90)
-        output2 = self.run_amos_command(command, timeout=timeout)
-        return output + "\n[SESSION RECONNECTED]\n" + output2
+        reason = (
+            "session expired"
+            if self.is_session_expired(output)
+            else "SSH socket closed"
+        )
+        self._log(
+            f"⚠ {reason} detected — reconnecting SSH and re-entering "
+            "AMOS, then retrying the command..."
+        )
+        try:
+            self.reconnect()
+            if in_amos:
+                self.enter_amos(node_name, timeout=90)
+            output2 = self.run_amos_command(command, timeout=timeout)
+            return output + "\n[SESSION RECONNECTED]\n" + output2
+        except Exception as exc:
+            self._log(f"✗ Reconnect/retry failed: {exc}")
+            return output
 
     def run_command_safe(
         self,
@@ -1054,6 +1219,7 @@ def run_create_arne(
     wait_for_user: Optional[Callable[[str], bool]] = None,
     *,
     bsc_name: Optional[str] = None,
+    log_dir: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run create_arne.py, fill the 3 prompts, then verify with cli.py.
 
@@ -1152,30 +1318,41 @@ def run_create_arne(
         if success:
             log_cb(f"✓ ARNE verified — {node_name} found (1 instance)")
 
-    # ── GSM only: set controllingBsc → NetworkElement=<BSC> ─────
-    # Same invocation pattern as ``verify_arne``: python + cli.py with
-    # the cmedit string wrapped in shell quotes. We then read the
-    # attribute back with ``cmedit get`` to confirm it was applied.
-    if bsc_name:
-        bsc = bsc_name.strip()
-        if not bsc:
-            log_cb("(controllingBsc skipped — empty BSC name)")
-        else:
-            set_ok, set_out = _set_controlling_bsc(
-                ssh, node_name, bsc, log_cb,
-                wait_for_user=wait_for_user,
+    # ── GSM: set controllingBsc → NetworkElement=<BSC> ──────────
+    # Triggered only when the caller passed a non-empty bsc_name
+    # (separate GSM node, or co-located GSM on the primary LTE node).
+    # We ALWAYS log the decision here — silent skips were impossible
+    # to trace from the field.
+    bsc = (bsc_name or "").strip()
+    if not bsc:
+        log_cb(
+            f"[controllingBsc] SKIPPED for {node_name} — no BSC name "
+            f"was passed to run_create_arne (bsc_name={bsc_name!r}). "
+            "This is expected for pure LTE/NR nodes. If this IS a GSM "
+            "or co-located node, check that the BSC Name field is "
+            "filled in the form."
+        )
+    else:
+        log_cb(
+            f"[controllingBsc] BSC name = '{bsc}' → proceeding to set "
+            f"controllingBsc on {node_name}."
+        )
+        set_ok, set_out = _set_controlling_bsc(
+            ssh, node_name, bsc, log_cb,
+            wait_for_user=wait_for_user,
+            log_dir=log_dir,
+        )
+        all_output += "\n" + set_out
+        if not set_ok:
+            # The controllingBsc set failed — but ARNE itself is
+            # already verified, so we report this as a partial
+            # failure. Caller decides whether to continue.
+            log_cb(
+                f"✗ controllingBsc could not be set on {node_name} "
+                f"→ NetworkElement={bsc}. ARNE entry exists but the "
+                "BSC link is missing."
             )
-            all_output += "\n" + set_out
-            if not set_ok:
-                # The controllingBsc set failed — but ARNE itself is
-                # already verified, so we report this as a partial
-                # failure. Caller decides whether to continue.
-                log_cb(
-                    f"✗ controllingBsc could not be set on {node_name} "
-                    f"→ NetworkElement={bsc}. ARNE entry exists but the "
-                    "BSC link is missing."
-                )
-                return False, all_output
+            return False, all_output
 
     return True, all_output
 
@@ -1186,89 +1363,205 @@ def _set_controlling_bsc(
     bsc_name: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    log_dir: Optional[str] = None,
+    in_amos: bool = False,
 ) -> tuple[bool, str]:
     """Set ``controllingBsc`` on a GSM NetworkElement and verify.
 
-    Sends, via the same ``python cli.py "<cmd>"`` wrapper used by
-    ``verify_arne``::
+    Sends the cmedit set/get through cli.py. The invocation style
+    depends on the SSH context:
 
-        cmedit set NetworkElement=<node> \\
-                   controllingBsc="NetworkElement=<bsc>"
+      * ``in_amos=False`` (bash shell — e.g. inside ``run_create_arne``
+        before AMOS is entered): ``python cli.py "<cmd>"`` via
+        ``ssh.run_command``.
+      * ``in_amos=True`` (inside an AMOS session — e.g. the GSM cell
+        define step): ``!python cli.py "<cmd>"`` via
+        ``ssh.run_amos_command_safe`` (the ``!`` shells out from AMOS).
 
-    Then reads back with ``cmedit get NetworkElement=<node> \\
-    controllingBsc`` and confirms the response shows the expected BSC.
-    On mismatch, prompts the operator to retry (same pattern as the
-    ARNE verification loop above).
+    Commands::
+
+        cmedit set NetworkElement=<node> controllingBsc="NetworkElement=<bsc>"
+        cmedit get <node> NetworkElement.controllingBsc
+
+    On mismatch, prompts the operator to retry (re-runs SET + GET).
+
+    If ``log_dir`` is given, a dedicated trace file is written to
+    ``<log_dir>/MOSHELL/CONTROLLING_BSC_<node>.log`` containing the
+    exact SET / GET commands and their raw output — so a failed BSC
+    link can be diagnosed from the field without re-running.
     """
+    import os as _os
+    import time as _time
+
     all_output = ""
     expected_value = f"NetworkElement={bsc_name}"
 
-    # Outer single quotes wrap the whole cmedit string for bash; the
-    # inner double quotes around the controllingBsc value are preserved
-    # and reach cli.py intact.
+    # cli.py invocation prefix + runner differ by context.
+    _prefix = "!python" if in_amos else "python"
+
+    def _exec(cmd: str) -> str:
+        if in_amos:
+            return ssh.run_amos_command_safe(cmd, node_name, timeout=60)
+        return ssh.run_command(cmd, timeout=60)
+
+    # Collect a structured trace for the dedicated log file.
+    _trace: list[str] = [
+        "=" * 72,
+        "controllingBsc SET + VERIFY trace",
+        f"Node: {node_name}",
+        f"Target BSC: {bsc_name}  (expected value: {expected_value})",
+        f"Started: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * 72,
+        "",
+    ]
+
+    def _trace_log(msg: str) -> None:
+        """Forward to the normal UI log AND accumulate for the file."""
+        log_cb(msg)
+        _trace.append(msg)
+
+    def _flush_trace(final_status: str) -> None:
+        _trace.append("")
+        _trace.append("-" * 72)
+        _trace.append(f"Result: {final_status}")
+        _trace.append(f"Finished: {_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if not log_dir:
+            return
+        try:
+            moshell_dir = _os.path.join(log_dir, "MOSHELL")
+            _os.makedirs(moshell_dir, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", node_name)
+            path = _os.path.join(
+                moshell_dir, f"CONTROLLING_BSC_{safe}.log"
+            )
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(_trace) + "\n")
+            log_cb(f"[controllingBsc] trace saved → {path}")
+        except Exception as exc:
+            log_cb(f"[controllingBsc] could not save trace: {exc}")
+
+    # ── SET ──────────────────────────────────────────────────
+    # cmedit set syntax accepted by ENM:
+    #   cmedit set NetworkElement=<node> controllingBsc="NetworkElement=<bsc>"
+    # The value MUST be wrapped in double quotes because it's an FDN
+    # reference (contains ``=``) — without quotes cmedit would parse
+    # ``controllingBsc=NetworkElement=BSC`` as two separate key=value
+    # pairs and silently set nothing.
+    #
+    # Shell-quoting: we wrap the WHOLE cmedit string in OUTER double
+    # quotes and ESCAPE the inner doubles, matching the established
+    # pattern used by ``verify_arne`` / ``cmedit action`` elsewhere.
+    # The previous single-quote-outer approach let the literal quotes
+    # bleed into cli.py's argument, which depending on cli.py's
+    # parsing could be why the set never took effect.
     set_cmd = (
-        f"python {CLI_PY} "
-        f"'cmedit set NetworkElement={node_name} "
-        f'controllingBsc="NetworkElement={bsc_name}"\''
+        f'{_prefix} {CLI_PY} '
+        f'"cmedit set NetworkElement={node_name} '
+        f'controllingBsc=\\"NetworkElement={bsc_name}\\""'
     )
-    log_cb(f"Setting controllingBsc on {node_name} → {expected_value}")
-    log_cb(f"  $ {set_cmd}")
-    set_out = ssh.run_command(set_cmd, timeout=60)
+
+    def _run_set() -> str:
+        _trace_log(f"Setting controllingBsc on {node_name} → {expected_value}")
+        _trace_log(f"  $ {set_cmd}")
+        out = _exec(set_cmd)
+        _trace_log(f"cmedit set output:\n{out}")
+        return out
+
+    set_out = _run_set()
     all_output += set_out
-    log_cb(f"cmedit set output:\n{set_out}")
 
-    # Verification: read attribute back. Successful "1 instance(s)
-    # updated" plus the BSC name appearing in the get output is our
-    # double-check.
+    # Give ENM ~3 s to commit the attribute before reading it back —
+    # cmedit set is fire-and-forget; the change isn't always visible
+    # to an immediate get.
+    _trace_log("Waiting 3 s for ENM to propagate the controllingBsc change…")
+    time.sleep(3)
+
+    # ── VERIFY ───────────────────────────────────────────────
+    # Correct cmedit syntax for reading a single MO-class attribute
+    # off a NetworkElement is to qualify with ``<MoClass>.<attr>``:
+    #     cmedit get <node> NetworkElement.controllingBsc
+    # Plain ``controllingBsc`` without the ``NetworkElement.`` prefix
+    # makes cmedit search every MO under the node — which is why the
+    # previous verify always saw ``null`` even when the set worked.
     get_cmd = (
-        f"python {CLI_PY} "
-        f'"cmedit get {node_name} controllingBsc"'
+        f'{_prefix} {CLI_PY} '
+        f'"cmedit get {node_name} NetworkElement.controllingBsc"'
     )
 
-    def _verify_once() -> tuple[bool, str]:
-        log_cb(f"  $ {get_cmd}")
-        out = ssh.run_command(get_cmd, timeout=60)
-        log_cb(f"cmedit get output:\n{out}")
-        ok = (
-            "1 instance(s)" in out
-            and expected_value in out
-        )
-        return ok, out
+    # Match the controllingBsc line specifically — anchored to its
+    # own line so the FDN line (``NetworkElement=<NODE>``) above it
+    # can't false-positive the substring search. ``null`` is the
+    # explicit "not set" sentinel.
+    _SUCCESS_RE = re.compile(
+        r"^\s*controllingBsc\s*:\s*NetworkElement\s*=\s*"
+        + re.escape(bsc_name) + r"\s*$",
+        re.MULTILINE,
+    )
+    _NULL_RE = re.compile(
+        r"^\s*controllingBsc\s*:\s*null\s*$", re.MULTILINE,
+    )
 
-    ok, get_out = _verify_once()
+    def _verify_once() -> tuple[bool, str, bool]:
+        """Returns (ok, output, is_explicit_null)."""
+        _trace_log(f"  $ {get_cmd}")
+        out = _exec(get_cmd)
+        _trace_log(f"cmedit get output:\n{out}")
+        ok = bool(_SUCCESS_RE.search(out))
+        is_null = bool(_NULL_RE.search(out)) and not ok
+        return ok, out, is_null
+
+    ok, get_out, is_null = _verify_once()
     all_output += "\n" + get_out
     if ok:
-        log_cb(
+        _trace_log(
             f"✓ controllingBsc verified on {node_name} → {expected_value}"
         )
+        _flush_trace("SUCCESS")
         return True, all_output
 
-    # Verification failed — same retry loop pattern as ARNE.
+    # ── Retry loop ───────────────────────────────────────────
+    # When verify shows ``null`` (set didn't take effect), re-RUN the
+    # SET command then re-verify — operator's manual retry usually
+    # works the second time. When verify shows some OTHER value (rare:
+    # set went through but to a different BSC), just re-verify.
     while not ok:
-        log_cb(
-            f"✗ controllingBsc not yet showing {expected_value} on "
-            f"{node_name}."
-        )
+        if is_null:
+            _trace_log(
+                f"✗ controllingBsc still null on {node_name} — set "
+                "did not take effect."
+            )
+        else:
+            _trace_log(
+                f"✗ controllingBsc on {node_name} is not "
+                f"{expected_value} (see output above)."
+            )
         if wait_for_user is None:
+            _flush_trace("FAILED (no user prompt available)")
             return False, all_output
         retry = wait_for_user(
-            f"Setting controllingBsc on '{node_name}' → "
-            f"'{expected_value}' did not verify.\n\n"
-            f"Check the output above (the attribute may need ENM "
-            f"propagation time, or the BSC name may be wrong).\n"
-            f"Click 'Retry' to re-check, or 'Stop' to skip the BSC "
-            f"link step."
+            f"controllingBsc on '{node_name}' did not verify as "
+            f"'{expected_value}'.\n\n"
+            "Click Retry — we'll re-run the SET and re-verify. "
+            "Click Stop to skip the BSC link step (ARNE itself is "
+            "already verified)."
         )
         if not retry:
-            log_cb("User chose to stop the controllingBsc verification.")
+            _trace_log("User chose to stop the controllingBsc verification.")
+            _flush_trace("STOPPED by user")
             return False, all_output
-        log_cb("User clicked Retry — re-checking controllingBsc…")
-        ok, get_out = _verify_once()
+        _trace_log("User clicked Retry — re-running set + verify…")
+        # Re-do the SET on retry (not just re-read), since the
+        # previous SET clearly didn't stick.
+        set_out2 = _run_set()
+        all_output += "\n" + set_out2
+        time.sleep(3)
+        ok, get_out, is_null = _verify_once()
         all_output += "\n" + get_out
 
-    log_cb(
+    _trace_log(
         f"✓ controllingBsc verified on {node_name} → {expected_value}"
     )
+    _flush_trace("SUCCESS (after retry)")
     return True, all_output
 
 
@@ -1585,13 +1878,24 @@ def run_install_lkf(
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
 ) -> tuple[bool, str]:
-    """Upload LKF zip via SFTP, import, install, and poll status.
+    """Install LKF and poll status. Works with or without a zip file.
 
-    Sub-steps:
-      1. SFTP upload LKF zip to ~/LKF/
-      2. lkfimport.py <zipfile>.zip
-      3. lkfinstall.py <nodename>  → extract job name
-      4. lkfstatus.py <jobname>    → poll until COMPLETED (max 10×60s)
+    Two modes:
+
+      A) Zip provided (``lkf_local_path`` non-empty):
+         0. Fast-path: skip upload+import if the per-node XML is
+            already on SMRS.
+         1. SFTP upload LKF zip to ~/LKF/
+         2. lkfimport.py <zipfile>.zip
+         3. lkfinstall.py <nodename>  → extract job name
+         4. lkfstatus.py <jobname>    → poll until COMPLETED
+
+      B) No zip (``lkf_local_path`` empty/None):
+         Skip steps 0/1/2 entirely. Go straight to step 3
+         (lkfinstall.py) — the license may already be imported in ENM
+         from a previous batch. Then poll status. If install/status
+         fails, return False WITHOUT prompting (caller continues to
+         the next step and just logs "LKF not available").
 
     Must be called while inside an AMOS session (or will enter one).
 
@@ -1599,131 +1903,145 @@ def run_install_lkf(
         (success: bool, full_output: str)
     """
     all_output = ""
-    zip_filename = os.path.basename(lkf_local_path)
-
-    # ── 0. Fast-path check: is this node's LKF already on SMRS? ─
-    # We open the zip locally (no upload yet) and look for the
-    # per-node XML inside. If a file with the same name is already in
-    # ``<smrs_dir>/<node>/`` on the gateway, the import was done in a
-    # previous run and we can skip straight to ``lkfinstall.py`` —
-    # saves an SFTP upload + a 10-minute lkfimport.py run.
-    target_xml = _find_node_lkf_in_zip(lkf_local_path, node_name)
-    skip_upload_and_import = False
-    if target_xml:
+    has_zip = bool(lkf_local_path and str(lkf_local_path).strip())
+    # In no-zip mode we never prompt the operator — failures are
+    # non-blocking (caller continues). This overrides any
+    # wait_for_user passed in.
+    if not has_zip:
+        wait_for_user = None
         log_cb(
-            f"Found LKF XML for {node_name} in zip: {target_xml} "
-            f"(matched non-_info.xml entry)"
+            f"No LKF zip provided — running lkfinstall.py for "
+            f"{node_name} directly (license may already be imported "
+            "in ENM). Will not prompt on failure; just report and "
+            "continue."
         )
-        try:
-            if _lkf_already_on_smrs(ssh, node_name, target_xml, log_cb):
-                log_cb(
-                    f"✓ LKF already on SMRS for {node_name} — "
-                    "skipping SFTP upload and lkfimport.py."
-                )
-                skip_upload_and_import = True
-                all_output += (
-                    f"[fast-path] LKF {target_xml} already present at "
-                    f"{_SMRS_LICENCE_DIR}/{node_name}/ — skipping import.\n"
-                )
-            else:
-                log_cb(
-                    f"LKF not present at "
-                    f"{_SMRS_LICENCE_DIR}/{node_name}/ — will do full "
-                    "upload + import flow."
-                )
-        except Exception as exc:
+
+    if has_zip:
+        zip_filename = os.path.basename(lkf_local_path)
+
+        # ── 0. Fast-path check: is this node's LKF already on SMRS? ─
+        # We open the zip locally (no upload yet) and look for the
+        # per-node XML inside. If a file with the same name is already in
+        # ``<smrs_dir>/<node>/`` on the gateway, the import was done in a
+        # previous run and we can skip straight to ``lkfinstall.py`` —
+        # saves an SFTP upload + a 10-minute lkfimport.py run.
+        target_xml = _find_node_lkf_in_zip(lkf_local_path, node_name)
+        skip_upload_and_import = False
+        if target_xml:
             log_cb(
-                f"(SMRS pre-check failed: {exc}; will do full flow)"
+                f"Found LKF XML for {node_name} in zip: {target_xml} "
+                f"(matched non-_info.xml entry)"
             )
-    else:
-        log_cb(
-            f"No matching <{node_name}>_*.xml found in {zip_filename} — "
-            "will do full upload + import flow."
-        )
-
-    if skip_upload_and_import:
-        log_cb("Skipping steps 1 & 2 (upload + import) — fast-path.")
-    else:
-        # ── 1. Upload LKF file via SFTP ──────────────────────────────
-        log_cb(f"Uploading LKF file: {zip_filename}...")
-        try:
-            # Upload to /home/shared/<username>/LKF
-            lkf_remote_dir = f"/home/shared/{ssh.username}/LKF"
-            remote_path = ssh.sftp_upload(lkf_local_path, lkf_remote_dir)
-            # Resolve ~ for display (actual path handled by SFTP)
-            all_output += f"[SFTP] Uploaded {zip_filename} → ~/LKF/{zip_filename}\n"
-            log_cb(f"✓ LKF file uploaded to ~/LKF/{zip_filename}")
-        except Exception as exc:
-            msg = f"SFTP upload failed: {exc}"
-            log_cb(f"✗ {msg}")
-            all_output += f"[SFTP] {msg}\n"
-            if wait_for_user:
-                retry = wait_for_user(
-                    f"LKF file upload failed: {exc}\n\n"
-                    f"Please upload the file manually to ~/LKF/ and click Retry."
+            try:
+                if _lkf_already_on_smrs(ssh, node_name, target_xml, log_cb):
+                    log_cb(
+                        f"✓ LKF already on SMRS for {node_name} — "
+                        "skipping SFTP upload and lkfimport.py."
+                    )
+                    skip_upload_and_import = True
+                    all_output += (
+                        f"[fast-path] LKF {target_xml} already present at "
+                        f"{_SMRS_LICENCE_DIR}/{node_name}/ — skipping import.\n"
+                    )
+                else:
+                    log_cb(
+                        f"LKF not present at "
+                        f"{_SMRS_LICENCE_DIR}/{node_name}/ — will do full "
+                        "upload + import flow."
+                    )
+            except Exception as exc:
+                log_cb(
+                    f"(SMRS pre-check failed: {exc}; will do full flow)"
                 )
-                if not retry:
-                    return False, all_output
-            else:
-                return False, all_output
-
-        # ── 2. Import LKF (direct SSH exec — much faster than !python in AMOS) ──
-        log_cb(f"Importing LKF: {zip_filename}...")
-        out = ssh.exec_ssh(
-            f"python {_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
-            timeout=600,
-        )
-        all_output += out
-        log_cb(f"lkfimport.py output:\n{out}")
-
-        # Validate the import succeeded BEFORE proceeding to install.
-        # Previously we plowed straight into ``lkfinstall.py`` regardless,
-        # so an import error (corrupt zip, ENM down) showed up as a
-        # confusing "no job name" later instead of a clear import failure.
-        upper_imp = out.upper()
-        import_ok = (
-            "IMPORTED SUCCESSFULLY" in upper_imp
-            or "IMPORT SUCCESSFUL" in upper_imp
-            or "ALREADY EXISTS" in upper_imp     # already imported earlier
-            or "ALREADY IMPORTED" in upper_imp
-        )
-        # Explicit failure markers — but be careful not to false-positive
-        # on harmless lines like "Error description: None".
-        import_failed = bool(
-            re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp)
-            or re.search(r"\bEXCEPTION\b", upper_imp)
-            or "TRACEBACK" in upper_imp
-        )
-        if import_failed and not import_ok:
-            msg = (
-                f"LKF import failed for {zip_filename}.\n"
-                f"Output tail:\n{out[-500:]}"
+        else:
+            log_cb(
+                f"No matching <{node_name}>_*.xml found in {zip_filename} — "
+                "will do full upload + import flow."
             )
-            log_cb(f"✗ {msg}")
-            if wait_for_user:
-                retry = wait_for_user(
-                    f"{msg}\n\nFix the issue (e.g. re-export the LKF, check ENM) "
-                    f"and click Retry, or Stop to abort."
-                )
-                if not retry:
+
+        if skip_upload_and_import:
+            log_cb("Skipping steps 1 & 2 (upload + import) — fast-path.")
+        else:
+            # ── 1. Upload LKF file via SFTP ──────────────────────────
+            log_cb(f"Uploading LKF file: {zip_filename}...")
+            try:
+                # Upload to /home/shared/<username>/LKF
+                lkf_remote_dir = f"/home/shared/{ssh.username}/LKF"
+                remote_path = ssh.sftp_upload(lkf_local_path, lkf_remote_dir)
+                # Resolve ~ for display (actual path handled by SFTP)
+                all_output += f"[SFTP] Uploaded {zip_filename} → ~/LKF/{zip_filename}\n"
+                log_cb(f"✓ LKF file uploaded to ~/LKF/{zip_filename}")
+            except Exception as exc:
+                msg = f"SFTP upload failed: {exc}"
+                log_cb(f"✗ {msg}")
+                all_output += f"[SFTP] {msg}\n"
+                if wait_for_user:
+                    retry = wait_for_user(
+                        f"LKF file upload failed: {exc}\n\n"
+                        f"Please upload the file manually to ~/LKF/ and click Retry."
+                    )
+                    if not retry:
+                        return False, all_output
+                else:
                     return False, all_output
-                # One re-attempt
-                out = ssh.exec_ssh(
-                    f"python {_LKF_IMPORT} "
-                    f"/home/shared/{ssh.username}/LKF/{zip_filename}",
-                    timeout=600,
+
+            # ── 2. Import LKF (direct SSH exec — faster than !python) ──
+            log_cb(f"Importing LKF: {zip_filename}...")
+            out = ssh.exec_ssh(
+                f"python {_LKF_IMPORT} /home/shared/{ssh.username}/LKF/{zip_filename}",
+                timeout=600,
+            )
+            all_output += out
+            log_cb(f"lkfimport.py output:\n{out}")
+
+            # Validate the import succeeded BEFORE proceeding to install.
+            # Previously we plowed straight into ``lkfinstall.py`` regardless,
+            # so an import error (corrupt zip, ENM down) showed up as a
+            # confusing "no job name" later instead of a clear import failure.
+            upper_imp = out.upper()
+            import_ok = (
+                "IMPORTED SUCCESSFULLY" in upper_imp
+                or "IMPORT SUCCESSFUL" in upper_imp
+                or "ALREADY EXISTS" in upper_imp     # already imported earlier
+                or "ALREADY IMPORTED" in upper_imp
+            )
+            # Explicit failure markers — but be careful not to false-positive
+            # on harmless lines like "Error description: None".
+            import_failed = bool(
+                re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp)
+                or re.search(r"\bEXCEPTION\b", upper_imp)
+                or "TRACEBACK" in upper_imp
+            )
+            if import_failed and not import_ok:
+                msg = (
+                    f"LKF import failed for {zip_filename}.\n"
+                    f"Output tail:\n{out[-500:]}"
                 )
-                all_output += out
-                log_cb(f"Retry import output:\n{out}")
-                upper_imp = out.upper()
-                if (re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp) and
-                        "IMPORTED" not in upper_imp and
-                        "ALREADY" not in upper_imp):
-                    log_cb("✗ Import still failed.")
+                log_cb(f"✗ {msg}")
+                if wait_for_user:
+                    retry = wait_for_user(
+                        f"{msg}\n\nFix the issue (e.g. re-export the LKF, check ENM) "
+                        f"and click Retry, or Stop to abort."
+                    )
+                    if not retry:
+                        return False, all_output
+                    # One re-attempt
+                    out = ssh.exec_ssh(
+                        f"python {_LKF_IMPORT} "
+                        f"/home/shared/{ssh.username}/LKF/{zip_filename}",
+                        timeout=600,
+                    )
+                    all_output += out
+                    log_cb(f"Retry import output:\n{out}")
+                    upper_imp = out.upper()
+                    if (re.search(r"\bFAIL(?:ED|URE)?\b", upper_imp) and
+                            "IMPORTED" not in upper_imp and
+                            "ALREADY" not in upper_imp):
+                        log_cb("✗ Import still failed.")
+                        return False, all_output
+                else:
                     return False, all_output
-            else:
-                return False, all_output
-        log_cb("✓ LKF imported (or already present in ENM).")
+            log_cb("✓ LKF imported (or already present in ENM).")
 
     # ── 3. Install LKF — extract job name (direct SSH exec) ──────
     log_cb(f"Installing LKF for {node_name}...")
@@ -1859,23 +2177,70 @@ def run_install_lkf(
     # Real fatal states the LKF status tool prints — anchored to a
     # status field, not free-text.
     FATAL_RE = re.compile(
-        r"(?:^|\s)(?:status|state|result)\s*[:=]\s*"
+        r"(?:^|\s)(?:status|state)\s*[:=]\s*"
         r"(failed|failure|error|cancelled|canceled|terminated)\b",
         re.IGNORECASE,
     )
-    COMPLETED_RE = re.compile(
-        r"(?:^|\s)(?:status|state|result)\s*[:=]\s*completed\b",
+    # ``Status : COMPLETED`` means the JOB finished — but NOT that the
+    # license was actually installed. The real outcome is the RESULT
+    # field. A job can finish COMPLETED with ``Result : SKIPPED`` when
+    # the Licence Key File isn't found — that is a FAILURE for us.
+    STATUS_COMPLETED_RE = re.compile(
+        r"(?:^|\s)status\s*[:=]\s*completed\b", re.IGNORECASE,
+    )
+    # Markers that the install did NOT actually happen even though the
+    # job "completed":
+    SKIPPED_RE = re.compile(
+        r"(?:^|\s)result\s*[:=]\s*skipped\b", re.IGNORECASE,
+    )
+    NODES_SKIPPED_RE = re.compile(
+        r"No\s+of\s+Nodes\s+Skipped\s*[:=]\s*([1-9]\d*)", re.IGNORECASE,
+    )
+    NOT_FOUND_RE = re.compile(
+        r"licen[cs]e\s*key\s*file\s*not\s*found"
+        r"|activity\s+is\s+skipped"
+        r"|\bnot\s+found\b",
         re.IGNORECASE,
     )
+    # Positive confirmation the install really succeeded.
+    RESULT_SUCCESS_RE = re.compile(
+        r"(?:^|\s)result\s*[:=]\s*success\b", re.IGNORECASE,
+    )
+    NODES_COMPLETED_RE = re.compile(
+        r"No\s+of\s+Nodes\s+Completed\s*[:=]\s*([1-9]\d*)", re.IGNORECASE,
+    )
 
+    skipped = False
     for attempt in range(1, max_attempts + 1):
         out = ssh.exec_ssh(status_cmd, timeout=120)
         all_output += out
         log_cb(f"Status check #{attempt}:\n{out}")
 
-        if COMPLETED_RE.search(out) or "COMPLETED" in out.split("\n")[-5:].__str__().upper():
-            # Bias toward the regex match, but accept "COMPLETED" if it
-            # appears near the end of output (last 5 lines).
+        status_completed = (
+            STATUS_COMPLETED_RE.search(out)
+            or "COMPLETED" in out.split("\n")[-5:].__str__().upper()
+        )
+        if status_completed:
+            # Job reached a terminal state. Now decide the REAL result.
+            install_skipped = bool(
+                SKIPPED_RE.search(out)
+                or NODES_SKIPPED_RE.search(out)
+                or NOT_FOUND_RE.search(out)
+            )
+            install_ok = bool(
+                RESULT_SUCCESS_RE.search(out)
+                or NODES_COMPLETED_RE.search(out)
+            )
+            if install_skipped and not (
+                install_ok and not SKIPPED_RE.search(out)
+            ):
+                # Completed-but-skipped → license NOT installed.
+                skipped = True
+                log_cb(
+                    "LKF job COMPLETED but Result=SKIPPED — license was "
+                    "NOT installed (Licence Key File not found)."
+                )
+                break
             completed = True
             break
         if FATAL_RE.search(out):
@@ -1889,6 +2254,18 @@ def run_install_lkf(
                    f"waiting {delay}s...")
             time.sleep(delay)
 
+    if skipped:
+        msg = (
+            f"LKF NOT installed for {node_name} — the job completed but "
+            f"the install was SKIPPED (Licence Key File not found). "
+            f"Make sure the LKF for this node is imported in ENM / present "
+            f"in SMRS, or provide the LKF zip."
+        )
+        log_cb(f"✗ {msg}")
+        if wait_for_user:
+            wait_for_user(msg)
+        return False, all_output
+
     if not completed:
         msg = (
             f"LKF installation is failed, need manual check.\n"
@@ -1899,7 +2276,7 @@ def run_install_lkf(
             wait_for_user(msg)
         return False, all_output
 
-    log_cb(f"✓ LKF installation COMPLETED for {node_name} (job: {job_name}).")
+    log_cb(f"✓ LKF installation COMPLETED + installed for {node_name} (job: {job_name}).")
     return True, all_output
 
 
@@ -2038,54 +2415,13 @@ def run_uri_setting(
     """
     all_output = ""
 
-    # ── 1. Detect the current UpgradePackage ID ─────────────────
-    # The package ID is not constant across nodes (e.g. ``CXP2010174/2-
-    # R42H05`` on some, ``CXP2010174/2-R42G13`` on others). We used to
-    # hard-code one from config, which silently broke nodes running a
-    # different package. Now we ``pr UpgradePackage`` and parse the
-    # actual ID off the printed MO line.
-    log_cb(f"Detecting UpgradePackage on {node_name}...")
-    pr_out = ssh.run_amos_command_safe(
-        "pr UpgradePackage", node_name, timeout=30,
-    )
-    all_output += pr_out
-    log_cb(f"pr UpgradePackage output:\n{pr_out}")
-
-    # Lines look like:
-    #   1234 UNLOCKED  ENABLED  SystemFunctions=1,SwM=1,UpgradePackage=CXP2010174/2-R42G13
-    # We capture the ID token after ``UpgradePackage=``. The token can
-    # include letters, digits, ``/``, ``-`` and ``.`` — anything up to
-    # whitespace or end-of-line.
-    pkg_re = re.compile(r"UpgradePackage=([A-Za-z0-9_/\-.]+)")
-    detected = pkg_re.findall(pr_out)
-
-    # De-duplicate while preserving order. Most nodes list one
-    # UpgradePackage; if more than one shows up we prefer the LAST
-    # one (typically the current/active package after an upgrade —
-    # older packages tend to be printed first).
-    seen: dict[str, None] = {}
-    for pid in detected:
-        seen[pid] = None
-    detected_unique = list(seen.keys())
-
-    if not detected_unique:
-        msg = (
-            f"Could not detect any UpgradePackage on {node_name} from "
-            f"'pr UpgradePackage'. Falling back to config default "
-            f"'{_UPGRADE_PKG_ID}' (may not match this node)."
-        )
-        log_cb(f"⚠ {msg}")
-        upgrade_pkg_id = _UPGRADE_PKG_ID
-    else:
-        upgrade_pkg_id = detected_unique[-1]
-        if len(detected_unique) == 1:
-            log_cb(f"✓ Detected UpgradePackage: {upgrade_pkg_id}")
-        else:
-            log_cb(
-                f"✓ Found {len(detected_unique)} UpgradePackages "
-                f"({', '.join(detected_unique)}); using most recent: "
-                f"{upgrade_pkg_id}"
-            )
+    # ── 1. UpgradePackage ID (from config.json) ─────────────────
+    # Use the configured target version directly
+    # (uri_setting.upgrade_package_id) — NO auto-detect. This keeps URI
+    # Setting and SW Level Check on the SAME source of truth. Change the
+    # target by editing config.json next to the exe (no rebuild).
+    upgrade_pkg_id = _UPGRADE_PKG_ID
+    log_cb(f"Using UpgradePackage from config.json: {upgrade_pkg_id}")
 
     # ── 2-4. AMOS set commands (each requires y/n confirmation) ─
     amos_cmds = [
@@ -2403,6 +2739,7 @@ def run_relation(
     log_dir: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    ui_cb: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
     """Upload relation file and run it on the node.
 
@@ -2410,9 +2747,16 @@ def run_relation(
       - **.xml** → upload, run ``netconf /path/file.xml``, check for <ok/> or </error-message>
       - **.zip** → upload, unzip, find node folder, run each .txt with ``run <filepath>``
 
+    Args:
+        log_cb: detail log (file). High-volume moshell output.
+        ui_cb:  optional high-level UI log for live milestones
+                (which script is running, etc.). Defaults to log_cb.
+
     Returns:
         (success: bool, full_output: str)
     """
+    if ui_cb is None:
+        ui_cb = log_cb
     all_output = ""
     filename = os.path.basename(relation_local_path)
     is_xml = filename.lower().endswith(".xml")
@@ -2497,7 +2841,7 @@ def run_relation(
     else:
         return _run_relation_zip(
             ssh, node_name, shortcode, remote_dir, filename, log_dir, log_cb,
-            all_output, wait_for_user,
+            all_output, wait_for_user, ui_cb=ui_cb,
         )
 
 
@@ -2573,8 +2917,11 @@ def _run_relation_zip(
     log_cb: Callable[[str], None],
     all_output: str,
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    ui_cb: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str]:
     """Unzip relation zip, find node folder, run each .txt file."""
+    if ui_cb is None:
+        ui_cb = log_cb
 
     # ── 2. Unzip on server ───────────────────────────────────────
     log_cb(f"Unzipping {zip_filename} on server...")
@@ -2710,17 +3057,53 @@ def _run_relation_zip(
     # immediately after the ``run`` command so it only prints once the
     # batch actually finished — i.e. we never mark relation OK early.
     log_cb(f"Running all {len(txt_files)} relation files in one batch...")
+    # Announce the list up-front in the UI so the operator sees what's
+    # queued, even before per-script live progress starts.
+    ui_cb(f"Running {len(txt_files)} relation script(s) in one batch:")
+    for tp in sorted(txt_files):
+        ui_cb(f"  - {os.path.basename(tp)}")
     batch_timeout = max(3600, len(txt_files) * 300)
     log_cb(
         f"(sentinel + 10s idle quiescence; timeout={batch_timeout}s, "
         "heartbeat every 60s)"
     )
+
+    # ── Live per-script progress ─────────────────────────────────
+    # moshell echoes a ``run /path/NN_<name>.txt`` line as it starts
+    # each script in the batch. We detect those in the streaming
+    # output and emit one UI line per script — "running script
+    # NN_<name>.txt" — so the operator sees real-time progress with
+    # the node tag (ui_cb is already node-tagged by the caller).
+    _seen_scripts: set = set()
+    _line_tail = [""]
+    _run_line_re = re.compile(r"run\s+\S*/(\d*_?[^/\s]+\.txt)\b")
+
+    def _relation_activity(text: str) -> None:
+        combined = _line_tail[0] + text
+        parts = combined.split("\n")
+        _line_tail[0] = parts[-1]
+        for ln in parts[:-1]:
+            m = _run_line_re.search(ln)
+            if m:
+                fname = m.group(1)
+                if fname not in _seen_scripts:
+                    _seen_scripts.add(fname)
+                    ui_cb(
+                        f"running script "
+                        f"[{len(_seen_scripts)}/{len(txt_files)}] {fname}"
+                    )
+
     batch_out = ssh.run_amos_blocking_with_sentinel(
         f"run {batch_script}", node_name, timeout=batch_timeout,
         quiet_after=10.0,
+        on_activity=_relation_activity,
     )
     all_output += batch_out
     log_cb(f"Batch run completed ({len(batch_out)} bytes of live output).")
+    ui_cb(
+        f"Relation batch finished — {len(_seen_scripts)}/{len(txt_files)} "
+        "script(s) executed."
+    )
 
     # ── Sanity check: did any of the relation scripts ACTUALLY run? ──
     # Without this, an empty batch_out (because ``run <batch>``
@@ -2970,146 +3353,298 @@ def _run_relation_zip(
 
 
 # ── Verify MME step ──────────────────────────────────────────────
+def _parse_ping_test_output(output: str) -> dict:
+    """Parse a ``Ping_Test_Cmd.txt`` (or any ``PING <ip>`` block) output
+    and categorise each unique target into one of four states:
+
+      - ``ok``      → 0 % packet loss, all replies received
+      - ``partial`` → between 1 % and 99 % packet loss (some replies lost)
+      - ``failed``  → 100 % packet loss, ``Destination Host Unreachable``,
+                      ``Network is unreachable`` — no reply at all
+      - ``no_route``→ ``ping: $VAR: Name or service not known`` (the
+                      script's pre-resolution variable wasn't populated
+                      — a node config issue, NOT a network failure)
+
+    Returns:
+        {
+          "results": [(ip, state, loss_pct, tx, rx), …],
+          "n_ok": int, "n_partial": int, "n_failed": int,
+          "n_no_route": int,
+        }
+    """
+    lines = output.split("\n")
+    results: list[tuple[str, str, int, int, int]] = []
+
+    ping_re = re.compile(
+        r"^\s*PING\s+(\d+\.\d+\.\d+\.\d+)\s*\(",
+        re.IGNORECASE,
+    )
+    stats_re = re.compile(
+        r"(\d+)\s+packets\s+transmitted,\s*(\d+)\s+received"
+        r"(?:,\s*\+?\d+\s+errors)?,\s*(\d+)%\s+packet\s+loss",
+    )
+    var_not_set_re = re.compile(r"ping:\s+\$\S+:\s+Name or service not known")
+    no_route_re = re.compile(r"ping:.*Name or service not known")
+
+    current_ip: Optional[str] = None
+    no_route = 0
+    for line in lines:
+        m = ping_re.search(line)
+        if m:
+            current_ip = m.group(1)
+            continue
+        if var_not_set_re.search(line) or (
+            current_ip is None and no_route_re.search(line)
+        ):
+            no_route += 1
+            current_ip = None
+            continue
+        if current_ip:
+            if ("Destination Host Unreachable" in line
+                    or "Network is unreachable" in line):
+                results.append((current_ip, "failed", 100, 0, 0))
+                current_ip = None
+                continue
+            sm = stats_re.search(line)
+            if sm:
+                tx, rx, loss = int(sm.group(1)), int(sm.group(2)), int(sm.group(3))
+                if loss <= 0 and rx == tx:
+                    state = "ok"
+                elif loss >= 100 or rx == 0:
+                    state = "failed"
+                else:
+                    state = "partial"
+                results.append((current_ip, state, loss, tx, rx))
+                current_ip = None
+
+    counts = {"ok": 0, "partial": 0, "failed": 0}
+    for _, st, _, _, _ in results:
+        if st in counts:
+            counts[st] += 1
+    return {
+        "results": results,
+        "n_ok": counts["ok"],
+        "n_partial": counts["partial"],
+        "n_failed": counts["failed"],
+        "n_no_route": no_route,
+    }
+
+
+def _ping_overall_status(parsed: dict) -> tuple[str, str, str]:
+    """Map the per-IP counts to one of the four user-facing buckets.
+
+    Returns ``(status_key, short_detail, long_message)``:
+      - status_key      → "all_ok" | "partial_loss" | "some_failed" |
+                          "all_failed" | "no_data"
+      - short_detail    → cell label for the progress / summary column
+      - long_message    → fuller sentence for the operator's log
+    """
+    n_ok = parsed["n_ok"]
+    n_partial = parsed["n_partial"]
+    n_failed = parsed["n_failed"]
+    n_total = n_ok + n_partial + n_failed
+
+    if n_total == 0:
+        return ("no_data",
+                "No ping data",
+                "Ping test produced no parseable results (the script may "
+                "have errored before any ping ran).")
+
+    if n_failed == 0 and n_partial == 0:
+        return ("all_ok",
+                f"All {n_ok} pings OK",
+                f"All {n_ok} target(s) reachable with 0 % packet loss.")
+
+    if n_failed == 0 and n_partial > 0:
+        return ("partial_loss",
+                f"{n_partial}/{n_total} with packet loss",
+                f"All {n_total} target(s) reachable, but {n_partial} "
+                "showed partial packet loss — review per-IP detail.")
+
+    if n_failed > 0 and (n_ok > 0 or n_partial > 0):
+        return ("some_failed",
+                f"{n_failed}/{n_total} failed",
+                f"{n_failed} of {n_total} target(s) failed (100 % loss); "
+                f"{n_ok + n_partial} still reachable.")
+
+    # n_failed == n_total
+    return ("all_failed",
+            f"All {n_total} pings failed",
+            f"All {n_total} target(s) failed (100 % loss / unreachable).")
+
+
 def run_sgw_check(
     ssh: "IntegrationSSH",
     node_name: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
     node_type: str = "lte_nr",
+    gsm_on_primary: bool = False,
     gsm_ping_targets: Optional[list[str]] = None,
-) -> tuple[bool, str]:
-    """SGW transport reachability check.
+    bsc_name: Optional[str] = None,
+) -> tuple[bool, str, str, bool]:
+    """Transport reachability check.
 
-    - LTE/NR: ``run {SCRIPTS_PATH}/SWG_Check.mos`` (multi-ping script on server).
-    - GSM:    ``mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,
-              AddressIPv4=1 ping -c 5 <ip>`` per target.
+    Scripts:
+      * LTE/NR — ``/home/shared/ESETARI/INOC/SCRIPTS/DM/ping.txt``
+        (backhaul + MME + SGW for both LTE and NR routers).
+      * GSM    — ``/home/shared/common/INTEGRATION_TEAM/script/
+        Ping_Test_BSC_brokerIP.txt`` (BSC broker IP reachability).
 
-    Wrapped in ``l+ / l-``; the server-side log is registered for download
-    into MOSHELL/. Ping blocks are parsed; failed targets are reported as
-    "<ip> > Not OK".
+    What gets run:
+      * Pure LTE/NR node       → LTE/NR script only.
+      * Pure GSM node          → GSM script only.
+      * Co-located LTE+GSM     → BOTH scripts back-to-back on the
+        (``gsm_on_primary``)     same node. Results from both runs
+                                 are merged into a single 4-level
+                                 status verdict.
+
+    Each script runs through ``run_amos_blocking_with_sentinel`` so
+    the mid-script ``NODE>`` prompts don't mark completion early.
+    Wrapped in ``l+ / l-``; the server-side log goes to ``MOSHELL/``.
+
+    Broker IP validation (GSM only): when ``bsc_name`` is given and a GSM
+    script ran, the ``$bscBrokerIp`` the node reported is compared against
+    ``config.json → bsc_broker_map[bsc_name]``. A mismatch means the node
+    is pointed at the WRONG BSC — ping alone can't catch that (the wrong
+    broker still answers).
 
     Returns:
-        (success: bool, full_output: str) — success=True iff every ping OK.
+        ``(success: bool, full_output: str, detail: str, broker_wrong: bool)``
+        where ``success`` is True for ``all_ok`` AND ``partial_loss``,
+        False for ``some_failed`` / ``all_failed`` / ``no_data``.
+        ``detail`` is the short cell label (carries the
+        "Wrong IP Broker BSC" remark when ``broker_wrong``).
     """
-    import re
     all_output = ""
     command_output = ""
 
+    # ── Decide which scripts to run ──────────────────────────────
+    # ``scripts`` is a list of ``(label, path)`` tuples. Order is
+    # deterministic so the log reads naturally (LTE/NR before GSM in
+    # co-located mode).
+    scripts: list[tuple[str, str]] = []
+    if node_type == "gsm":
+        scripts.append(("GSM", _PING_TEST_GSM))
+    else:
+        scripts.append(("LTE/NR", _PING_TEST_LTE_NR))
+        if gsm_on_primary:
+            # Single physical node carries both RATs — run the GSM
+            # ping script too. ``Ping_Test_BSC_brokerIP.txt`` knows
+            # how to talk to the BSC broker via the same node.
+            scripts.append(("GSM (co-located)", _PING_TEST_GSM))
+
     remote_log = f"/home/shared/{ssh.username}/SGW_Check_{node_name}.log"
 
-    log_cb(f"Running SGW Check for {node_name} ({node_type})...")
-    ssh.run_amos_command_safe(f"!rm -f {remote_log}", node_name, timeout=15)
-
-    ssh.run_amos_command_safe(f"l+ {remote_log}", node_name, timeout=15)
-    if node_type == "gsm":
-        targets = gsm_ping_targets or ["10.14.194.131"]
-        for ip in targets:
-            gsm_cmds = [
-                (
-                    "Abis",
-                    f"mcc Transport=1,Router=Abis,InterfaceIPv4=Abis,"
-                    f"AddressIPv4=1 ping -c 5 {ip}",
-                ),
-                (
-                    "Traffic",
-                    f"mcc Transport=1,Router=Abis,InterfaceIPv4=Traffic,"
-                    f"AddressIPv4=1 ping -c 5 {ip}",
-                ),
-            ]
-
-            for idx, (iface_name, cmd) in enumerate(gsm_cmds, start=1):
-                log_cb(f"  $ {cmd}")
-                # mcc emits a "[y/n]" confirmation prompt — auto-answer 'y'
-                out = ssh.run_amos_command_autoyes(cmd, timeout=180)
-                all_output += out
-
-                # Some GSM nodes expose the ping MO only on Traffic. If Abis
-                # returns zero MOs, fall back to the Traffic interface.
-                if "Total: 0 MOs" in out and idx < len(gsm_cmds):
-                    log_cb(
-                        f"No MO found on InterfaceIPv4={iface_name}; "
-                        f"retrying with InterfaceIPv4={gsm_cmds[idx][0]}..."
-                    )
-                    continue
-
-                break
-        command_output = all_output
-    else:
-        command_output = ssh.run_amos_command_safe(
-            f"run {_SGW_CHECK_MOS}", node_name, timeout=900,
-        )
-        all_output += command_output
-    ssh.run_amos_command_safe("l-", node_name, timeout=15)
-    log_cb(f"SGW_Check output ({len(command_output)} bytes).")
-
-    # Register for MOSHELL/ download
-    ssh.register_remote_log(remote_log)
-
-    # Parse ping blocks. A "ping <ip>" command appears, then later the
-    # stats line "N packets transmitted, M received, K% packet loss, ..."
-    # Failure = received=0  OR  100% packet loss  OR  Destination unreachable
-    lines = command_output.split("\n")
-    current_ip: Optional[str] = None
-    results: list[tuple[str, bool]] = []  # (ip, ok)
-    seen_ips: set[str] = set()
-    # Match the "PING <ip> (" header emitted by /bin/ping — reliable and
-    # independent of caller-supplied options like "-c 5" or "--count 3".
-    ping_re = re.compile(r"^\s*PING\s+(\d+\.\d+\.\d+\.\d+)\s*\(", re.IGNORECASE)
-    stats_re = re.compile(
-        r"(\d+)\s+packets\s+transmitted,\s*(\d+)\s+received"
+    log_cb(
+        f"Running ping check(s) for {node_name} "
+        f"({len(scripts)} script(s): "
+        + ", ".join(lbl for lbl, _ in scripts) + ")"
     )
+    ssh.run_amos_command_safe(f"!rm -f {remote_log}", node_name, timeout=15)
+    ssh.run_amos_command_safe(f"l+ {remote_log}", node_name, timeout=15)
 
-    for line in lines:
-        m = ping_re.search(line)
-        if m:
-            current_ip = m.group(1)
-            continue
-        if current_ip:
-            if "Destination Host Unreachable" in line or \
-               "Network is unreachable" in line or \
-               "100% packet loss" in line:
-                if current_ip not in seen_ips:
-                    results.append((current_ip, False))
-                    seen_ips.add(current_ip)
-                current_ip = None
-                continue
-            sm = stats_re.search(line)
-            if sm:
-                transmitted = int(sm.group(1))
-                received = int(sm.group(2))
-                ok = received > 0 and received == transmitted
-                if current_ip not in seen_ips:
-                    results.append((current_ip, ok))
-                    seen_ips.add(current_ip)
-                current_ip = None
+    for label, script_path in scripts:
+        log_cb(f"── {label} ── $ run {script_path}")
+        log_cb("(sentinel + 10s idle quiescence; usually 1-2 min)")
+        out = ssh.run_amos_blocking_with_sentinel(
+            f"run {script_path}",
+            node_name, timeout=900, quiet_after=10.0,
+        )
+        log_cb(f"{label} output: {len(out)} bytes")
+        all_output += out
+        command_output += out
 
-    if not results:
-        msg = "No ping blocks detected in SGW_Check output."
-        log_cb(f"⚠ {msg}")
-        all_output += f"\n[SGW CHECK] {msg}\n"
-        return False, all_output
+    ssh.run_amos_command_safe("l-", node_name, timeout=15)
+    ssh.register_remote_log(remote_log)
+    log_cb(f"Combined ping output captured ({len(command_output)} bytes).")
 
-    failed = [ip for ip, ok in results if not ok]
-    ok_ips = [ip for ip, ok in results if ok]
+    # ── Parse + categorise ───────────────────────────────────────
+    parsed = _parse_ping_test_output(command_output)
+    status_key, short_detail, long_msg = _ping_overall_status(parsed)
 
-    log_cb(f"SGW Check parsed {len(results)} target(s): "
-           f"{len(ok_ips)} OK, {len(failed)} failed.")
+    log_cb(
+        f"Parsed: {parsed['n_ok']} OK, {parsed['n_partial']} partial-loss, "
+        f"{parsed['n_failed']} failed, "
+        f"{parsed['n_no_route']} no-route (script var not set)."
+    )
+    log_cb(long_msg)
 
+    # Per-target lines for operator review
     summary_lines = [
-        "[SGW CHECK SUMMARY]",
-        f"Total: {len(results)}  OK: {len(ok_ips)}  FAIL: {len(failed)}",
-        "-" * 60,
+        "[PING TEST SUMMARY]",
+        (f"Status: {short_detail}  |  "
+         f"OK={parsed['n_ok']}  "
+         f"Partial={parsed['n_partial']}  "
+         f"Failed={parsed['n_failed']}  "
+         f"NoRoute={parsed['n_no_route']}"),
+        "-" * 64,
     ]
-    for ip, ok in results:
-        if ok:
-            summary_lines.append(f"  {ip} > OK")
+    for ip, st, loss, tx, rx in parsed["results"]:
+        if st == "ok":
+            summary_lines.append(f"  {ip} > OK ({rx}/{tx} replies)")
+        elif st == "partial":
+            summary_lines.append(
+                f"  {ip} > Packet loss {loss}% ({rx}/{tx} replies)"
+            )
         else:
-            summary_lines.append(f"  {ip} > Not OK")
+            summary_lines.append(f"  {ip} > FAILED ({loss}% loss)")
     summary_text = "\n".join(summary_lines)
     all_output += "\n" + summary_text + "\n"
     log_cb(summary_text)
 
-    return (len(failed) == 0), all_output
+    success = status_key in ("all_ok", "partial_loss")
+
+    # ── BSC broker IP validation (GSM only) ──────────────────────
+    # The GSM script reads the node's own AbisIp bscBrokerIpAddress and
+    # pings it — so a node pointed at the WRONG BSC still pings fine.
+    # Compare what the node reported against the expected IP for the
+    # form's BSC (config.json bsc_broker_map).
+    broker_wrong = False
+    gsm_ran = any("GSM" in lbl for lbl, _ in scripts)
+    if gsm_ran and (bsc_name or "").strip():
+        bsc = bsc_name.strip().upper()
+        # Primary: the script's own "$bscBrokerIp = <ip>" echo.
+        found = re.findall(
+            r"\$bscBrokerIp\s*=\s*(\d+\.\d+\.\d+\.\d+)", command_output)
+        if not found:
+            # Fallback: the `get AbisIp` table rows.
+            found = re.findall(
+                r"bscBrokerIpAddress\s+(\d+\.\d+\.\d+\.\d+)", command_output)
+        found_ips = sorted(set(found))
+
+        expected = _BSC_BROKER_MAP.get(bsc)
+        if expected is None:
+            broker_wrong = True
+            short_detail = f"BSC {bsc} not in bsc_broker_map"
+            log_cb(
+                f"⚠ Broker IP check: BSC '{bsc}' is not defined in "
+                "config.json bsc_broker_map — add it there. "
+                f"Node reported: {', '.join(found_ips) or 'none'}"
+            )
+        elif not found_ips:
+            log_cb(
+                "⚠ Broker IP check: could not extract $bscBrokerIp from "
+                f"the output — cannot verify against {expected} ({bsc}). "
+                "Verdict unchanged."
+            )
+        elif any(ip != expected for ip in found_ips):
+            broker_wrong = True
+            got = ", ".join(found_ips)
+            remark = f"Wrong IP Broker BSC ({got} ≠ {expected})"
+            short_detail = (remark if success
+                            else f"{short_detail} — {remark}")
+            log_cb(
+                f"✗ Broker IP check: expected {expected} ({bsc}) but the "
+                f"node reports {got} → WRONG BSC broker."
+            )
+        else:
+            log_cb(
+                f"✓ Broker IP check: node broker {expected} matches "
+                f"{bsc} (config.json)."
+            )
+
+    return success, all_output, short_detail, broker_wrong
 
 
 def run_verify_mme(
@@ -3192,6 +3727,166 @@ def run_verify_mme(
 
     log_cb(f"✓ All MME connections ENABLED for {node_name} ({len(mme_lines)} entries).")
     return True, all_output
+
+
+# ── Synchronization (GPS / PTP) check ───────────────────────────
+def _sync_source_label(sync_type: Optional[str]) -> str:
+    """Map a raw ``syncRefType`` to a short source label."""
+    if not sync_type:
+        return "Unknown"
+    t = sync_type.upper()
+    if "GNSS" in t or "GPS" in t:
+        return "GPS"
+    if "PTP" in t:
+        return "PTP"
+    if "SYNC_ETH" in t or "SYNCE" in t:
+        return "SyncE"
+    return sync_type   # fall back to the raw type for anything else
+
+
+def _is_dashes(s: str) -> bool:
+    s = s.strip()
+    return len(s) >= 3 and set(s) <= set("-")
+
+
+def _parse_sts(output: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse ``sts`` output → (radioClockState, syncRefType).
+
+    radioClockState comes from the ``radioClockState : <STATE>`` line.
+
+    syncRefType is read from the SyncReference table — bounded strictly
+    to the rows between the two ``---`` rules right under the header (so
+    we never bleed into a following ``DU/Port/sharedUnitRef`` table whose
+    rows ALSO start with a digit). The row marked active with a leading
+    ``*`` is preferred; otherwise the first data row.
+        ``*1   1  GNSS_RECEIVER  NO_FAULT  GNSS  Synchronization=1,...``
+
+    Some nodes have an EMPTY syncRefType table and sync from a radio unit
+    instead (``nodeGroupRole`` / ``sharedUnitRef`` with an ``OK_ACTIVE``
+    row) — that case is reported as source ``RRU``.
+    """
+    state = None
+    m = re.search(r"radioClockState\s*:\s*([A-Za-z0-9_]+)", output)
+    if m:
+        state = m.group(1)
+
+    lines = output.splitlines()
+    header = None
+    for i, l in enumerate(lines):
+        if "syncRefType" in l and "Prio" in l:
+            header = i
+            break
+
+    sync_type = None
+    if header is not None:
+        # Bound the table body to between the first and second '---'
+        # rule after the header (the empty-table case has no rows there).
+        region = lines[header + 1:]
+        dash_idx = [i for i, l in enumerate(region) if _is_dashes(l)]
+        if len(dash_idx) >= 2:
+            body = region[dash_idx[0] + 1: dash_idx[1]]
+        elif len(dash_idx) == 1:
+            body = region[dash_idx[0] + 1:]
+        else:
+            body = region
+
+        candidates: list[tuple[bool, str]] = []   # (is_active, type)
+        for l in body:
+            s = l.strip()
+            if not s or _is_dashes(s):
+                continue
+            toks = s.split()
+            # Prio token is like "1" or "*1"; syncRefType is the 3rd col.
+            if len(toks) >= 3 and re.match(r"\*?\d+$", toks[0]):
+                candidates.append((toks[0].startswith("*"), toks[2]))
+        for is_active, t in candidates:
+            if is_active:
+                sync_type = t
+                break
+        if sync_type is None and candidates:
+            sync_type = candidates[0][1]
+
+    # Fallback: empty syncRefType table but the node syncs from a radio
+    # unit (DU/RRU node sync) → label the source RRU.
+    if sync_type is None and re.search(r"nodeGroupRole|sharedUnitRef",
+                                       output):
+        sync_type = "RRU"
+
+    return state, sync_type
+
+
+def run_sync_check(
+    ssh: IntegrationSSH,
+    node_name: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str, str]:
+    """Check node synchronization via the moshell ``sts`` command.
+
+    OK when ``radioClockState`` contains "LOCKED" (RNT_TIME_LOCKED,
+    TIME_OFFSET_LOCKED, FREQUENCY_LOCKED, …). The source label is
+    derived from ``syncRefType`` (GNSS→GPS, PTP→PTP, …).
+
+    Returns ``(ok, full_output, detail)`` where detail is the short
+    string shown in the progress cell, e.g. ``"GPS - OK (RNT_TIME_LOCKED)"``.
+    """
+    log_cb("Checking synchronization (sts)...")
+    out = ssh.run_amos_command_safe("sts", node_name, timeout=60)
+    log_cb(f"sts output:\n{out}")
+
+    state, sync_type = _parse_sts(out)
+    source = _sync_source_label(sync_type)
+    ok = bool(state) and "LOCKED" in state.upper()
+
+    if state:
+        detail = f"{source} - {'OK' if ok else 'Not OK'} ({state})"
+    else:
+        detail = f"{source} - Not OK (no radioClockState found)"
+
+    log_cb(("✓ Synchronization " if ok else "✗ Synchronization ") + detail)
+    return ok, out, detail
+
+
+# ── SW level check ──────────────────────────────────────────────
+def run_sw_check(
+    ssh: IntegrationSSH,
+    node_name: str,
+    log_cb: Callable[[str], None],
+    expected: Optional[str] = None,
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str, str]:
+    """Check the node's active Upgrade Package against the expected
+    version from config.json (``uri_setting.upgrade_package_id``).
+
+    Runs ``pr SystemFunctions=1,SwM=1,UpgradePackage=`` and reads the
+    ``UpgradePackage=<version>`` shown. OK when it matches the expected
+    id (e.g. ``CXP2010174/2-R42J13``).
+
+    Returns ``(ok, full_output, detail)`` — detail e.g. ``"OK (CXP.../2-R42J13)"``
+    or ``"Not OK (got R42H05, want R42J13)"``.
+    """
+    if expected is None:
+        expected = _UPGRADE_PKG_ID
+    expected = (expected or "").strip()
+
+    log_cb(f"Checking SW level (expected UpgradePackage: {expected})...")
+    out = ssh.run_amos_command_safe(
+        "pr SystemFunctions=1,SwM=1,UpgradePackage=", node_name, timeout=60)
+    log_cb(f"SW level output:\n{out}")
+
+    # The echoed command ends with a bare 'UpgradePackage=' (no value);
+    # only the result row(s) carry a real value → \S+ skips the empty one.
+    found = [v for v in re.findall(r"UpgradePackage=(\S+)", out) if v]
+    ok = expected in found
+    if not found:
+        detail = f"Not OK (no UpgradePackage found, want {expected})"
+    elif ok:
+        detail = f"OK ({expected})"
+    else:
+        detail = f"Not OK (got {', '.join(found)}, want {expected})"
+
+    log_cb(("✓ SW level " if ok else "✗ SW level ") + detail)
+    return ok, out, detail
 
 
 # ── Backup CV step ──────────────────────────────────────────────
@@ -3455,8 +4150,17 @@ def run_gsm_cell_define(
     shortcode: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    bsc_name: Optional[str] = None,
+    log_dir: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Verify GSM Cell and MO are defined in BSC.
+
+    Pre-step (NEW): if ``bsc_name`` is provided, set ``controllingBsc``
+    on the node's NetworkElement FIRST. The GSM cell/MO lookups below
+    rely on the node being linked to its BSC, so this is the natural
+    place to guarantee the link exists — "every GSM check sets
+    controllingBsc". Runs inside the current AMOS session via
+    ``!python cli.py`` (``in_amos=True``).
 
     Two checks:
       1. MO check:  cmedit get * G31Tg.rsite==<SHORTCODE>* -t  → must be > 0 instances
@@ -3469,6 +4173,38 @@ def run_gsm_cell_define(
     """
     all_output = ""
     modified_sc = _shortcode_to_cell_id(shortcode)
+
+    # ── 0. Pre-step: set controllingBsc (GSM link) ──────────────
+    bsc = (bsc_name or "").strip()
+    if bsc:
+        log_cb(
+            f"[GSM check] Ensuring controllingBsc link on {node_name} "
+            f"→ NetworkElement={bsc} before cell/MO lookup."
+        )
+        set_ok, set_out = _set_controlling_bsc(
+            ssh, node_name, bsc, log_cb,
+            wait_for_user=wait_for_user,
+            log_dir=log_dir,
+            in_amos=True,  # gsm_cell_define runs inside an AMOS session
+        )
+        all_output += set_out + "\n"
+        if set_ok:
+            log_cb(f"✓ controllingBsc OK on {node_name} → NetworkElement={bsc}")
+        else:
+            # Not fatal to the cell/MO check itself — log loudly and
+            # continue so the operator still gets the cell verdict.
+            log_cb(
+                f"⚠ controllingBsc could not be confirmed on {node_name} "
+                f"→ NetworkElement={bsc}. Continuing with cell/MO check; "
+                "BSC cell lookups may return 0 instances if the link is "
+                "missing."
+            )
+    else:
+        log_cb(
+            f"[GSM check] No BSC name provided for {node_name} — "
+            "skipping controllingBsc set (check the BSC Name field in "
+            "the form if this node needs the BSC link)."
+        )
 
     # ── 1. Check MO (G31Tg.rsite) ──────────────────────────────
     mo_cmd = f'!python {CLI_PY} "cmedit get * G31Tg.rsite=={shortcode}* -t"'
@@ -3571,6 +4307,111 @@ def run_gsm_cell_define(
             msg = "GSM Cell Define verification still failing:\n" + "\n".join(problems)
 
     log_cb(f"✓ BSC Cell and MO verified OK for {shortcode}.")
+    return True, all_output
+
+
+# ── BSC Neighbours (relation) check ─────────────────────────────
+def run_bsc_neighbours(
+    ssh: IntegrationSSH,
+    node_name: str,
+    shortcode: str,
+    log_cb: Callable[[str], None],
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+) -> tuple[bool, str]:
+    """Verify GSM neighbour relations are defined in the BSC.
+
+    Two checks, both keyed on the modified shortcode (first letter +
+    digits, e.g. MIN3884 → M3884), run inside AMOS via ``!python cli.py``:
+
+      1. cmedit get *BS* gerancell.gerancellid==<MOD>*,gerancellrelation -t
+      2. cmedit get *BS* gerancell.gerancellid==<MOD>*,externalgerancellrelation -t
+
+    The ``*BS*`` scope restricts the search to BSC nodes (vs ``*`` which
+    scans the whole network) and ``-t`` prints table output — both make
+    the query much faster; the trailing "N instance(s)" line used for
+    the verdict is unchanged.
+
+    Each is OK when its instance count is NOT 0 (same rule as the GSM
+    cell check). Both must be OK for the step to pass.
+
+    Returns:
+        (success: bool, full_output: str)
+    """
+    all_output = ""
+    modified_sc = _shortcode_to_cell_id(shortcode)
+
+    intra_cmd = (
+        f'!python {CLI_PY} "cmedit get *BS* '
+        f'gerancell.gerancellid=={modified_sc}*,gerancellrelation -t"'
+    )
+    ext_cmd = (
+        f'!python {CLI_PY} "cmedit get *BS* '
+        f'gerancell.gerancellid=={modified_sc}*,externalgerancellrelation -t"'
+    )
+
+    def _has_instances(out: str) -> bool:
+        """True if the cmedit output reports a non-zero instance count."""
+        for line in out.split("\n"):
+            if "instance" in line.lower():
+                return "0 instance" not in line.lower()
+        return False
+
+    def _check(label: str, cmd: str) -> tuple[bool, str]:
+        log_cb(f"Checking BSC {label} (gerancellid=={modified_sc}*)...")
+        out = ssh.run_amos_command_safe(cmd, node_name, timeout=60)
+        ok = _has_instances(out)
+        log_cb(f"{label} output:\n{out}")
+        if ok:
+            log_cb(f"✓ BSC {label} found for {modified_sc}.")
+        else:
+            log_cb(
+                f"✗ BSC {label} not found (0 instances for "
+                f"gerancellid=={modified_sc}*)."
+            )
+        return ok, out
+
+    intra_ok, out1 = _check("GeranCellRelation", intra_cmd)
+    all_output += out1
+    ext_ok, out2 = _check("ExternalGeranCellRelation", ext_cmd)
+    all_output += "\n" + out2
+
+    if intra_ok and ext_ok:
+        log_cb(f"✓ BSC Neighbours verified OK for {modified_sc}.")
+        return True, all_output
+
+    def _problems() -> str:
+        probs = []
+        if not intra_ok:
+            probs.append(
+                f"GeranCellRelation (gerancellid=={modified_sc}*) — 0 instances")
+        if not ext_ok:
+            probs.append(
+                f"ExternalGeranCellRelation (gerancellid=={modified_sc}*) — 0 instances")
+        return "\n".join(probs)
+
+    msg = f"BSC Neighbours verification failed:\n{_problems()}"
+    log_cb(f"✗ {msg}")
+
+    # Retry loop (same pattern as gsm_cell_define).
+    while not (intra_ok and ext_ok):
+        if not wait_for_user:
+            return False, all_output
+        retry = wait_for_user(
+            f"{msg}\n\nCheck BSC neighbour relations, then click Retry "
+            "to re-check."
+        )
+        if not retry:
+            log_cb("User chose to stop.")
+            return False, all_output
+        if not intra_ok:
+            intra_ok, out1 = _check("GeranCellRelation", intra_cmd)
+            all_output += "\n" + out1
+        if not ext_ok:
+            ext_ok, out2 = _check("ExternalGeranCellRelation", ext_cmd)
+            all_output += "\n" + out2
+        msg = f"BSC Neighbours still failing:\n{_problems()}"
+
+    log_cb(f"✓ BSC Neighbours verified OK for {modified_sc}.")
     return True, all_output
 
 

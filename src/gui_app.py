@@ -15,12 +15,14 @@ from app_path import ensure_assets_in_app_dir
 ensure_assets_in_app_dir([
     "config.yaml",          # site shortcode + SSH credentials
     "config.json",          # integration script paths (ENM cli.py, baseline, …)
+    "audit_map.json",       # CDD audit mapping (sheet/column → MO.attribute)
     "TEMPLATE_REPORT.xlsx",
     "TRFS commands.txt",
     "snapshot.ico",
 ])
 
 import flet as ft
+from gui.audit_page import AuditPage
 from gui.form_page import FormPage
 from gui.integration_page import IntegrationPage, IntegrationRunPage
 from gui.license_page import LicensePage
@@ -31,9 +33,66 @@ from gui.theme import BG_TOP
 from license_manager import load_saved_license
 
 
+# One stable identity for every NodeCraft window, so Windows groups all
+# instances under a SINGLE taskbar button (hover → window previews).
+APP_USER_MODEL_ID = "Globe.NodeCraft.Integration"
+
+
+def _set_app_user_model_id():
+    """Give this process an explicit AppUserModelID.
+
+    Without it Windows derives app identity from the executable path, and
+    every instance ends up as its own taskbar button.
+    """
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            APP_USER_MODEL_ID)
+        print(f"[TASKBAR] AppUserModelID = {APP_USER_MODEL_ID}")
+    except Exception as exc:
+        print(f"[TASKBAR] could not set AppUserModelID: {exc}")
+
+
+def _prefer_bundled_flet_view():
+    if not getattr(sys, "frozen", False):
+        return
+
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if not bundle_dir:
+        return
+
+    flet_view_dir = os.path.join(bundle_dir, "flet_desktop", "app", "flet")
+    flet_view_exe = os.path.join(flet_view_dir, "flet.exe")
+    if not os.path.isfile(flet_view_exe):
+        print(f"[FLET] Bundled view not found: {flet_view_exe}")
+        return
+
+    # IMPORTANT (taskbar grouping): with --onefile, ``_MEIPASS`` is a NEW
+    # temp folder on every launch, so running flet.exe straight from there
+    # makes Windows see each instance as a DIFFERENT application → one
+    # taskbar button per window. Copying the client ONCE to a stable path
+    # gives every instance the same identity → a single grouped button.
+    try:
+        import shutil
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        target = os.path.join(base, "NodeCraft", "flet-client", "flet")
+        if not os.path.isfile(os.path.join(target, "flet.exe")):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copytree(flet_view_dir, target, dirs_exist_ok=True)
+            print(f"[FLET] Seeded stable client → {target}")
+        os.environ["FLET_VIEW_PATH"] = target
+        print(f"[FLET] Using stable view: {target}")
+    except Exception as exc:
+        # Seeding failed (permissions, disk) — fall back to the per-run
+        # bundled copy. App still works; taskbar just won't group.
+        os.environ["FLET_VIEW_PATH"] = flet_view_dir
+        print(f"[FLET] Stable seed failed ({exc}); using bundled: {flet_view_exe}")
+
+
 def main(page: ft.Page):
     # Default title; updated below with the licensed user's name once verified.
-    page.title = "NodeCraft v1.0 — ewisbay"
+    from version import version_string
+    page.title = f"{version_string()} — ewisbay"
     from app_path import get_app_dir
     # Icon can live next to the exe OR inside _internal/ (PyInstaller COLLECT)
     _app_dir = get_app_dir()
@@ -93,10 +152,22 @@ def main(page: ft.Page):
             return ResultPage(page).build()
         elif route == "/terminal":
             return TerminalPage(page).build()
+        elif route == "/audit":
+            return AuditPage(page).build()
         return FormPage(page).build()
 
     def route_change(e):
         route = page.route or "/"
+        # Guard against duplicate route_change firings for the SAME
+        # route. Flet can fire on_route_change redundantly; without
+        # this, /integration_run would be built twice — spawning a
+        # SECOND set of worker threads + SSH sessions per node. That
+        # caused duplicate / out-of-order log lines and SSH socket
+        # conflicts (two sessions fighting over the same node).
+        if (page.views
+                and getattr(page.views[-1], "route", None) == route):
+            print(f"[ROUTE] ignoring duplicate route_change for {route}")
+            return
         print(f"[ROUTE] route_change fired: route={route}, views before={len(page.views)}")
         page.views.clear()
         page.views.append(build_view(route))
@@ -185,7 +256,8 @@ def main(page: ft.Page):
         print(f"[LICENSE] Valid — user={p.get('user')}, expires={p.get('expires')}")
         _user = p.get("user") or p.get("name")
         if _user:
-            page.title = f"NodeCraft v1.0 — Welcome, {_user}"
+            from version import version_string
+            page.title = f"{version_string()} — Welcome, {_user}"
     else:
         print(f"[LICENSE] {license_result['error']} — showing activation screen")
 
@@ -198,6 +270,10 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
+    # Must run BEFORE the Flet client window is created so the taskbar
+    # picks up the shared identity.
+    _set_app_user_model_id()
+    _prefer_bundled_flet_view()
     from app_path import get_app_dir
     _assets = get_app_dir()
     ft.run(main, assets_dir=_assets)

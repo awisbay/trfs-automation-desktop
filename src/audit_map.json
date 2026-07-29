@@ -1,0 +1,179 @@
+{
+  "_note": "CDD Audit mapping. Each profile maps a CDD sheet to a node MO. 'mo_fdn'/'mo' are templates: {ColumnHeader} is replaced with the row value. 'attr' = the MO attribute name in the modump/cmdump (calibrate against a real dump). node_key_column filters rows to the audited node. Add params/sheets by editing this file — no rebuild.",
+
+  "profiles": [
+    {
+      "name": "LTE Node (ENodeFunction)",
+      "tech": "lte_nr",
+      "category": "node",
+      "sheet": "ENodeFunction",
+      "header_row": 1,
+      "node_key_column": "eNodeBName",
+      "mo_fdn": "ENodeBFunction=1",
+      "columns": [
+        {"cdd": "DataRadioBearer.dlMaxRetxThreshold", "attr": "dlMaxRetxThreshold", "mo": "ENodeBFunction=1,DataRadioBearer=1"},
+        {"cdd": "DataRadioBearer.ulMaxRetxThreshold", "attr": "ulMaxRetxThreshold", "mo": "ENodeBFunction=1,DataRadioBearer=1"},
+        {"cdd": "AnrFunctionEUtran.anrInterFreqState", "attr": "anrInterFreqState", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"},
+        {"cdd": "AnrFunctionEUtran.anrIntraFreqState", "attr": "anrIntraFreqState", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"},
+        {"cdd": "AnrFunctionGeran.anrStateGsm", "attr": "anrStateGsm", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionGeran=1"},
+        {"cdd": "AnrFunctionNR.anrStateNR", "attr": "anrStateNR", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionNR=1"}
+      ]
+    },
+
+    {
+      "name": "LTE Node (ManagedElement)",
+      "tech": "lte_nr",
+      "category": "node",
+      "sheet": "CDD",
+      "header_row": 3,
+      "node_key_column": "eNodeBName",
+      "mo_fdn": "ManagedElement={eNodeBName}",
+      "columns": [
+        {"cdd": "UserLabel_Node", "attr": "userLabel"}
+      ]
+    },
+
+    {
+      "name": "LTE Cell (EUtranCellFDD)",
+      "tech": "lte_nr",
+      "category": "cell",
+      "sheet": "CDD",
+      "header_row": 3,
+      "node_key_column": "eNodeBName",
+      "mo_fdn": "ENodeBFunction=1,{_cellmo}={CellName}",
+      "cell_mo_map": {
+        "band_column": "Freq Band",
+        "map": {"L26": "EUtranCellTDD", "L23": "EUtranCellTDD"},
+        "default": "EUtranCellFDD"
+      },
+      "columns": [
+        {"cdd": "TAC", "attr": "tac"},
+        {"cdd": "DLEARFCN", "attr": "earfcndl"},
+        {"cdd": "ULEARFCN", "attr": "earfcnul"},
+        {"cdd": "PCI", "attr": "physicalLayerCellId"},
+        {"cdd": "Root Sequence Index", "attr": "rachRootSequence"},
+        {"cdd": "CRSGain", "attr": "crsGain"},
+        {"cdd": "configuredMaxTxPower", "attr": "configuredMaxTxPower", "via_ref": "sectorCarrierRef"},
+        {"cdd": "sectorCarrierType", "attr": "sectorCarrierType", "via_ref": "sectorCarrierRef"},
+        {"cdd": "transmissionMode", "attr": "transmissionMode"},
+        {"cdd": "pZeroNominalPucch", "attr": "pZeroNominalPucch"},
+        {"cdd": "pZeroNominalPusch", "attr": "pZeroNominalPusch"},
+        {"cdd": "siWindowLength", "attr": "siWindowLength"},
+        {"cdd": "preambleInitialReceivedTargetPower", "attr": "preambleInitialReceivedTargetPower"},
+        {"cdd": "UserLabel_Cell", "attr": "userLabel"},
+        {"cdd": "MIMO", "via_ref": "sectorCarrierRef", "split": [
+          {"attr": "noOfTxAntennas", "regex": "(\\d+)T"},
+          {"attr": "noOfRxAntennas", "regex": "(\\d+)R"}
+        ]}
+      ]
+    },
+
+    {
+      "name": "LTE Relation (EUtranFreqRelation)",
+      "tech": "lte_nr",
+      "category": "relation",
+      "sheet": "EUtranFreqRelation",
+      "header_row": 1,
+      "node_key_column": "eNodeBName",
+      "mo_fdn": "ENodeBFunction=1,{_cellmo}={_cell},{MO}",
+      "cell_expand": {
+        "sheet": "CDD",
+        "header_row": 3,
+        "enb_column": "eNodeBName",
+        "band_column": "Freq Band",
+        "cell_column": "CellName",
+        "row_band_column": "EUTRANCell"
+      },
+      "cell_mo_map": {
+        "band_column": "EUTRANCell",
+        "map": {"L26": "EUtranCellTDD", "L23": "EUtranCellTDD"},
+        "default": "EUtranCellFDD"
+      },
+      "columns": [
+        {"cdd": "caTriggeredRedirectionActive", "attr": "caTriggeredRedirectionActive"},
+        {"cdd": "connectedModeMobilityPrio", "attr": "connectedModeMobilityPrio"},
+        {"cdd": "cellReselectionPriority", "attr": "cellReselectionPriority"},
+        {"cdd": "lbActivationThreshold", "attr": "lbActivationThreshold"},
+        {"cdd": "threshXHigh", "attr": "threshXHigh"},
+        {"cdd": "threshXLow", "attr": "threshXLow"},
+        {"cdd": "tReselectionEutra", "attr": "tReselectionEutra"},
+        {"cdd": "allowedMeasBandwidth", "attr": "allowedMeasBandwidth"},
+        {"cdd": "qOffsetFreq", "attr": "qOffsetFreq"},
+        {"cdd": "qRxLevMin", "attr": "qRxLevMin"},
+        {"cdd": "caFreqPriority", "attr": "caFreqPriority"},
+        {"cdd": "endcHoFreqPriority", "attr": "endcHoFreqPriority"}
+      ]
+    },
+
+    {
+      "name": "NR Node (ManagedElement)",
+      "tech": "nr",
+      "category": "node",
+      "sheet": "CDD",
+      "header_row": 3,
+      "node_key_column": "gNodeBName",
+      "mo_fdn": "ManagedElement={gNodeBName}",
+      "columns": [
+        {"cdd": "UserLabel_Node", "attr": "userLabel"}
+      ]
+    },
+
+    {
+      "name": "NR Cell (NRCellDU)",
+      "tech": "nr",
+      "category": "cell",
+      "sheet": "CDD",
+      "header_row": 3,
+      "node_key_column": "gNodeBName",
+      "mo_fdn": "GNBDUFunction=1,NRCellDU={CellName}",
+      "columns": [
+        {"cdd": "nRPCI", "attr": "nRPCI"},
+        {"cdd": "TAC", "attr": "nRTAC"},
+        {"cdd": "UserLabel_Cell", "attr": "userLabel"},
+        {"cdd": "Root Sequence Index", "attr": "rachRootSequence"},
+        {"cdd": "ssbFrequency", "attr": "ssbFrequency"},
+        {"cdd": "ssbPowerBoost", "attr": "ssbPowerBoost"},
+        {"cdd": "tddUlDlPattern", "attr": "tddUlDlPattern"},
+        {"cdd": "tddSpecialSlotPattern", "attr": "tddSpecialSlotPattern"},
+        {"cdd": "NRCellDU.ulStartCrb", "attr": "ulStartCrb"},
+        {"cdd": "NRCellDU.ulAvailableCrbs", "attr": "ulAvailableCrbs"},
+        {"cdd": "NRCellDU.dlStartCrb", "attr": "dlStartCrb"},
+        {"cdd": "NRCellDU.dlAvailableCrbs", "attr": "dlAvailableCrbs"},
+        {"cdd": "rachPreambleFormat", "attr": "rachPreambleFormat"},
+        {"cdd": "cellRange", "attr": "cellRange"},
+        {"cdd": "maxUeSpeed", "attr": "maxUeSpeed"},
+        {"cdd": "csiRsPeriodicity", "attr": "csiRsPeriodicity"},
+        {"cdd": "DLEARFCN", "attr": "arfcnDL", "via_ref": "nRSectorCarrierRef"},
+        {"cdd": "ULEARFCN", "attr": "arfcnUL", "via_ref": "nRSectorCarrierRef"},
+        {"cdd": "DL BW(MHz)", "attr": "bSChannelBwDL", "via_ref": "nRSectorCarrierRef"},
+        {"cdd": "MIMO", "via_ref": "nRSectorCarrierRef", "split": [
+          {"attr": "noOfTxAntennas", "regex": "(\\d+)T"},
+          {"attr": "noOfRxAntennas", "regex": "(\\d+)R"}
+        ]}
+      ]
+    },
+
+    {
+      "name": "GSM Cell (BSC — via live cmedit, not dump)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "GeranCell",
+      "cmedit_cmd": "cmedit get {scope} {mo}.(gerancellid=={site_mod}*,{attrs}) -t",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {"cdd": "NEW CGI", "attr": "cgi", "norm": "segments"},
+        {"cdd": "NCC", "attr": "ncc"},
+        {"cdd": "BCC", "attr": "bcc"},
+        {"cdd": "BCCHNO", "attr": "bcchNo"},
+        {"cdd": "USER LABEL_CELL", "attr": "userLabel"},
+        {"cdd": "NEW RAC", "attr": "rac"},
+        {"cdd": "CSYSTYPE", "attr": "cSysType"}
+      ]
+    }
+  ]
+}

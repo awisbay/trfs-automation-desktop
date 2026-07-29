@@ -31,6 +31,47 @@ def _project_path(*parts):
     return os.path.join(PROJECT_ROOT, *parts)
 
 
+# ── App version (single source of truth: src/version.py) ───────
+import re as _re
+
+APP_VERSION = "0.0.0"
+try:
+    _ns = {}
+    with open(_project_path("src", "version.py"), encoding="utf-8") as _vf:
+        exec(_vf.read(), _ns)
+    APP_VERSION = _ns.get("__version__", APP_VERSION)
+except Exception as _e:
+    print("[NodeCraft.spec] could not read src/version.py:", _e)
+
+# Build a Windows VERSIONINFO resource so the exe's Properties → Details show
+# the version. Guarded — any failure just omits the resource, never breaks the
+# build.
+_version_res = None
+try:
+    from PyInstaller.utils.win32 import versioninfo as _vi
+    _p = [int(_re.sub(r"\D", "", x) or 0) for x in (APP_VERSION.split(".") + ["0", "0", "0", "0"])[:4]]
+    _vtuple = (_p[0], _p[1], _p[2], _p[3])
+    _version_res = _vi.VSVersionInfo(
+        ffi=_vi.FixedFileInfo(filevers=_vtuple, prodvers=_vtuple,
+                              mask=0x3F, flags=0x0, OS=0x40004,
+                              fileType=0x1, subtype=0x0, date=(0, 0)),
+        kids=[
+            _vi.StringFileInfo([_vi.StringTable("040904B0", [
+                _vi.StringStruct("CompanyName", "Globe"),
+                _vi.StringStruct("ProductName", "NodeCraft"),
+                _vi.StringStruct("FileDescription", "NodeCraft — RAN Integration & CDD Audit"),
+                _vi.StringStruct("FileVersion", APP_VERSION),
+                _vi.StringStruct("ProductVersion", APP_VERSION),
+            ])]),
+            _vi.VarFileInfo([_vi.VarStruct("Translation", [1033, 1200])]),
+        ],
+    )
+except Exception as _e:
+    print("[NodeCraft.spec] version resource skipped:", _e)
+
+print("[NodeCraft.spec] Building NodeCraft v" + APP_VERSION)
+
+
 # ── Flet runtime files ─────────────────────────────────────────
 # Flet ships its own desktop client (the Flutter-built viewer)
 # inside the ``flet`` package. ``collect_data_files`` pulls those
@@ -82,6 +123,12 @@ if os.path.exists(src_config):
     # integration_runner.py reads it from beside itself — that's the
     # same _MEIPASS dir at runtime, so root placement is correct.
 
+# CDD audit mapping — cdd_reader reads ``../audit_map.json`` relative to the
+# frozen ``audit/`` package, i.e. the bundle root.
+src_audit_map = _project_path("src", "audit_map.json")
+if os.path.exists(src_audit_map):
+    asset_datas.append((src_audit_map, "."))
+
 datas = flet_datas + asset_datas
 
 hiddenimports = (
@@ -90,6 +137,7 @@ hiddenimports = (
     + paramiko_hidden
     + cryptography_hidden
     + [
+        "version",          # single source of truth for the app version
         "openpyxl",
         "openpyxl.workbook",
         "openpyxl.styles",
@@ -97,6 +145,11 @@ hiddenimports = (
         "PIL.Image",
         "yaml",
         "tkinter",          # for clipboard fallback in terminal_page
+        # CDD audit (some imported lazily inside worker threads)
+        "gui.audit_page",
+        "audit", "audit.dump_parser", "audit.cdd_reader", "audit.audit_core",
+        "audit.cmedit_source",
+        "xml.etree.ElementTree",
     ]
 )
 
@@ -158,4 +211,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=_project_path("snapshot.ico"),
+    version=_version_res,
 )

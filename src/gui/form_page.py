@@ -19,6 +19,15 @@ def _get_license_user() -> str:
         return str(info.get("user") or info.get("name") or "User").strip() or "User"
     except Exception:
         return "User"
+
+
+def _app_version() -> str:
+    """App version from the single source of truth (src/version.py)."""
+    try:
+        from version import __version__
+        return __version__
+    except Exception:
+        return "?"
 from config_loader import build_config_from_form, load_config
 from session import load_session, save_session
 from gui.theme import (
@@ -27,6 +36,7 @@ from gui.theme import (
     BG_BOTTOM,
     BG_TOP,
     BORDER,
+    DANGER,
     INFO,
     PANEL,
     PANEL_RAISED,
@@ -137,8 +147,19 @@ class FormPage:
         self.defaults.setdefault("relation_file", "")
 
     def build(self) -> ft.View:
+        # Reset the OS window title when returning to the form (clears
+        # any per-shortcode title set during integration/TRFS).
+        try:
+            _sc = self.defaults.get("shortcode", "")
+            self.page.title = (
+                f"NodeCraft — {_sc}" if _sc else "NodeCraft"
+            )
+            self.page.update()
+        except Exception:
+            pass
+
         self.shortcode_field = self._text_field(
-            "Shortcode ex. MIN3117",
+            "Site ID ex. MIN3117",
             self.defaults["shortcode"],
             expand=1,
             autofocus=True,
@@ -290,7 +311,7 @@ class FormPage:
                         color=TEXT,
                     ),
                     ft.Text(
-                        "v1.0 — by ewisbay",
+                        f"v{_app_version()} — by ewisbay",
                         size=14,
                         color=ACCENT,
                         weight=ft.FontWeight.W_500,
@@ -463,6 +484,20 @@ class FormPage:
                             ),
                             ft.Container(width=12),
                             ft.OutlinedButton(
+                                "CDD Audit",
+                                icon=ft.Icons.FACT_CHECK,
+                                tooltip="Compare node dump (modump/cmdump) against CDD",
+                                style=ft.ButtonStyle(
+                                    color=ACCENT_WARM,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT_WARM)),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
+                                    shape=ft.RoundedRectangleBorder(radius=16),
+                                ),
+                                on_click=self._on_audit,
+                            ),
+                            ft.Container(width=12),
+                            ft.OutlinedButton(
                                 "Clear Data",
                                 icon=ft.Icons.CLEANING_SERVICES_OUTLINED,
                                 icon_color="#FF8A8A",
@@ -574,6 +609,7 @@ class FormPage:
             color=ACCENT_WARM,
             weight=ft.FontWeight.BOLD,
         )
+
 
     async def _on_browse(self, e):
         files = await self.file_picker.pick_files(
@@ -859,6 +895,76 @@ class FormPage:
         self.error_box.visible = True
         self.page.update()
 
+    def _show_alert(self, title: str, message: str):
+        """Blocking modal alert (Flet 0.84 dialog stack)."""
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title, color=DANGER, weight=ft.FontWeight.BOLD),
+            content=ft.Text(message, size=13, color=TEXT, selectable=True),
+            actions_alignment=ft.MainAxisAlignment.END,
+            bgcolor=PANEL,
+        )
+
+        def _close(e):
+            try:
+                self.page.pop_dialog()
+            except Exception:
+                try:
+                    dlg.open = False
+                    self.page.update()
+                except Exception:
+                    pass
+
+        dlg.actions = [ft.TextButton("OK", on_click=_close)]
+        try:
+            self.page.show_dialog(dlg)
+        except Exception:
+            try:
+                self.page.overlay.append(dlg)
+                dlg.open = True
+                self.page.update()
+            except Exception:
+                pass
+
+    def _validate_shortcode_prefix(self, f: dict) -> bool:
+        """Site ID and EVERY node name must belong to the same site, so
+        each site gets one consistent LOG/<SITE_ID>/ folder.
+
+        A node name matches when it is exactly the Site ID or starts with
+        ``<SITE_ID>_``. The underscore boundary matters: without it a Site
+        ID of ``MIN3117`` would wrongly accept ``MIN31170_...``, which is a
+        DIFFERENT site.
+
+        Returns False (and shows a popup) when any node name doesn't match.
+        """
+        sc = (f.get("shortcode") or "").strip()
+        if not sc:
+            return True                       # emptiness handled by caller
+        scu = sc.upper()
+
+        def _matches(nn: str) -> bool:
+            u = nn.strip().upper()
+            return u == scu or u.startswith(scu + "_")
+
+        checks = (
+            ("LTE/NR", f.get("node_name", "")),
+            ("LTE/NR #2", f.get("node2_name", "")),
+            ("GSM", f.get("gsm_node_name", "")),
+        )
+        bad = [f"  • {lbl}: {nn.strip()}" for lbl, nn in checks
+               if nn.strip() and not _matches(nn)]
+        if not bad:
+            return True
+        self._show_alert(
+            "Site ID and Node Name do not match",
+            f"Site ID '{sc}' must be the prefix of EVERY node name — the "
+            "Site ID, Node 1, Node 2 and GSM must all belong to the same "
+            "site.\n\nMismatched:\n" + "\n".join(bad) +
+            f"\n\nExpected format:  {sc}_SITENAME...\n\n"
+            "Please correct the Site ID or the node name(s)."
+        )
+        return False
+
     def _on_clear_data(self, e):
         """Clear all site-related fields. SSH credentials (host, port,
         username, password) are intentionally preserved so the operator
@@ -899,7 +1005,7 @@ class FormPage:
 
         errors = []
         if not f["shortcode"]:
-            errors.append("Shortcode is required.")
+            errors.append("Site ID is required.")
         if not f["node_name"]:
             errors.append("Node name is required.")
         if not f["host"]:
@@ -915,6 +1021,10 @@ class FormPage:
 
         if errors:
             self._show_errors(errors)
+            return
+
+        # Shortcode must prefix every node name.
+        if not self._validate_shortcode_prefix(f):
             return
 
         self.error_text.visible = False
@@ -961,10 +1071,20 @@ class FormPage:
         }
         self.page.go("/terminal")
 
+    def _on_audit(self, e):
+        # Standalone CDD audit — no field validation required. Hand off the
+        # form so the audit page can prefill Site ID + Node Name.
+        self.page.integration_form = self._collect_form()
+        self.page.go("/audit")
+
     def _on_integration(self, e):
         f = self._collect_form()
 
         errors = []
+        # Shortcode is mandatory — every site must land in its own
+        # LOG/<SHORTCODE>/ folder.
+        if not f["shortcode"]:
+            errors.append("Site ID is required.")
         if not f["node_name"]:
             errors.append("Node name (LTE/NR) is required.")
         if not f["host"]:
@@ -976,6 +1096,10 @@ class FormPage:
 
         if errors:
             self._show_errors(errors)
+            return
+
+        # Shortcode must prefix every node name.
+        if not self._validate_shortcode_prefix(f):
             return
 
         self.error_text.visible = False

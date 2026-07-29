@@ -6,6 +6,7 @@ Two phases:
   /integration_run  — Progress page (2-3 node columns, high-level log, timer)
 """
 import asyncio
+import collections
 import logging
 import os
 import queue
@@ -65,6 +66,7 @@ INTEGRATION_STEPS = [
     ("create_arne",       "Add Node in ENM",              "both",    "ARNE"),
     ("enrollment",       "Perform Site Enrollment in ENM", "both",    "ENROLLMENT"),
     ("uri_setting",       "URI Reconfig",                 "both",    "URI"),
+    ("sw_level_check",    "SW Level Check",                "both",    "SW_LEVEL"),
     ("enrollment_sync",   "Node Synchronized in ENM",    "both",    "ENROLLMENT"),
     ("install_lkf",       "Install LKF (License File)",    "both",   "LKF"),
     ("relation",          "Load Neighbour Relation Scripts", "lte_nr", "RELATION"),
@@ -77,6 +79,7 @@ INTEGRATION_STEPS = [
     ("gsm_cell_define",  "GSM Cells and MO Defined in BSC", "gsm",   "GSM_CELL_DEFINE"),
     ("bsc_neighbours",    "BSC Neighbours Defined",        "gsm",     "BSC_NEIGHBOURS"),
     ("network_audit",     "Network Configuration Audit (NAT)", "both", "NAT"),
+    ("sync_check",        "Synchronization",               "both",    "SYNC"),
     ("backup_cv",         "Configuration Backup and Upload to ENM", "both", "BACKUP_CV"),
     ("take_cm_dump",      "Take CM Dump",                  "both",    "CM_DUMP"),
     ("take_dump",         "Take Dump",                     "both",    "DUMP"),
@@ -89,14 +92,12 @@ REMARK_STEPS = {
     "bb_power_on",        # pre-verified manual check → always Yes
     "enrollment_sync",
     "bb_transport",
-    "bsc_neighbours",
     "network_audit",
 }
 
 # Summary-only rows that should stay out of the live progress columns and
 # always display as N/A in the final summary.
 SUMMARY_NA_STEPS = {
-    "bsc_neighbours",
     "network_audit",
 }
 
@@ -108,6 +109,7 @@ SUMMARY_LABELS = {
     "create_arne":       "Add Node in ENM",
     "enrollment":        "Perform Site Enrollment in ENM",
     "uri_setting":       "URI Reconfig",
+    "sw_level_check":    "SW Level Check",
     "enrollment_sync":   "Node Synchronized in ENM",
     "install_lkf":       "Install LKF (License File)",
     "relation":          "Load Neighbour Relation Scripts",
@@ -119,13 +121,18 @@ SUMMARY_LABELS = {
     "gsm_cell_define":   "GSM Cells and MO Defined in BSC",
     "bsc_neighbours":    "BSC Neighbours Defined",
     "network_audit":     "Network Configuration Audit (NAT)",
+    "sync_check":        "Synchronization",
     "pm_measurement":    "Validate Performance Counter",
     "backup_cv":         "Configuration Backup and Upload to ENM",
     "take_cm_dump":      "Take CM Dump",
     "take_dump":         "Take Dump",
 }
 
-def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
+def _step_applies_to_node(
+    applies_to: str,
+    ntag: str,
+    gsm_on_primary: bool = False,
+) -> bool:
     """Whether a step with the given ``applies_to`` scope is relevant
     to the node identified by ``ntag`` (``"lte"`` / ``"lte2"`` / ``"gsm"``).
 
@@ -136,7 +143,11 @@ def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
       ``both``        → every node
       ``lte_nr``      → ``lte`` or ``lte2``
       ``lte_primary`` → ``lte`` only (per-site setup that runs once)
-      ``gsm``         → ``gsm``
+      ``gsm``         → ``gsm`` node; with ``gsm_on_primary=True`` it
+                        also matches ``lte`` (single-RAT-radio site
+                        where the operator typed a BSC name but no
+                        separate GSM node — GSM is co-located on the
+                        primary LTE/NR node).
     """
     if applies_to == "both":
         return True
@@ -145,12 +156,17 @@ def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
     if applies_to == "lte_primary":
         return ntag == "lte"
     if applies_to == "gsm":
-        return ntag == "gsm"
+        if ntag == "gsm":
+            return True
+        if gsm_on_primary and ntag == "lte":
+            return True
+        return False
     return False
 
 
 _RESULT_SYMBOLS = {
     "done":    "✅",
+    "warn":    "⚠️",
     "error":   "❌",
     "skip":    "⏩",
     "running": "🔄",
@@ -178,6 +194,15 @@ class IntegrationPage:
         self.gsm_subnet = self.form.get("gsm_subnetwork", "")
         self.has_lte2 = bool(self.lte2_name)
         self.has_gsm = bool(self.gsm_name)
+        # Co-located mode: a single physical node hosts BOTH LTE/NR
+        # AND GSM (multi-RAT, no separate GSM DN). Operator signals
+        # this by entering a BSC name but leaving the GSM node name +
+        # IP blank. All GSM-scope steps then run on the primary LTE
+        # node instead of getting their own column.
+        self.gsm_on_primary = (
+            not self.has_gsm
+            and bool(str(self.form.get("bsc_name", "") or "").strip())
+        )
         self.shortcode = self.form.get("shortcode", "UNKNOWN")
 
         # Checkboxes are keyed step → node_tag → Checkbox so each node
@@ -197,11 +222,14 @@ class IntegrationPage:
         if self.has_gsm:
             self.node_columns.append(("gsm", "GSM"))
 
-    @staticmethod
-    def _step_applies_to_node(applies_to: str, ntag: str) -> bool:
-        # Thin wrapper over the module-level helper, kept here for
-        # backward compatibility with existing callers in this class.
-        return _step_applies_to_node(applies_to, ntag)
+    def _step_applies_to_node(self, applies_to: str, ntag: str) -> bool:
+        # Thin wrapper over the module-level helper — passes the
+        # co-located-GSM flag so GSM-scope steps fold into the LTE
+        # column when there's no separate GSM node.
+        return _step_applies_to_node(
+            applies_to, ntag,
+            gsm_on_primary=getattr(self, "gsm_on_primary", False),
+        )
 
     def _step_disabled_reason(self, key: str) -> Optional[str]:
         """Return a short reason why a step's checkboxes should be
@@ -213,16 +241,26 @@ class IntegrationPage:
         checklist hides the choice from the operator entirely:
         checkbox starts unchecked, disabled (can't be ticked), and a
         small italic hint explains why.
+
+        NOTE: ``install_lkf`` is intentionally NOT disabled when no zip
+        is provided — LKF now always runs (``lkfinstall.py <node>``
+        directly, the license may already be imported in ENM). Only
+        ``relation`` still requires its file.
         """
-        if key == "install_lkf":
-            if not str(self.form.get("lkf_file", "")).strip():
-                return "no LKF file selected"
         if key == "relation":
             if not str(self.form.get("relation_file", "")).strip():
                 return "no relation file selected"
         return None
 
     def build(self) -> ft.View:
+        # Tag the OS window with the SHORTCODE so multiple open
+        # NodeCraft windows are distinguishable from the taskbar.
+        try:
+            self.page.title = f"NodeCraft — {self.shortcode} (Setup)"
+            self.page.update()
+        except Exception:
+            pass
+
         # ── Build the multi-column checklist grid ───────────────
         # Layout: one row per step, one checkbox column per node.
         # Cells where the step doesn't apply to the node show "—".
@@ -461,7 +499,7 @@ class IntegrationPage:
                 [
                     ft.Text("Integration Setup", size=24,
                             weight=ft.FontWeight.BOLD, color=TEXT),
-                    ft.Text(f"Shortcode: {self.shortcode}", size=13,
+                    ft.Text(f"Site ID: {self.shortcode}", size=13,
                             color=TEXT_MUTED),
                     node_info_row,
                     ft.Container(height=8),
@@ -563,6 +601,56 @@ class IntegrationRunPage:
         self._active_ssh = {}
         self._log_queue: queue.Queue = queue.Queue()
         self._run_finished = False
+        # Set by _set_step (worker threads) when a step's status cell
+        # changes but no log line was emitted — tells the UI-thread
+        # flush loop to repaint so progress doesn't appear frozen.
+        self._ui_dirty = False
+        # Serializes operator dialogs so two parallel node workers never
+        # stack/overlap modal dialogs (which made the topmost one
+        # un-clickable). Only one dialog is shown at a time.
+        self._dialog_lock = threading.Lock()
+        # Node tags the operator chose to "Skip Node" on — the worker
+        # loop checks this and aborts that node's remaining steps.
+        self._aborted_nodes: set = set()
+        # Serializes CPU-heavy post-processing (log parsing + openpyxl
+        # Excel building). These hold Python's GIL for 1-3 s; if all 3
+        # node workers run them at once the asyncio event loop is
+        # starved and the Flet window paints BLACK (no render frames
+        # sent). Serializing caps it to one CPU-bound section at a time
+        # so the event loop gets GIL gaps to keep the UI alive.
+        self._heavy_lock = threading.Lock()
+
+        # ── Per-node live terminal tabs ──────────────────────────
+        # A real mirror of the moshell/SSH session per node — every byte
+        # the node sends back (the actual `crn ...`, `ERROR: MO already
+        # exists`, prompts, etc.), not just a high-level summary.
+        # CPU/memory-safe by design:
+        #   * per node we keep a bounded TEXT scrollback (last N chars),
+        #     so RAM is tiny and appends are cheap on the SSH hot path
+        #   * ONLY the active tab is rendered → zero render cost while the
+        #     operator stays on the default "Session" tab
+        #   * ANSI stripping + line splitting happen at RENDER time on the
+        #     ~300 visible lines only — never on the SSH read path
+        self._RAW_MAXCHARS = 48000                # ~600 lines scrollback
+        self._active_log_tab = "session"          # "session" | node tag
+        # Scrollback stored as a deque of raw chunks + a running char
+        # count, so appends are O(chunk) (append + a couple of poplefts)
+        # instead of recopying the whole ~48 KB window every recv.
+        self._node_raw: dict[str, collections.deque] = {}
+        self._node_raw_len: dict[str, int] = {}
+        self._node_live_dirty: dict[str, bool] = {}
+        self._node_live_column: dict[str, ft.Column] = {}
+        self._live_lock = threading.Lock()
+        self._log_tab_buttons: dict[str, ft.Container] = {}
+
+        # Relation remote-folder cleanup coordination. The relation zip
+        # is unzipped into a SHARED ``/RELATION/<shortcode>/`` folder
+        # with one subfolder per node. We must only delete it once ALL
+        # relation-running nodes are done — otherwise the first node to
+        # finish wipes a still-running sibling's scripts mid-run.
+        self._relation_cleanup_lock = threading.Lock()
+        self._relation_nodes_expected: Optional[set] = None
+        self._relation_nodes_done: set = set()
 
         self.form = getattr(page, "integration_form", {})
         self.selected_steps: set = getattr(
@@ -585,6 +673,13 @@ class IntegrationRunPage:
         self.gsm_subnet = self.form.get("gsm_subnetwork", "")
         self.has_lte2 = bool(self.lte2_name)
         self.has_gsm = bool(self.gsm_name)
+        # See IntegrationPage.__init__ for rationale — co-located
+        # GSM (BSC filled, GSM node name blank) routes GSM steps to
+        # the primary LTE node instead of a separate column.
+        self.gsm_on_primary = (
+            not self.has_gsm
+            and bool(str(self.form.get("bsc_name", "") or "").strip())
+        )
 
         self.shortcode = self.form.get("shortcode", "UNKNOWN")
 
@@ -603,8 +698,37 @@ class IntegrationRunPage:
         # Per-node duration tracking: {node_tag: seconds}
         self._node_durations: dict[str, float] = {}
 
+        # ── Per-node resume support ──────────────────────────────
+        # When a node stops early (fail/skip) with steps still pending,
+        # a "Resume" button on that node's column re-runs its workflow
+        # from the failed step (skipping already-done steps) with a
+        # fresh SSH session. Other nodes are unaffected.
+        self._resume_buttons: dict[str, ft.Control] = {}
+        self._node_params: dict[str, dict] = {}   # tag -> run kwargs
+        self._resuming: set = set()               # tags currently re-running
+        # All node workers currently running (initial + resumed). Finalize
+        # (+ summary popup) only fires when this is empty, so the popup can
+        # never appear while ANY node — including a resumed one — is busy.
+        self._active_workers: set = set()
+        # Nodes that stopped early (fail/abort/AMOS-fail) with steps left
+        # unfinished — these get a Resume button. Explicit set, because
+        # stopped steps are marked "skip" and can't be told apart from
+        # legitimate skips by state alone.
+        self._resumable_nodes: set = set()
+
     # ── Build ────────────────────────────────────────────────────
     def build(self) -> ft.View:
+        # Put the SHORTCODE in the OS window title so the taskbar
+        # preview / Alt-Tab shows which site each window is running —
+        # essential when the operator opens several NodeCraft windows.
+        try:
+            self.page.title = (
+                f"NodeCraft — {self.shortcode} (Integration)"
+            )
+            self.page.update()
+        except Exception:
+            pass
+
         self.back_button = ft.ElevatedButton(
             "Back to Form",
             icon=ft.Icons.ARROW_BACK,
@@ -627,8 +751,13 @@ class IntegrationRunPage:
             size=22, weight=ft.FontWeight.BOLD, color=TEXT,
         )
         self.elapsed_text = ft.Text("00:00", size=13, color=TEXT_MUTED)
+        # ``auto_scroll=True`` makes Flet keep the view pinned to the
+        # newest line automatically — no manual scroll_to (which is an
+        # un-awaited coroutine in this Flet version and never actually
+        # scrolled).
         self.log_column = ft.Column(
             spacing=2, scroll=ft.ScrollMode.AUTO, expand=True,
+            auto_scroll=True,
         )
 
         # Build step rows for each node column
@@ -677,26 +806,30 @@ class IntegrationRunPage:
         lte_rows = []
         lte2_rows = []
         gsm_rows = []
+        gsm_on_primary = getattr(self, "gsm_on_primary", False)
         for key, label, applies_to, _ in INTEGRATION_STEPS:
             # Route to the correct column(s) based on the step's
             # applies_to scope. Uses the module-level helper so the
-            # new ``lte_primary`` scope (primary LTE only) is honoured
-            # — it shows in the lte column but NOT in lte2 or gsm.
-            if _step_applies_to_node(applies_to, "lte"):
+            # ``lte_primary`` scope (primary LTE only) is honoured —
+            # and so ``gsm`` steps fold into the LTE column when
+            # ``gsm_on_primary`` (BSC filled, no separate GSM node).
+            if _step_applies_to_node(applies_to, "lte", gsm_on_primary):
                 if _should_show_for_node(key, "lte"):
                     row = _StepRow(_row_label(key, label, "lte"))
                     self.lte_steps[key] = row
                     lte_rows.append(row.control)
                     if key in REMARK_STEPS:
                         _apply_remark_state(row, key)
-            if self.has_lte2 and _step_applies_to_node(applies_to, "lte2"):
+            if self.has_lte2 and _step_applies_to_node(
+                applies_to, "lte2", gsm_on_primary,
+            ):
                 if _should_show_for_node(key, "lte2"):
                     row2 = _StepRow(_row_label(key, label, "lte2"))
                     self.lte2_steps[key] = row2
                     lte2_rows.append(row2.control)
                     if key in REMARK_STEPS:
                         _apply_remark_state(row2, key)
-            if _step_applies_to_node(applies_to, "gsm"):
+            if _step_applies_to_node(applies_to, "gsm", gsm_on_primary):
                 if _should_show_for_node(key, "gsm"):
                     row = _StepRow(_row_label(key, label, "gsm"))
                     self.gsm_steps[key] = row
@@ -711,6 +844,7 @@ class IntegrationRunPage:
             accent=INFO,
             icon=ft.Icons.CELL_TOWER,
             step_rows=lte_rows,
+            node_tag="lte",
         )
         columns.append(lte_column)
 
@@ -721,6 +855,7 @@ class IntegrationRunPage:
                 accent=ACCENT,
                 icon=ft.Icons.CELL_TOWER,
                 step_rows=lte2_rows,
+                node_tag="lte2",
             )
             columns.append(lte2_column)
 
@@ -731,6 +866,7 @@ class IntegrationRunPage:
                 accent=ACCENT_WARM,
                 icon=ft.Icons.SETTINGS_INPUT_ANTENNA,
                 step_rows=gsm_rows,
+                node_tag="gsm",
             )
             columns.append(gsm_column)
 
@@ -754,12 +890,51 @@ class IntegrationRunPage:
             expand=True,
         )
 
+        # ── Build the log tab bar: Session + one per connected node ──
+        log_tabs: list[tuple[str, str]] = [("session", "Session")]
+        log_tabs.append(("lte", self.lte_name or "LTE/NR"))
+        if self.has_lte2:
+            log_tabs.append(("lte2", self.lte2_name or "LTE/NR #2"))
+        if self.has_gsm:
+            log_tabs.append(("gsm", self.gsm_name or "GSM"))
+
+        # Per-node scrollback + columns (only built for real nodes).
+        for tab_key, _ in log_tabs:
+            if tab_key == "session":
+                continue
+            self._node_raw[tab_key] = collections.deque()
+            self._node_raw_len[tab_key] = 0
+            self._node_live_dirty[tab_key] = False
+            self._node_live_column[tab_key] = ft.Column(
+                spacing=1, scroll=ft.ScrollMode.AUTO, expand=True,
+                auto_scroll=True,
+            )
+
+        tab_btn_row = ft.Row(spacing=4, scroll=ft.ScrollMode.AUTO)
+        for tab_key, tab_label in log_tabs:
+            short = tab_label if len(tab_label) <= 22 else tab_label[:20] + "…"
+            btn = ft.Container(
+                content=ft.Text(short, size=12,
+                                weight=ft.FontWeight.W_600),
+                padding=ft.Padding(left=12, top=5, right=12, bottom=5),
+                border_radius=8,
+                on_click=lambda e, k=tab_key: self._switch_log_tab(k),
+                ink=True,
+            )
+            self._log_tab_buttons[tab_key] = btn
+            tab_btn_row.controls.append(btn)
+
+        # Content host swaps between Session log and node live columns.
+        self._log_content_host = ft.Container(
+            content=self.log_column, expand=True,
+        )
+        self._style_log_tabs()  # set initial active highlight
+
         log_panel = panel(
             ft.Column(
                 [
-                    ft.Text("LOG OUTPUT", size=11, color=TEXT_MUTED,
-                            weight=ft.FontWeight.BOLD),
-                    self.log_column,
+                    tab_btn_row,
+                    self._log_content_host,
                 ],
                 spacing=8,
                 expand=True,
@@ -786,6 +961,8 @@ class IntegrationRunPage:
         self._timer_running = True
         threading.Thread(target=self._tick_timer, daemon=True).start()
         threading.Thread(target=self._run_workflow, daemon=True).start()
+        # Phone monitor pusher (no-op thread exits immediately if the
+        # Telegram monitor isn't configured).
         self.page.run_task(self._flush_loop)
 
         return ft.View(
@@ -805,8 +982,24 @@ class IntegrationRunPage:
     def _node_card(
         self, title: str, subtitle: str, accent: str, icon: str,
         step_rows: list[ft.Control], dimmed: bool = False,
+        node_tag: str = "",
     ) -> ft.Container:
         opacity = 0.4 if dimmed else 1.0
+        # Per-node Resume button — hidden until the node stops early with
+        # steps still pending (see _update_resume_button).
+        resume_btn = ft.ElevatedButton(
+            "Resume",
+            icon=ft.Icons.PLAY_ARROW,
+            visible=False,
+            tooltip="Re-run this node from the failed step to the end",
+            style=ft.ButtonStyle(
+                bgcolor=ACCENT_WARM, color="#06242A",
+                shape=ft.RoundedRectangleBorder(radius=10),
+            ),
+            on_click=lambda e, nt=node_tag: self._resume_node(nt),
+        )
+        if node_tag:
+            self._resume_buttons[node_tag] = resume_btn
         return ft.Container(
             expand=1,
             opacity=opacity,
@@ -818,8 +1011,11 @@ class IntegrationRunPage:
                                 ft.Icon(icon, size=20, color=accent),
                                 ft.Text(title, size=16,
                                         weight=ft.FontWeight.BOLD, color=TEXT),
+                                ft.Container(expand=True),
+                                resume_btn,
                             ],
                             spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                         ft.Text(subtitle, size=11, color=TEXT_MUTED),
                         ft.Divider(height=1, color=BORDER),
@@ -846,11 +1042,89 @@ class IntegrationRunPage:
         self._log_queue.put_nowait(line)
 
     def _detail_log(self, msg: str, node_tag: str = "lte"):
-        """Full-detail log saved to step log files only (not shown in UI)."""
+        """Full-detail log saved to step log files only. (The per-node
+        LIVE tab is fed separately from the raw SSH stream — see
+        ``_feed_raw`` — so it mirrors the real moshell terminal.)"""
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         with self._session_log_lock:
             self._session_logs[node_tag].append(line)
+
+    # ── Live per-node terminal feed (raw moshell stream) ─────────
+    def _feed_raw(self, node_tag: str, chunk: str) -> None:
+        """Append a raw SSH recv chunk to a node's scrollback. Runs on
+        the SSH reader thread → kept minimal: just append + cap. ANSI
+        cleanup and line splitting are deferred to render time (active
+        tab only)."""
+        if not chunk:
+            return
+        dq = self._node_raw.get(node_tag)
+        if dq is None:
+            return
+        cap = self._RAW_MAXCHARS
+        # A single recv can't exceed the whole window — trim it alone.
+        if len(chunk) > cap:
+            chunk = chunk[-cap:]
+        with self._live_lock:
+            dq.append(chunk)
+            total = self._node_raw_len[node_tag] + len(chunk)
+            # Drop oldest chunks until back under the cap (keep ≥1).
+            while total > cap and len(dq) > 1:
+                total -= len(dq.popleft())
+            self._node_raw_len[node_tag] = total
+            if self._active_log_tab == node_tag:
+                self._node_live_dirty[node_tag] = True
+
+    # ── Live log tab switching ─────────────────────────────────
+    def _style_log_tabs(self) -> None:
+        for key, btn in self._log_tab_buttons.items():
+            active = (key == self._active_log_tab)
+            btn.bgcolor = (
+                ft.Colors.with_opacity(0.20, ACCENT) if active else None
+            )
+            try:
+                btn.content.color = ACCENT if active else TEXT_MUTED
+            except Exception:
+                pass
+
+    def _switch_log_tab(self, tab_key: str) -> None:
+        self._active_log_tab = tab_key
+        if tab_key == "session":
+            self._log_content_host.content = self.log_column
+        else:
+            col = self._node_live_column.get(tab_key)
+            if col is not None:
+                # Full one-time render of the buffer on switch.
+                self._render_node_live(tab_key, full=True)
+                self._log_content_host.content = col
+        self._style_log_tabs()
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    # Strips ANSI/VT100 escape sequences (colour codes, cursor moves)
+    # that moshell emits so the terminal view shows clean text.
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+    def _render_node_live(self, tab_key: str, full: bool = False) -> None:
+        """Rebuild the active node tab's terminal from its scrollback.
+        Only ever called for the ACTIVE tab. ANSI strip + split run here
+        (on ≤48 KB), never on the SSH read path."""
+        col = self._node_live_column.get(tab_key)
+        if col is None:
+            return
+        with self._live_lock:
+            dq = self._node_raw.get(tab_key)
+            raw = "".join(dq) if dq else ""
+            self._node_live_dirty[tab_key] = False
+        clean = self._ANSI_RE.sub("", raw).replace("\r", "")
+        lines = clean.split("\n")[-300:]   # cap visible rows
+        col.controls = [
+            ft.Text(ln if ln else " ", size=11, color=TEXT_MUTED,
+                    selectable=True, font_family="Consolas")
+            for ln in lines
+        ]
 
     def _save_step_log(self, step_number: int, node_name: str,
                        log_suffix: str, node_tag: str = "lte"):
@@ -859,8 +1133,17 @@ class IntegrationRunPage:
         session_dir = os.path.join(self.log_dir, "SESSION")
         os.makedirs(session_dir, exist_ok=True)
         filepath = os.path.join(session_dir, filename)
+        # MEMORY FIX: snapshot THIS step's lines then CLEAR the buffer.
+        # Previously we copied the entire accumulated list every step
+        # (O(steps²) memory + CPU + disk, and each numbered file was
+        # cumulative). With 3 nodes each logging multi-MB baseline /
+        # relation output, that churn is what made 3-node runs slow.
+        # Now each numbered file holds only that step's lines and the
+        # in-memory buffer is freed after every step — peak memory is
+        # bounded to roughly one step's output per node.
         with self._session_log_lock:
-            snapshot = list(self._session_logs.get(node_tag, []))
+            snapshot = self._session_logs.get(node_tag, [])
+            self._session_logs[node_tag] = []
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(f"Integration Log — {self.shortcode}\n")
@@ -874,28 +1157,52 @@ class IntegrationRunPage:
             logger.warning(f"[Integration] Failed to save log: {exc}")
 
     async def _flush_loop(self):
+        # 0.4 s (not 0.25 s) so the event loop spends less time on
+        # full-page updates and more handling client input — keeps the
+        # modal dialog buttons responsive under 3-node load.
         while not self._run_finished or not self._log_queue.empty():
             self._flush_log()
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.4)
         self._flush_log()
 
     def _flush_log(self):
         dirty = False
-        while not self._log_queue.empty():
+        had_new_log = False
+        # Cap how many lines we ingest per tick so a sudden burst (3
+        # nodes flooding) can't make one update() serialize a huge diff
+        # and stall the event loop.
+        ingested = 0
+        while not self._log_queue.empty() and ingested < 200:
             try:
                 msg = self._log_queue.get_nowait()
             except queue.Empty:
                 break
+            ingested += 1
             self.log_column.controls.append(
                 ft.Text(msg, size=11, color=TEXT_MUTED, selectable=True,
                         font_family="Consolas")
             )
-            if len(self.log_column.controls) > 500:
-                self.log_column.controls = self.log_column.controls[-400:]
+            # Smaller retained window → cheaper page.update() diffs.
+            if len(self.log_column.controls) > 300:
+                self.log_column.controls = self.log_column.controls[-250:]
+            dirty = True
+            had_new_log = True
+        # Also repaint when a step status cell changed without a log
+        # line (``_ui_dirty`` set by _set_step from a worker thread).
+        if self._ui_dirty:
+            dirty = True
+            self._ui_dirty = False
+        # Render the active node LIVE tab only when it has new lines.
+        # Inactive node tabs are never rendered (their ring buffers
+        # just hold the last N lines) → zero cost while on Session.
+        atab = self._active_log_tab
+        if atab != "session" and self._node_live_dirty.get(atab):
+            self._render_node_live(atab)
             dirty = True
         if dirty:
+            # No manual scroll_to — log_column has auto_scroll=True, so
+            # Flet keeps the newest line in view on its own.
             try:
-                self.log_column.scroll_to(offset=-1)
                 self.page.update()
             except Exception:
                 pass
@@ -906,10 +1213,12 @@ class IntegrationRunPage:
             elapsed = datetime.now() - self._start_time
             mins, secs = divmod(int(elapsed.total_seconds()), 60)
             self.elapsed_text.value = f"{mins:02d}:{secs:02d}"
-            try:
-                self.page.update()
-            except Exception:
-                pass
+            # Do NOT call page.update() here — that was a second
+            # cross-thread updater competing with the flush loop for
+            # the event loop (and could stall click handling on the
+            # modal dialogs). Just mark dirty; the flush loop (the
+            # single updater, on the event loop) repaints the timer.
+            self._ui_dirty = True
             time.sleep(1)
 
     # ── Step state updates ───────────────────────────────────────
@@ -923,6 +1232,12 @@ class IntegrationRunPage:
         if key in steps:
             steps[key].set_state(state, detail)
         self._step_results.setdefault(node, {})[key] = state
+        # Mark the UI dirty so the flush loop repaints the status cell
+        # on its next tick (≤0.25 s) even if no log line follows. This
+        # is what keeps the progress column in sync with the worker —
+        # previously the cell only updated when a log line happened to
+        # be emitted right after.
+        self._ui_dirty = True
 
     def is_step_selected(self, step_key: str, node_tag: str) -> bool:
         """Whether the operator ticked ``step_key`` for ``node_tag`` in
@@ -1002,43 +1317,102 @@ class IntegrationRunPage:
 
         return _RESULT_SYMBOLS.get(state, "—")
 
+    # ── Dialog plumbing (Flet 0.84 correct API) ─────────────────
+    def _show_dialog_safe(self, dlg) -> None:
+        """Open a modal dialog using the Flet 0.84 dialog stack
+        (``page.show_dialog``). Falls back to the legacy
+        ``overlay.append + open=True`` only if show_dialog is absent.
+
+        The OLD overlay approach is exactly what made dialogs
+        un-closable: a dialog placed in ``page.overlay`` is NOT in
+        Flet's managed ``_dialogs`` stack, so toggling ``dlg.open``
+        never dismisses it and its action buttons don't resolve.
+        """
+        if hasattr(self.page, "show_dialog"):
+            try:
+                self.page.show_dialog(dlg)
+                return
+            except Exception as exc:
+                logger.warning(f"show_dialog failed ({exc}); using overlay fallback")
+        try:
+            self.page.overlay.append(dlg)
+            dlg.open = True
+            self.page.update()
+        except Exception as exc:
+            logger.warning(f"overlay dialog fallback failed: {exc}")
+
+    def _close_dialog_safe(self, dlg) -> None:
+        """Dismiss a dialog opened via _show_dialog_safe. Tries the
+        managed stack (``pop_dialog``) first, then direct ``open=False``,
+        then overlay removal — whichever the current Flet supports."""
+        closed = False
+        if hasattr(self.page, "pop_dialog"):
+            try:
+                self.page.pop_dialog()
+                closed = True
+            except Exception:
+                pass
+        if not closed:
+            try:
+                dlg.open = False
+                dlg.update()
+                closed = True
+            except Exception:
+                pass
+        # Belt-and-braces: remove from overlay if it ended up there.
+        try:
+            if dlg in (self.page.overlay or []):
+                self.page.overlay.remove(dlg)
+        except Exception:
+            pass
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
     # ── Blocking dialogs (called from worker threads) ────────────
-    def _ask_user_retry(self, message: str) -> bool:
-        result_event = threading.Event()
-        user_choice: list[bool] = [False]
+    def _ask_user_retry(self, message: str, node_tag: Optional[str] = None) -> bool:
+        """Modal Retry / Skip Node / Stop dialog.
 
-        def _on_retry(e):
-            user_choice[0] = True
-            dlg.open = False
-            self.page.update()
-            result_event.set()
+        Returns True only for **Retry**. **Stop** and **Skip Node**
+        both return False; **Skip Node** additionally marks
+        ``node_tag`` so the worker loop aborts that node's remaining
+        steps (the operator's "force-close everything on this node"
+        escape hatch).
 
-        def _on_stop(e):
-            user_choice[0] = False
-            dlg.open = False
-            self.page.update()
-            result_event.set()
+        Serialized via ``self._dialog_lock`` so parallel node workers
+        never stack overlapping modal dialogs.
+        """
+        with self._dialog_lock:
+            result = {"choice": "stop"}
+            ev = threading.Event()
 
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Verification Failed", color=DANGER,
-                          weight=ft.FontWeight.BOLD),
-            content=ft.Column(
-                [
-                    ft.Text(message, size=13, color=TEXT),
-                    ft.Container(height=8),
-                    ft.Text(
-                        "Fix the issue manually (e.g. via ENM CLI), "
-                        "then click Retry.",
-                        size=12, color=TEXT_MUTED, italic=True,
-                    ),
-                ],
-                tight=True,
-            ),
-            actions=[
-                ft.TextButton("Stop",
-                              style=ft.ButtonStyle(color=DANGER),
-                              on_click=_on_stop),
+            def _resolve(choice):
+                # Idempotent — ignore double fires (e.g. on_dismiss
+                # after a button already resolved).
+                if ev.is_set():
+                    return
+                result["choice"] = choice
+                self._close_dialog_safe(dlg)
+                ev.set()
+
+            actions = [
+                ft.TextButton(
+                    "Stop",
+                    style=ft.ButtonStyle(color=DANGER),
+                    on_click=lambda e: _resolve("stop"),
+                ),
+            ]
+            if node_tag:
+                actions.append(
+                    ft.TextButton(
+                        "Skip Node",
+                        icon=ft.Icons.SKIP_NEXT,
+                        style=ft.ButtonStyle(color=ACCENT_WARM),
+                        on_click=lambda e: _resolve("skip"),
+                    )
+                )
+            actions.append(
                 ft.ElevatedButton(
                     "Retry", icon=ft.Icons.REFRESH,
                     style=ft.ButtonStyle(
@@ -1046,79 +1420,95 @@ class IntegrationRunPage:
                         padding=ft.Padding.symmetric(horizontal=16,
                                                      vertical=12),
                         shape=ft.RoundedRectangleBorder(radius=12)),
-                    on_click=_on_retry),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-            bgcolor=PANEL,
-        )
+                    on_click=lambda e: _resolve("retry"),
+                )
+            )
 
-        self.page.overlay.append(dlg)
-        dlg.open = True
-        try:
-            self.page.update()
-        except Exception:
-            pass
+            hint = (
+                "Retry re-runs this check. "
+                + ("Skip Node aborts the rest of this node only. "
+                   if node_tag else "")
+                + "Stop ends this step."
+            )
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Verification Failed", color=DANGER,
+                              weight=ft.FontWeight.BOLD),
+                content=ft.Column(
+                    [
+                        ft.Text(message, size=13, color=TEXT,
+                                selectable=True),
+                        ft.Container(height=8),
+                        ft.Text(hint, size=12, color=TEXT_MUTED,
+                                italic=True),
+                    ],
+                    tight=True,
+                ),
+                actions=actions,
+                actions_alignment=ft.MainAxisAlignment.END,
+                bgcolor=PANEL,
+                on_dismiss=lambda e: _resolve("stop"),
+            )
 
-        result_event.wait()
-        if dlg in self.page.overlay:
-            self.page.overlay.remove(dlg)
-        return user_choice[0]
+            self._show_dialog_safe(dlg)
+            ev.wait()
+
+            if result["choice"] == "skip" and node_tag:
+                self._aborted_nodes.add(node_tag)
+                self._ui_log(
+                    f"Operator chose Skip Node — aborting remaining "
+                    f"steps for this node."
+                )
+            return result["choice"] == "retry"
 
     def _ask_user_confirm(self, title: str, message: str) -> bool:
-        result_event = threading.Event()
-        user_choice: list[bool] = [False]
+        """Modal OK / Cancel confirmation. Serialized + Flet-0.84-safe."""
+        with self._dialog_lock:
+            result = {"ok": False}
+            ev = threading.Event()
 
-        def _on_ok(e):
-            user_choice[0] = True
-            dlg.open = False
-            self.page.update()
-            result_event.set()
+            def _resolve(ok: bool):
+                if ev.is_set():
+                    return
+                result["ok"] = ok
+                self._close_dialog_safe(dlg)
+                ev.set()
 
-        def _on_cancel(e):
-            user_choice[0] = False
-            dlg.open = False
-            self.page.update()
-            result_event.set()
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text(title, color=INFO, weight=ft.FontWeight.BOLD),
+                content=ft.Text(message, size=13, color=TEXT, selectable=True),
+                actions=[
+                    ft.TextButton(
+                        "Cancel",
+                        style=ft.ButtonStyle(color=DANGER),
+                        on_click=lambda e: _resolve(False),
+                    ),
+                    ft.ElevatedButton(
+                        "OK, Run It", icon=ft.Icons.CHECK,
+                        style=ft.ButtonStyle(
+                            bgcolor=ACCENT, color="#06242A",
+                            padding=ft.Padding.symmetric(horizontal=16,
+                                                         vertical=12),
+                            shape=ft.RoundedRectangleBorder(radius=12)),
+                        on_click=lambda e: _resolve(True),
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+                bgcolor=PANEL,
+                on_dismiss=lambda e: _resolve(False),
+            )
 
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(title, color=INFO, weight=ft.FontWeight.BOLD),
-            content=ft.Text(message, size=13, color=TEXT, selectable=True),
-            actions=[
-                ft.TextButton("Cancel",
-                              style=ft.ButtonStyle(color=DANGER),
-                              on_click=_on_cancel),
-                ft.ElevatedButton(
-                    "OK, Run It", icon=ft.Icons.CHECK,
-                    style=ft.ButtonStyle(
-                        bgcolor=ACCENT, color="#06242A",
-                        padding=ft.Padding.symmetric(horizontal=16,
-                                                     vertical=12),
-                        shape=ft.RoundedRectangleBorder(radius=12)),
-                    on_click=_on_ok),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-            bgcolor=PANEL,
-        )
-
-        self.page.overlay.append(dlg)
-        dlg.open = True
-        try:
-            self.page.update()
-        except Exception:
-            pass
-
-        result_event.wait()
-        if dlg in self.page.overlay:
-            self.page.overlay.remove(dlg)
-        return user_choice[0]
+            self._show_dialog_safe(dlg)
+            ev.wait()
+            return result["ok"]
 
     # ── Workflow ───────────────────────────────────────────────────
     def _run_workflow(self):
         from concurrent.futures import ThreadPoolExecutor
 
         self._ui_log("Starting integration workflow...")
-        self._ui_log(f"Shortcode: {self.shortcode}")
+        self._ui_log(f"Site ID: {self.shortcode}")
         self._ui_log(f"Log directory: {self.log_dir}")
         self._ui_log(
             f"LTE/NR #1: {self.lte_name}  IP: {self.lte_ip}  "
@@ -1159,61 +1549,121 @@ class IntegrationRunPage:
                     self._set_step("gsm", key, "skip", "No GSM node")
         self._ui_log("")
 
+        # Remember each node's run parameters so the Resume button can
+        # re-invoke _run_node_steps for a single node later.
+        self._node_params["lte"] = dict(
+            node_tag="lte", node_name=self.lte_name, node_ip=self.lte_ip,
+            subnetwork=self.lte_subnet, node_type="lte_nr")
+        if self.has_lte2:
+            self._node_params["lte2"] = dict(
+                node_tag="lte2", node_name=self.lte2_name,
+                node_ip=self.lte2_ip, subnetwork=self.lte2_subnet,
+                node_type="lte_nr")
+        if self.has_gsm:
+            self._node_params["gsm"] = dict(
+                node_tag="gsm", node_name=self.gsm_name,
+                node_ip=self.gsm_ip, subnetwork=self.gsm_subnet,
+                node_type="gsm")
+
         num_workers = 1 + (1 if self.has_lte2 else 0) + (1 if self.has_gsm else 0)
-        futures = {}
+        for ntag in self._node_params:
+            self._active_workers.add(ntag)
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures["lte"] = pool.submit(
-                self._run_node_steps,
-                node_tag="lte",
-                node_name=self.lte_name,
-                node_ip=self.lte_ip,
-                subnetwork=self.lte_subnet,
-                node_type="lte_nr",
-            )
-            if self.has_lte2:
-                futures["lte2"] = pool.submit(
-                    self._run_node_steps,
-                    node_tag="lte2",
-                    node_name=self.lte2_name,
-                    node_ip=self.lte2_ip,
-                    subnetwork=self.lte2_subnet,
-                    node_type="lte_nr",
-                )
-            if self.has_gsm:
-                futures["gsm"] = pool.submit(
-                    self._run_node_steps,
-                    node_tag="gsm",
-                    node_name=self.gsm_name,
-                    node_ip=self.gsm_ip,
-                    subnetwork=self.gsm_subnet,
-                    node_type="gsm",
-                )
-
-            for fkey, future in futures.items():
+            futures = [pool.submit(self._node_worker, ntag, params)
+                       for ntag, params in self._node_params.items()]
+            for f in futures:
                 try:
-                    future.result()
-                except Exception as exc:
-                    if fkey == "lte2":
-                        lbl = "LTE/NR #2"
-                    elif fkey == "lte":
-                        lbl = "LTE/NR"
-                    else:
-                        lbl = "GSM"
-                    self._ui_log(f"[{lbl}] Node workflow failed: {exc}")
-                    logger.exception(f"Integration {lbl} failed")
+                    f.result()
+                except Exception:
+                    logger.exception("Node worker crashed")
+        # NOTE: finalize is NOT called here. Each worker calls
+        # _maybe_finalize() as it ends; the popup only fires once EVERY
+        # worker (including any resumed node) is idle.
 
+    def _node_worker(self, node_tag: str, params: dict):
+        """Common wrapper for a node's run (initial OR resumed). Ensures
+        the run is only finalized when no node worker is left running."""
+        lbl = {"lte": "LTE/NR", "lte2": "LTE/NR #2"}.get(node_tag, "GSM")
+        try:
+            self._run_node_steps(**params)
+        except Exception as exc:
+            self._ui_log(f"[{lbl}] Node workflow failed: {exc}")
+            logger.exception(f"Integration {lbl} failed")
+        finally:
+            self._resuming.discard(node_tag)
+            self._active_workers.discard(node_tag)
+            self._maybe_finalize()
+
+    def _maybe_finalize(self):
+        """Finalize (+ summary popup) only when NO node worker is busy.
+        Guarded by ``_run_finished`` so two workers ending at once can't
+        double-finalize; a resume resets the flag so it fires again."""
+        if not self._active_workers and not self._run_finished:
+            self._finalize_run(show_popup=True)
+
+    def _finalize_run(self, show_popup: bool = True):
+        """Called when the current pass (initial run or a resume) ends
+        and no node is actively running."""
         self._timer_running = False
         self._run_finished = True
-        self.status_text.value = "Integration complete"
+        # Reveal Resume on any node that stopped early.
+        for ntag in self._node_params:
+            self._update_resume_button(ntag)
+        any_resumable = bool(self._resumable_nodes)
+        self.status_text.value = (
+            "Integration paused — Resume available on failed node(s)"
+            if any_resumable else "Integration complete"
+        )
         self.cancel_button.visible = False
         self.back_button.visible = True
         self._ui_log("")
-        self._ui_log(f"All steps finished. Logs saved to: {self.log_dir}")
-        self._show_summary_popup()
+        self._ui_log(f"All active steps finished. Logs saved to: {self.log_dir}")
+        if show_popup:
+            self._show_summary_popup()
         try:
             self.page.update()
         except Exception:
             pass
+
+    # ── Per-node resume ──────────────────────────────────────────
+    def _update_resume_button(self, node_tag: str):
+        btn = self._resume_buttons.get(node_tag)
+        if btn is None:
+            return
+        btn.visible = (node_tag not in self._resuming
+                       and node_tag in self._resumable_nodes)
+        self._ui_dirty = True
+
+    def _resume_node(self, node_tag: str):
+        """Re-run a single node from its failed step. Runs concurrently;
+        other nodes are untouched."""
+        if not node_tag or node_tag in self._resuming:
+            return
+        params = self._node_params.get(node_tag)
+        if not params:
+            return
+        self._resuming.add(node_tag)
+        self._active_workers.add(node_tag)
+        self._resumable_nodes.discard(node_tag)   # being re-run now
+        self._update_resume_button(node_tag)      # hides it
+        # Bring the run back to life for the resumed node.
+        self.cancelled = False                    # resume un-cancels
+        self._run_finished = False
+        self.cancel_button.visible = False
+        self.back_button.visible = False
+        self.status_text.value = "Resuming node..."
+        if not self._timer_running:
+            self._timer_running = True
+            threading.Thread(target=self._tick_timer, daemon=True).start()
+        try:
+            self.page.run_task(self._flush_loop)   # restart UI flusher
+        except Exception:
+            pass
+        self._ui_log(f"[Resume] Re-running {params['node_name']} "
+                     "from the failed step...")
+        # Same wrapper as the initial run → finalize only when all idle.
+        threading.Thread(target=self._node_worker,
+                         args=(node_tag, params), daemon=True).start()
 
     # ── Spreadsheet-styled summary table ───────────────────────
     def _build_summary_table_flet(
@@ -1326,7 +1776,12 @@ class IntegrationRunPage:
 
             for ntag in node_order:
                 # Step doesn't apply to this node type → N/A (yellow).
-                if not _step_applies_to_node(applies_to, ntag):
+                # Pass gsm_on_primary so GSM-scope steps render in the
+                # LTE column when there is no separate GSM node.
+                if not _step_applies_to_node(
+                    applies_to, ntag,
+                    gsm_on_primary=getattr(self, "gsm_on_primary", False),
+                ):
                     row_cells.append(
                         make_cell("N/A", NA_BG, NA_FG)
                     )
@@ -1411,7 +1866,10 @@ class IntegrationRunPage:
 
             row = [row_label]
             for ntag in node_order:
-                if not _step_applies_to_node(applies_to, ntag):
+                if not _step_applies_to_node(
+                    applies_to, ntag,
+                    gsm_on_primary=getattr(self, "gsm_on_primary", False),
+                ):
                     row.append("N/A")
                     continue
                 if (key not in REMARK_STEPS
@@ -1808,11 +2266,7 @@ class IntegrationRunPage:
         close_event = threading.Event()
 
         def _on_close(e):
-            dlg.open = False
-            try:
-                self.page.update()
-            except Exception:
-                pass
+            self._close_dialog_safe(dlg)
             close_event.set()
 
         window = getattr(self.page, "window", None)
@@ -1937,12 +2391,7 @@ class IntegrationRunPage:
             bgcolor=PANEL,
         )
 
-        self.page.overlay.append(dlg)
-        dlg.open = True
-        try:
-            self.page.update()
-        except Exception:
-            pass
+        self._show_dialog_safe(dlg)
 
     def _run_node_steps(
         self,
@@ -1961,7 +2410,8 @@ class IntegrationRunPage:
             run_backup_cv, run_take_dump, run_gsm_cell_define,
             run_take_cm_dump,
             run_uri_setting, run_pm_measurement, run_sgw_check,
-            run_external_alarm,
+            run_external_alarm, run_bsc_neighbours, run_sync_check,
+            run_sw_check,
         )
 
         label = "LTE/NR" if node_tag == "lte" else ("LTE/NR #2" if node_tag == "lte2" else "GSM")
@@ -1978,6 +2428,11 @@ class IntegrationRunPage:
             """High-level — shown in UI log panel."""
             self._ui_log(f"[{label}] {msg}")
 
+        # Node-bound retry dialog: carries this node's tag so the
+        # "Skip Node" button can abort only this node's remaining steps.
+        def node_wait_for_user(msg: str) -> bool:
+            return self._ask_user_retry(msg, node_tag=node_tag)
+
         # Connect SSH
         try:
             ssh = IntegrationSSH(
@@ -1985,6 +2440,10 @@ class IntegrationRunPage:
                 username=username, password=password,
                 log_callback=detail_cb,
             )
+            # Mirror the raw moshell/SSH stream into this node's live
+            # terminal tab (every byte the node sends back).
+            ssh.set_live_sink(
+                lambda chunk, _nt=node_tag: self._feed_raw(_nt, chunk))
             ssh.connect(timeout=30)
             self._active_ssh[node_tag] = ssh
             ui_cb("SSH connected.")
@@ -2001,10 +2460,14 @@ class IntegrationRunPage:
             "enrollment", "install_lkf", "baseline", "ret_scripts",
             "relation", "uri_setting", "verify_mme", "sgw_check",
             "backup_cv", "take_dump", "take_cm_dump", "gsm_cell_define",
-            "pm_measurement", "external_alarm",
+            "pm_measurement", "external_alarm", "bsc_neighbours",
         }
         custom_moshell_log_steps = {"relation", "sgw_check"}
         in_amos = False
+
+        # A resume re-enters this method for the same node — clear any
+        # prior abort mark so it isn't skipped, and hide the button.
+        self._aborted_nodes.discard(node_tag)
 
         try:
             step_num = 1
@@ -2013,8 +2476,14 @@ class IntegrationRunPage:
                     break
                 # Scope filter: the step's applies_to must include
                 # this node. The module-level helper handles "both",
-                # "lte_nr", "lte_primary" (lte only) and "gsm".
-                if not _step_applies_to_node(applies_to, node_tag):
+                # "lte_nr", "lte_primary" (lte only) and "gsm". With
+                # ``gsm_on_primary=True`` (single LTE node hosting
+                # co-located GSM via BSC), gsm-scope steps also run
+                # on the lte node — that's where they belong.
+                if not _step_applies_to_node(
+                    applies_to, node_tag,
+                    gsm_on_primary=self.gsm_on_primary,
+                ):
                     continue
 
                 # Skip if the operator didn't select this step for THIS
@@ -2026,6 +2495,11 @@ class IntegrationRunPage:
                 if key in REMARK_STEPS or key in SUMMARY_NA_STEPS:
                     continue
 
+                # On a resume, don't re-run steps that already succeeded —
+                # pick up from the failed/pending ones.
+                if self._step_results.get(node_tag, {}).get(key) == "done":
+                    continue
+
                 # Enter AMOS lazily before the first step that needs it
                 if not in_amos and key in amos_steps:
                     ui_cb(f"Entering AMOS for {node_name}...")
@@ -2035,6 +2509,7 @@ class IntegrationRunPage:
                         ui_cb("AMOS session ready.")
                     except Exception as exc:
                         ui_cb(f"Failed to enter AMOS: {exc}")
+                        self._resumable_nodes.add(node_tag)
                         # Mark remaining selected steps (for THIS node)
                         # as error
                         remaining = False
@@ -2095,32 +2570,48 @@ class IntegrationRunPage:
                 stopped = False
                 try:
                     if key == "create_arne":
-                        # Spec: continue on fail, retry only via user prompt
-                        # (no auto-retry). The runner's internal
-                        # ``wait_for_user`` re-checks ``cmedit get`` after
-                        # the user clicks Retry.
+                        # Spec: "Add Node in ENM" is a hard gate — if it
+                        # fails, STOP the node (don't run enrollment etc.
+                        # against a node that isn't in ENM). The node
+                        # becomes resumable (Resume button). Retry via the
+                        # runner's internal ``wait_for_user`` re-checks
+                        # ``cmedit get`` after the user clicks Retry.
                         #
-                        # GSM only: pass the BSC name so the runner also
-                        # sets ``controllingBsc`` →
-                        # ``NetworkElement=<bsc>`` after the ARNE entry
-                        # is verified.
-                        bsc_for_create = (
-                            self.form.get("bsc_name", "")
-                            if node_tag == "gsm"
-                            else None
+                        # ``bsc_name`` triggers the BSC link step inside
+                        # ``run_create_arne``. Pass it when:
+                        #   * node is the separate GSM node, OR
+                        #   * node is the primary LTE AND we're in
+                        #     co-located mode (no separate GSM, just a
+                        #     BSC name in the form) — single-radio
+                        #     multi-RAT site, controllingBsc lives on
+                        #     the primary node's NetworkElement.
+                        bsc_for_create = None
+                        if node_tag == "gsm":
+                            bsc_for_create = self.form.get("bsc_name", "")
+                        elif node_tag == "lte" and self.gsm_on_primary:
+                            bsc_for_create = self.form.get("bsc_name", "")
+                        # Diagnostic so the field can see WHY the BSC
+                        # link step ran or was skipped.
+                        ui_cb(
+                            f"create_arne: node_tag={node_tag}, "
+                            f"gsm_on_primary={self.gsm_on_primary}, "
+                            f"bsc_name={bsc_for_create!r}"
                         )
                         success, output = run_create_arne(
                             ssh, node_name, node_ip, subnetwork, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=node_wait_for_user,
                             bsc_name=bsc_for_create,
+                            log_dir=self.log_dir,
                         )
                         if success:
                             self._set_step(node_tag, key, "done", "Verified")
                             ui_cb(f"{step_label} — verified.")
                         else:
                             self._set_step(node_tag, key, "error",
-                                           "Failed (continued)")
-                            ui_cb(f"{step_label} — failed, continuing.")
+                                           "Failed — node stopped")
+                            ui_cb(f"{step_label} — failed; stopping node "
+                                  "(Resume available).")
+                            stopped = True
 
                     elif key == "enrollment":
                         # Spec: enrollment STOPS the workflow on failure
@@ -2131,7 +2622,7 @@ class IntegrationRunPage:
                         # apart).
                         success, output = run_enrollment(
                             ssh, node_name, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=node_wait_for_user,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -2148,25 +2639,44 @@ class IntegrationRunPage:
                             stopped = True
 
                     elif key == "install_lkf":
-                        # Spec: auto-retry 3 times, THEN fall back to a
-                        # user prompt — but never stop the workflow either
-                        # way. Inside the auto-retry loop we pass
-                        # ``wait_for_user=None`` so each attempt fails
-                        # cleanly without a dialog; the dialog is shown
-                        # only after all 3 auto-attempts have failed.
+                        # LKF always runs — with or without a zip file.
                         #
-                        # Note: ``lkfinstall.py`` does submit an ENM job,
-                        # so a retry can in theory create a duplicate.
-                        # In practice the previous job either COMPLETED
-                        # (in which case the retry is a no-op verification)
-                        # or FAILED (in which case re-submitting is what
-                        # we want). Operator can still cancel via the
-                        # post-retry prompt if duplication is a concern.
+                        # WITH zip:
+                        #   auto-retry 3x, then one operator-driven retry,
+                        #   then continue regardless. ``lkfinstall.py``
+                        #   submits an ENM job; the previous job either
+                        #   COMPLETED (retry = no-op verify) or FAILED
+                        #   (re-submit is what we want).
+                        #
+                        # WITHOUT zip:
+                        #   run lkfinstall.py <node> directly (the LKF may
+                        #   already be imported in ENM from a batch). If
+                        #   it fails, DON'T prompt — just mark
+                        #   "LKF not available" and continue to the next
+                        #   step. Single attempt, no retry.
                         lkf_file = self.form.get("lkf_file", "")
                         if not lkf_file:
-                            self._set_step(node_tag, key, "skip",
-                                           "No LKF file")
-                            ui_cb(f"{step_label} — skipped (no file).")
+                            # No zip → direct install attempt, non-blocking.
+                            ui_cb(
+                                f"{step_label} — no zip file; running "
+                                "lkfinstall.py directly."
+                            )
+                            success, output = run_install_lkf(
+                                ssh, node_name, "", detail_cb,
+                                wait_for_user=None,
+                            )
+                            if success:
+                                self._set_step(node_tag, key, "done",
+                                               "COMPLETED (no zip)")
+                                ui_cb(f"{step_label} — completed (no zip).")
+                            else:
+                                self._set_step(node_tag, key, "error",
+                                               "LKF not available")
+                                ui_cb(
+                                    f"{step_label} — LKF not available "
+                                    "(install/status failed); continuing "
+                                    "to next step."
+                                )
                         else:
                             success, output = self._retry_step(
                                 step_label,
@@ -2192,7 +2702,7 @@ class IntegrationRunPage:
                                 )
                                 success, output = run_install_lkf(
                                     ssh, node_name, lkf_file, detail_cb,
-                                    wait_for_user=self._ask_user_retry,
+                                    wait_for_user=node_wait_for_user,
                                 )
                             if success:
                                 self._set_step(node_tag, key, "done",
@@ -2233,7 +2743,8 @@ class IntegrationRunPage:
                             success, output = run_relation(
                                 ssh, node_name, self.shortcode,
                                 relation_file, self.log_dir, detail_cb,
-                                wait_for_user=self._ask_user_retry,
+                                wait_for_user=node_wait_for_user,
+                                ui_cb=ui_cb,  # live per-script progress
                             )
                             if success:
                                 self._set_step(node_tag, key, "done",
@@ -2266,6 +2777,23 @@ class IntegrationRunPage:
                                            "Failed (continued)")
                             ui_cb(f"{step_label} — failed, continuing to next step.")
 
+                    elif key == "sw_level_check":
+                        # Compare active UpgradePackage vs config.json
+                        # (uri_setting.upgrade_package_id). Report-only.
+                        success, output, detail = run_sw_check(
+                            ssh, node_name, detail_cb,
+                            wait_for_user=None,
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done", detail)
+                            ui_cb(f"{step_label} — {detail}.")
+                        else:
+                            self._set_step(node_tag, key, "error", detail)
+                            ui_cb(
+                                f"{step_label} — {detail}; continuing "
+                                "to next step."
+                            )
+
                     elif key == "verify_mme":
                         # Spec: no internal retry — single attempt.
                         success, output = run_verify_mme(
@@ -2283,24 +2811,79 @@ class IntegrationRunPage:
 
                     elif key == "sgw_check":
                         # Spec: no internal retry — single attempt.
-                        success, output = run_sgw_check(
+                        # ``run_sgw_check`` returns a 3-tuple with a
+                        # short detail string so the progress / summary
+                        # cell can show the 4-level status:
+                        #   all_ok       → "All N pings OK"           (done)
+                        #   partial_loss → "X/N with packet loss"      (done w/ warning)
+                        #   some_failed  → "X/N failed"                (error)
+                        #   all_failed   → "All N pings failed"        (error)
+                        #
+                        # ``gsm_on_primary`` makes the runner also
+                        # execute the GSM ping script when a single
+                        # LTE/NR node hosts co-located GSM (no
+                        # separate GSM DN).
+                        # BSC broker validation only applies when the GSM
+                        # ping script runs (gsm node, or co-located gsm on
+                        # the primary LTE node).
+                        sgw_bsc = None
+                        if node_tag == "gsm" or (
+                                node_tag == "lte" and self.gsm_on_primary):
+                            sgw_bsc = self.form.get("bsc_name", "")
+                        result = run_sgw_check(
                             ssh, node_name, detail_cb,
                             wait_for_user=None,
                             node_type=("gsm" if node_tag == "gsm" else "lte_nr"),
+                            gsm_on_primary=(
+                                self.gsm_on_primary
+                                and node_tag == "lte"
+                            ),
+                            bsc_name=sgw_bsc,
                         )
-                        if success:
-                            self._set_step(node_tag, key, "done",
-                                           "All pings OK")
-                            ui_cb(f"{step_label} — all targets reachable.")
+                        # Backward-compat: runner has returned 2-, 3- and
+                        # now 4-tuples across versions.
+                        broker_wrong = False
+                        if len(result) == 4:
+                            success, output, detail, broker_wrong = result
+                        elif len(result) == 3:
+                            success, output, detail = result
                         else:
-                            self._set_step(node_tag, key, "error",
-                                           "Ping failed (continued)")
-                            ui_cb(f"{step_label} — some pings failed, continuing.")
+                            success, output = result
+                            detail = (
+                                "All pings OK" if success
+                                else "Ping failed"
+                            )
+                        if broker_wrong and success:
+                            # Ping fine but the node points at the WRONG
+                            # BSC broker → yellow warning.
+                            self._set_step(node_tag, key, "warn", detail)
+                            ui_cb(f"{step_label} — ⚠ {detail}.")
+                        elif success:
+                            self._set_step(node_tag, key, "done", detail)
+                            ui_cb(f"{step_label} — {detail}.")
+                        else:
+                            self._set_step(node_tag, key, "error", detail)
+                            ui_cb(
+                                f"{step_label} — {detail}; continuing "
+                                "to next step."
+                            )
 
                     elif key == "gsm_cell_define":
+                        # This is the GSM check — per spec, every GSM
+                        # check first ensures controllingBsc is set.
+                        # Pass the BSC name (always available for GSM /
+                        # co-located nodes) + log_dir for the dedicated
+                        # controllingBsc trace file.
+                        gsm_bsc = self.form.get("bsc_name", "")
+                        ui_cb(
+                            f"gsm_cell_define: node_tag={node_tag}, "
+                            f"bsc_name={gsm_bsc!r}"
+                        )
                         success, output = run_gsm_cell_define(
                             ssh, node_name, self.shortcode, detail_cb,
                             wait_for_user=None,  # no prompt — just report
+                            bsc_name=gsm_bsc,
+                            log_dir=self.log_dir,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -2311,7 +2894,73 @@ class IntegrationRunPage:
                                            "0 instances (continued)")
                             ui_cb(f"{step_label} — 0 instances, continuing.")
 
+                    elif key == "bsc_neighbours":
+                        # Verify GSM neighbour relations exist in BSC:
+                        #   gerancellrelation + externalgerancellrelation
+                        # keyed on the modified shortcode (M<digits>).
+                        success, output = run_bsc_neighbours(
+                            ssh, node_name, self.shortcode, detail_cb,
+                            wait_for_user=None,  # no prompt — just report
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done",
+                                           "Relations OK")
+                            ui_cb(f"{step_label} — relations OK.")
+                        else:
+                            self._set_step(node_tag, key, "error",
+                                           "0 instances (continued)")
+                            ui_cb(f"{step_label} — 0 instances, continuing.")
+
+                    elif key == "sync_check":
+                        # Synchronization (GPS/PTP) via moshell `sts`.
+                        # OK when radioClockState contains "LOCKED".
+                        # Detail e.g. "GPS - OK (RNT_TIME_LOCKED)".
+                        success, output, detail = run_sync_check(
+                            ssh, node_name, detail_cb,
+                            wait_for_user=None,  # report-only, no prompt
+                        )
+                        if success:
+                            self._set_step(node_tag, key, "done", detail)
+                            ui_cb(f"{step_label} — {detail}.")
+                        else:
+                            self._set_step(node_tag, key, "error", detail)
+                            ui_cb(
+                                f"{step_label} — {detail}; continuing "
+                                "to next step."
+                            )
+
                     elif key == "backup_cv":
+                        # Workaround: if URI Reconfig FAILED earlier, give
+                        # it one more shot right before the backup — the
+                        # config upload to ENM depends on the URI being
+                        # set. Failure here doesn't block the backup.
+                        if (self._step_results.get(node_tag, {})
+                                .get("uri_setting") == "error"):
+                            ui_cb(
+                                "URI Reconfig failed earlier — retrying "
+                                "once before Configuration Backup..."
+                            )
+                            self._set_step(node_tag, "uri_setting",
+                                           "running", "retry before backup")
+                            try:
+                                uri_ok, _uri_out = run_uri_setting(
+                                    ssh, node_name, username, password,
+                                    detail_cb, wait_for_user=None,
+                                )
+                            except Exception as _uri_exc:
+                                uri_ok = False
+                                detail_cb(f"URI retry crashed: {_uri_exc}")
+                            if uri_ok:
+                                self._set_step(node_tag, "uri_setting",
+                                               "done", "SUCCESS (retried)")
+                                ui_cb("URI Reconfig retry — SUCCESS.")
+                            else:
+                                self._set_step(node_tag, "uri_setting",
+                                               "error", "Failed (retried)")
+                                ui_cb(
+                                    "URI Reconfig retry failed — "
+                                    "continuing to backup anyway."
+                                )
                         # Spec: 2 attempts.
                         success, output = self._retry_step(
                             step_label,
@@ -2395,7 +3044,7 @@ class IntegrationRunPage:
                         # here. Verify-only retry via user prompt.
                         success, output = run_external_alarm(
                             ssh, node_name, detail_cb,
-                            wait_for_user=self._ask_user_retry,
+                            wait_for_user=node_wait_for_user,
                         )
                         if success:
                             self._set_step(node_tag, key, "done",
@@ -2448,12 +3097,16 @@ class IntegrationRunPage:
                             )
                             if key == "relation":
                                 try:
-                                    parsed_path = build_relation_log_excel(
-                                        downloaded,
-                                        self.log_dir,
-                                        node_name,
-                                        log_cb=ui_cb,
-                                    )
+                                    # Serialize CPU-heavy Excel build so
+                                    # parallel nodes don't all peg the GIL
+                                    # at once (black-screen prevention).
+                                    with self._heavy_lock:
+                                        parsed_path = build_relation_log_excel(
+                                            downloaded,
+                                            self.log_dir,
+                                            node_name,
+                                            log_cb=ui_cb,
+                                        )
                                     ui_cb(
                                         "Relation log Excel created: "
                                         f"{os.path.basename(parsed_path)}"
@@ -2462,20 +3115,57 @@ class IntegrationRunPage:
                                     ui_cb(
                                         f"(relation log parsing skipped: {parse_exc})"
                                     )
-                                # Clean up remote RELATION folder now that
-                                # all logs are safely downloaded locally.
+                                # Clean up the SHARED remote RELATION
+                                # folder only when EVERY relation-running
+                                # node is done — otherwise this node
+                                # would delete a still-running sibling's
+                                # scripts. Ref-counted via
+                                # _relation_nodes_expected/_done.
                                 try:
                                     remote_rel = (
                                         f"/home/shared/{ssh.username}"
                                         f"/RELATION/{self.shortcode}"
                                     )
-                                    ssh.run_amos_command_safe(
-                                        f'!rm -rf "{remote_rel}"/*',
-                                        node_name, timeout=30,
-                                    )
-                                    ui_cb(
-                                        f"Cleaned up remote {remote_rel}/"
-                                    )
+                                    do_delete = False
+                                    with self._relation_cleanup_lock:
+                                        if self._relation_nodes_expected is None:
+                                            # Compute once: which nodes will
+                                            # run relation (lte_nr + selected
+                                            # + a relation file is present).
+                                            rel_file = self.form.get(
+                                                "relation_file", "")
+                                            exp = set()
+                                            if rel_file:
+                                                for nt, exists in (
+                                                    ("lte", True),
+                                                    ("lte2", self.has_lte2),
+                                                ):
+                                                    if exists and \
+                                                       self.is_step_selected(
+                                                           "relation", nt):
+                                                        exp.add(nt)
+                                            self._relation_nodes_expected = exp
+                                        self._relation_nodes_done.add(node_tag)
+                                        remaining = (
+                                            self._relation_nodes_expected
+                                            - self._relation_nodes_done
+                                        )
+                                        do_delete = not remaining
+                                    if do_delete:
+                                        ssh.run_amos_command_safe(
+                                            f'!rm -rf "{remote_rel}"/*',
+                                            node_name, timeout=30,
+                                        )
+                                        ui_cb(
+                                            "All relation nodes done — "
+                                            f"cleaned up remote {remote_rel}/"
+                                        )
+                                    else:
+                                        ui_cb(
+                                            "Relation done for this node; "
+                                            "keeping remote folder (still "
+                                            f"waiting on: {', '.join(sorted(remaining))})"
+                                        )
                                 except Exception as _clean_exc:
                                     ui_cb(
                                         f"(remote cleanup skipped: {_clean_exc})"
@@ -2577,20 +3267,25 @@ class IntegrationRunPage:
                                         )
 
                                 try:
-                                    parsed_path = build_baseline_log_excel(
-                                        parse_sources,
-                                        self.log_dir,
-                                        node_name,
-                                        log_cb=ui_cb,
-                                    )
+                                    # Serialize CPU-heavy parse + Excel
+                                    # build (baseline output can be MB-
+                                    # large) so parallel nodes don't all
+                                    # peg the GIL and black-screen the UI.
+                                    with self._heavy_lock:
+                                        parsed_path = build_baseline_log_excel(
+                                            parse_sources,
+                                            self.log_dir,
+                                            node_name,
+                                            log_cb=ui_cb,
+                                        )
+                                        bsummary = parse_baseline_summary(
+                                            parse_sources,
+                                        )
                                     ui_cb(
                                         "Baseline log Excel created: "
                                         f"{os.path.basename(parsed_path)}"
                                     )
                                     try:
-                                        bsummary = parse_baseline_summary(
-                                            parse_sources,
-                                        )
                                         if bsummary:
                                             ui_cb(
                                                 f"Baseline summary: "
@@ -2621,8 +3316,30 @@ class IntegrationRunPage:
                                     node_tag=node_tag)
                 step_num += 1
 
+                # Operator pressed "Skip Node" on a dialog for this node
+                # → abort all remaining steps for THIS node (other nodes
+                # keep running).
+                if node_tag in self._aborted_nodes:
+                    ui_cb("Skip Node requested — aborting remaining steps "
+                          "for this node.")
+                    self._resumable_nodes.add(node_tag)
+                    remaining = False
+                    for rkey, rlabel, rapplies, _ in INTEGRATION_STEPS:
+                        if rapplies not in ("both", node_type):
+                            continue
+                        if not self.is_step_selected(rkey, node_tag):
+                            continue
+                        if remaining:
+                            self._set_step(
+                                node_tag, rkey, "skip",
+                                "Skipped (node aborted by operator)")
+                        if rkey == key:
+                            remaining = True
+                    break
+
                 if stopped:
                     ui_cb("Stopping remaining steps due to failure.")
+                    self._resumable_nodes.add(node_tag)
                     remaining = False
                     for rkey, rlabel, rapplies, _ in INTEGRATION_STEPS:
                         if rapplies not in ("both", node_type):
@@ -2650,6 +3367,9 @@ class IntegrationRunPage:
                 pass
             self._active_ssh.pop(node_tag, None)
             ui_cb("SSH disconnected.")
+            # Show this node's Resume button the moment IT stops — don't
+            # wait for the other nodes to finish (they run independently).
+            self._update_resume_button(node_tag)
 
     # ── Navigation ───────────────────────────────────────────────
     def _force_disconnect(self) -> None:
@@ -2703,26 +3423,30 @@ class _StepRow:
         "pending":  (ft.Icons.RADIO_BUTTON_UNCHECKED, TEXT_MUTED),
         "running":  (ft.Icons.HOURGLASS_TOP,          ACCENT),
         "done":     (ft.Icons.CHECK_CIRCLE,            SUCCESS),
+        "warn":     (ft.Icons.WARNING_AMBER_ROUNDED,   ACCENT_WARM),
         "error":    (ft.Icons.ERROR,                   DANGER),
         "skip":     (ft.Icons.REMOVE_CIRCLE_OUTLINE,   TEXT_MUTED),
     }
 
     def __init__(self, label: str):
+        # NOTE: we use a STATIC icon for the "running" state (an
+        # hourglass), NOT an animated ft.ProgressRing. An indeterminate
+        # ProgressRing repaints the Flutter renderer every frame
+        # (~60 fps) for as long as it's visible — with several running
+        # steps across 3 node columns that pegged a CPU core at 60%+.
+        # A static icon lets the renderer go idle between actual
+        # updates, dropping CPU to near-zero when nothing changes.
         self._icon = ft.Icon(ft.Icons.RADIO_BUTTON_UNCHECKED, size=18,
                              color=TEXT_MUTED)
         self._label = ft.Text(label, size=13, color=TEXT,
                               weight=ft.FontWeight.W_500)
         self._detail = ft.Text("", size=11, color=TEXT_MUTED)
-        self._spinner = ft.ProgressRing(
-            width=16, height=16, stroke_width=2,
-            color=ACCENT, visible=False)
         self.control = ft.Container(
             padding=ft.Padding.symmetric(horizontal=8, vertical=6),
             border_radius=10,
             content=ft.Row(
                 [
                     self._icon,
-                    self._spinner,
                     self._label,
                     ft.Container(expand=True),
                     self._detail,
@@ -2736,13 +3460,14 @@ class _StepRow:
         icon_name, color = self._ICONS.get(state, self._ICONS["pending"])
         self._icon.name = icon_name
         self._icon.color = color
+        self._icon.visible = True
         self._label.color = color if state == "error" else TEXT
         self._detail.value = detail
         self._detail.color = SUCCESS if state == "done" else (
-            DANGER if state == "error" else TEXT_MUTED
+            DANGER if state == "error" else (
+                ACCENT_WARM if state == "warn" else TEXT_MUTED
+            )
         )
-        self._spinner.visible = (state == "running")
-        self._icon.visible = (state != "running")
         self.control.bgcolor = (
             ft.Colors.with_opacity(0.08, ACCENT)
             if state == "running" else None

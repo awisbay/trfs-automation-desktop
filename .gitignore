@@ -75,3 +75,10 @@ test_switch_node.py
 test_three_nodes_enm_real.py
 test_three_nodes_full.py
 test_two_nodes_full.py
+
+# Debug/build logs
+audit_dbg.log
+audit_dbg_err.log
+resume_debug.log
+resume_debug_err.log
+scratchpad_build.log
