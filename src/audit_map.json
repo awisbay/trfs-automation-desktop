@@ -1,6 +1,6 @@
 {
+  "gsm_fdn_prefix": "SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T7,SubNetwork=BSC,MeContext={bsc},ManagedElement={bsc},BscFunction=1,BscM=1,GeranCellM=1",
   "_note": "CDD Audit mapping. Each profile maps a CDD sheet to a node MO. 'mo_fdn'/'mo' are templates: {ColumnHeader} is replaced with the row value. 'attr' = the MO attribute name in the modump/cmdump (calibrate against a real dump). node_key_column filters rows to the audited node. Add params/sheets by editing this file — no rebuild.",
-
   "profiles": [
     {
       "name": "LTE Node (ENodeFunction)",
@@ -11,15 +11,38 @@
       "node_key_column": "eNodeBName",
       "mo_fdn": "ENodeBFunction=1",
       "columns": [
-        {"cdd": "DataRadioBearer.dlMaxRetxThreshold", "attr": "dlMaxRetxThreshold", "mo": "ENodeBFunction=1,DataRadioBearer=1"},
-        {"cdd": "DataRadioBearer.ulMaxRetxThreshold", "attr": "ulMaxRetxThreshold", "mo": "ENodeBFunction=1,DataRadioBearer=1"},
-        {"cdd": "AnrFunctionEUtran.anrInterFreqState", "attr": "anrInterFreqState", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"},
-        {"cdd": "AnrFunctionEUtran.anrIntraFreqState", "attr": "anrIntraFreqState", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"},
-        {"cdd": "AnrFunctionGeran.anrStateGsm", "attr": "anrStateGsm", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionGeran=1"},
-        {"cdd": "AnrFunctionNR.anrStateNR", "attr": "anrStateNR", "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionNR=1"}
+        {
+          "cdd": "DataRadioBearer.dlMaxRetxThreshold",
+          "attr": "dlMaxRetxThreshold",
+          "mo": "ENodeBFunction=1,DataRadioBearer=1"
+        },
+        {
+          "cdd": "DataRadioBearer.ulMaxRetxThreshold",
+          "attr": "ulMaxRetxThreshold",
+          "mo": "ENodeBFunction=1,DataRadioBearer=1"
+        },
+        {
+          "cdd": "AnrFunctionEUtran.anrInterFreqState",
+          "attr": "anrInterFreqState",
+          "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"
+        },
+        {
+          "cdd": "AnrFunctionEUtran.anrIntraFreqState",
+          "attr": "anrIntraFreqState",
+          "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionEUtran=1"
+        },
+        {
+          "cdd": "AnrFunctionGeran.anrStateGsm",
+          "attr": "anrStateGsm",
+          "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionGeran=1"
+        },
+        {
+          "cdd": "AnrFunctionNR.anrStateNR",
+          "attr": "anrStateNR",
+          "mo": "ENodeBFunction=1,AnrFunction=1,AnrFunctionNR=1"
+        }
       ]
     },
-
     {
       "name": "LTE Node (ManagedElement)",
       "tech": "lte_nr",
@@ -29,10 +52,12 @@
       "node_key_column": "eNodeBName",
       "mo_fdn": "ManagedElement={eNodeBName}",
       "columns": [
-        {"cdd": "UserLabel_Node", "attr": "userLabel"}
+        {
+          "cdd": "UserLabel_Node",
+          "attr": "userLabel"
+        }
       ]
     },
-
     {
       "name": "LTE Cell (EUtranCellFDD)",
       "tech": "lte_nr",
@@ -43,31 +68,97 @@
       "mo_fdn": "ENodeBFunction=1,{_cellmo}={CellName}",
       "cell_mo_map": {
         "band_column": "Freq Band",
-        "map": {"L26": "EUtranCellTDD", "L23": "EUtranCellTDD"},
+        "map": {
+          "L26": "EUtranCellTDD",
+          "L23": "EUtranCellTDD"
+        },
         "default": "EUtranCellFDD"
       },
       "columns": [
-        {"cdd": "TAC", "attr": "tac"},
-        {"cdd": "DLEARFCN", "attr": "earfcndl"},
-        {"cdd": "ULEARFCN", "attr": "earfcnul"},
-        {"cdd": "PCI", "attr": "physicalLayerCellId"},
-        {"cdd": "Root Sequence Index", "attr": "rachRootSequence"},
-        {"cdd": "CRSGain", "attr": "crsGain"},
-        {"cdd": "configuredMaxTxPower", "attr": "configuredMaxTxPower", "via_ref": "sectorCarrierRef"},
-        {"cdd": "sectorCarrierType", "attr": "sectorCarrierType", "via_ref": "sectorCarrierRef"},
-        {"cdd": "transmissionMode", "attr": "transmissionMode"},
-        {"cdd": "pZeroNominalPucch", "attr": "pZeroNominalPucch"},
-        {"cdd": "pZeroNominalPusch", "attr": "pZeroNominalPusch"},
-        {"cdd": "siWindowLength", "attr": "siWindowLength"},
-        {"cdd": "preambleInitialReceivedTargetPower", "attr": "preambleInitialReceivedTargetPower"},
-        {"cdd": "UserLabel_Cell", "attr": "userLabel"},
-        {"cdd": "MIMO", "via_ref": "sectorCarrierRef", "split": [
-          {"attr": "noOfTxAntennas", "regex": "(\\d+)T"},
-          {"attr": "noOfRxAntennas", "regex": "(\\d+)R"}
-        ]}
+        {
+          "cdd": "TAC",
+          "attr": "tac"
+        },
+        {
+          "cdd": "DLEARFCN",
+          "attr": "earfcndl"
+        },
+        {
+          "cdd": "ULEARFCN",
+          "attr": "earfcnul"
+        },
+        {
+          "cdd": "PCI",
+          "attr": "physicalLayerCellId"
+        },
+        {
+          "cdd": "Root Sequence Index",
+          "attr": "rachRootSequence"
+        },
+        {
+          "cdd": "CRSGain",
+          "attr": "crsGain"
+        },
+        {
+          "cdd": "configuredMaxTxPower",
+          "attr": "configuredMaxTxPower",
+          "via_ref": "sectorCarrierRef"
+        },
+        {
+          "cdd": "sectorCarrierType",
+          "attr": "sectorCarrierType",
+          "via_ref": "sectorCarrierRef"
+        },
+        {
+          "cdd": "transmissionMode",
+          "attr": "transmissionMode"
+        },
+        {
+          "cdd": "pZeroNominalPucch",
+          "attr": "pZeroNominalPucch"
+        },
+        {
+          "cdd": "pZeroNominalPusch",
+          "attr": "pZeroNominalPusch"
+        },
+        {
+          "cdd": "siWindowLength",
+          "attr": "siWindowLength"
+        },
+        {
+          "cdd": "preambleInitialReceivedTargetPower",
+          "attr": "preambleInitialReceivedTargetPower"
+        },
+        {
+          "cdd": "UserLabel_Cell",
+          "attr": "userLabel"
+        },
+        {
+          "cdd": "MIMO",
+          "via_ref": "sectorCarrierRef",
+          "split": [
+            {
+              "attr": "noOfTxAntennas",
+              "regex": "(\\d+)T"
+            },
+            {
+              "attr": "noOfRxAntennas",
+              "regex": "(\\d+)R"
+            }
+          ]
+        },
+        {
+          "cdd": "Latitude",
+          "attr": "latitude",
+          "norm": "geo"
+        },
+        {
+          "cdd": "Longitude",
+          "attr": "longitude",
+          "norm": "geo"
+        }
       ]
     },
-
     {
       "name": "LTE Relation (EUtranFreqRelation)",
       "tech": "lte_nr",
@@ -86,25 +177,63 @@
       },
       "cell_mo_map": {
         "band_column": "EUTRANCell",
-        "map": {"L26": "EUtranCellTDD", "L23": "EUtranCellTDD"},
+        "map": {
+          "L26": "EUtranCellTDD",
+          "L23": "EUtranCellTDD"
+        },
         "default": "EUtranCellFDD"
       },
       "columns": [
-        {"cdd": "caTriggeredRedirectionActive", "attr": "caTriggeredRedirectionActive"},
-        {"cdd": "connectedModeMobilityPrio", "attr": "connectedModeMobilityPrio"},
-        {"cdd": "cellReselectionPriority", "attr": "cellReselectionPriority"},
-        {"cdd": "lbActivationThreshold", "attr": "lbActivationThreshold"},
-        {"cdd": "threshXHigh", "attr": "threshXHigh"},
-        {"cdd": "threshXLow", "attr": "threshXLow"},
-        {"cdd": "tReselectionEutra", "attr": "tReselectionEutra"},
-        {"cdd": "allowedMeasBandwidth", "attr": "allowedMeasBandwidth"},
-        {"cdd": "qOffsetFreq", "attr": "qOffsetFreq"},
-        {"cdd": "qRxLevMin", "attr": "qRxLevMin"},
-        {"cdd": "caFreqPriority", "attr": "caFreqPriority"},
-        {"cdd": "endcHoFreqPriority", "attr": "endcHoFreqPriority"}
+        {
+          "cdd": "caTriggeredRedirectionActive",
+          "attr": "caTriggeredRedirectionActive"
+        },
+        {
+          "cdd": "connectedModeMobilityPrio",
+          "attr": "connectedModeMobilityPrio"
+        },
+        {
+          "cdd": "cellReselectionPriority",
+          "attr": "cellReselectionPriority"
+        },
+        {
+          "cdd": "lbActivationThreshold",
+          "attr": "lbActivationThreshold"
+        },
+        {
+          "cdd": "threshXHigh",
+          "attr": "threshXHigh"
+        },
+        {
+          "cdd": "threshXLow",
+          "attr": "threshXLow"
+        },
+        {
+          "cdd": "tReselectionEutra",
+          "attr": "tReselectionEutra"
+        },
+        {
+          "cdd": "allowedMeasBandwidth",
+          "attr": "allowedMeasBandwidth"
+        },
+        {
+          "cdd": "qOffsetFreq",
+          "attr": "qOffsetFreq"
+        },
+        {
+          "cdd": "qRxLevMin",
+          "attr": "qRxLevMin"
+        },
+        {
+          "cdd": "caFreqPriority",
+          "attr": "caFreqPriority"
+        },
+        {
+          "cdd": "endcHoFreqPriority",
+          "attr": "endcHoFreqPriority"
+        }
       ]
     },
-
     {
       "name": "NR Node (ManagedElement)",
       "tech": "nr",
@@ -114,10 +243,12 @@
       "node_key_column": "gNodeBName",
       "mo_fdn": "ManagedElement={gNodeBName}",
       "columns": [
-        {"cdd": "UserLabel_Node", "attr": "userLabel"}
+        {
+          "cdd": "UserLabel_Node",
+          "attr": "userLabel"
+        }
       ]
     },
-
     {
       "name": "NR Cell (NRCellDU)",
       "tech": "nr",
@@ -127,32 +258,113 @@
       "node_key_column": "gNodeBName",
       "mo_fdn": "GNBDUFunction=1,NRCellDU={CellName}",
       "columns": [
-        {"cdd": "nRPCI", "attr": "nRPCI"},
-        {"cdd": "TAC", "attr": "nRTAC"},
-        {"cdd": "UserLabel_Cell", "attr": "userLabel"},
-        {"cdd": "Root Sequence Index", "attr": "rachRootSequence"},
-        {"cdd": "ssbFrequency", "attr": "ssbFrequency"},
-        {"cdd": "ssbPowerBoost", "attr": "ssbPowerBoost"},
-        {"cdd": "tddUlDlPattern", "attr": "tddUlDlPattern"},
-        {"cdd": "tddSpecialSlotPattern", "attr": "tddSpecialSlotPattern"},
-        {"cdd": "NRCellDU.ulStartCrb", "attr": "ulStartCrb"},
-        {"cdd": "NRCellDU.ulAvailableCrbs", "attr": "ulAvailableCrbs"},
-        {"cdd": "NRCellDU.dlStartCrb", "attr": "dlStartCrb"},
-        {"cdd": "NRCellDU.dlAvailableCrbs", "attr": "dlAvailableCrbs"},
-        {"cdd": "rachPreambleFormat", "attr": "rachPreambleFormat"},
-        {"cdd": "cellRange", "attr": "cellRange"},
-        {"cdd": "maxUeSpeed", "attr": "maxUeSpeed"},
-        {"cdd": "csiRsPeriodicity", "attr": "csiRsPeriodicity"},
-        {"cdd": "DLEARFCN", "attr": "arfcnDL", "via_ref": "nRSectorCarrierRef"},
-        {"cdd": "ULEARFCN", "attr": "arfcnUL", "via_ref": "nRSectorCarrierRef"},
-        {"cdd": "DL BW(MHz)", "attr": "bSChannelBwDL", "via_ref": "nRSectorCarrierRef"},
-        {"cdd": "MIMO", "via_ref": "nRSectorCarrierRef", "split": [
-          {"attr": "noOfTxAntennas", "regex": "(\\d+)T"},
-          {"attr": "noOfRxAntennas", "regex": "(\\d+)R"}
-        ]}
+        {
+          "cdd": "nRPCI",
+          "attr": "nRPCI"
+        },
+        {
+          "cdd": "TAC",
+          "attr": "nRTAC"
+        },
+        {
+          "cdd": "UserLabel_Cell",
+          "attr": "userLabel"
+        },
+        {
+          "cdd": "Root Sequence Index",
+          "attr": "rachRootSequence"
+        },
+        {
+          "cdd": "ssbFrequency",
+          "attr": "ssbFrequency"
+        },
+        {
+          "cdd": "ssbPowerBoost",
+          "attr": "ssbPowerBoost"
+        },
+        {
+          "cdd": "tddUlDlPattern",
+          "attr": "tddUlDlPattern"
+        },
+        {
+          "cdd": "tddSpecialSlotPattern",
+          "attr": "tddSpecialSlotPattern"
+        },
+        {
+          "cdd": "NRCellDU.ulStartCrb",
+          "attr": "ulStartCrb"
+        },
+        {
+          "cdd": "NRCellDU.ulAvailableCrbs",
+          "attr": "ulAvailableCrbs"
+        },
+        {
+          "cdd": "NRCellDU.dlStartCrb",
+          "attr": "dlStartCrb"
+        },
+        {
+          "cdd": "NRCellDU.dlAvailableCrbs",
+          "attr": "dlAvailableCrbs"
+        },
+        {
+          "cdd": "rachPreambleFormat",
+          "attr": "rachPreambleFormat"
+        },
+        {
+          "cdd": "cellRange",
+          "attr": "cellRange"
+        },
+        {
+          "cdd": "maxUeSpeed",
+          "attr": "maxUeSpeed"
+        },
+        {
+          "cdd": "csiRsPeriodicity",
+          "attr": "csiRsPeriodicity"
+        },
+        {
+          "cdd": "DLEARFCN",
+          "attr": "arfcnDL",
+          "via_ref": "nRSectorCarrierRef"
+        },
+        {
+          "cdd": "ULEARFCN",
+          "attr": "arfcnUL",
+          "via_ref": "nRSectorCarrierRef"
+        },
+        {
+          "cdd": "DL BW(MHz)",
+          "attr": "bSChannelBwDL",
+          "via_ref": "nRSectorCarrierRef"
+        },
+        {
+          "cdd": "MIMO",
+          "via_ref": "nRSectorCarrierRef",
+          "split": [
+            {
+              "attr": "noOfTxAntennas",
+              "regex": "(\\d+)T"
+            },
+            {
+              "attr": "noOfRxAntennas",
+              "regex": "(\\d+)R"
+            }
+          ]
+        },
+        {
+          "cdd": "Latitude",
+          "attr": "latitude",
+          "via_ref": "nRSectorCarrierRef",
+          "norm": "geo"
+        },
+        {
+          "cdd": "Longitude",
+          "attr": "longitude",
+          "via_ref": "nRSectorCarrierRef",
+          "norm": "geo"
+        }
       ]
     },
-
     {
       "name": "GSM Cell (BSC — via live cmedit, not dump)",
       "tech": "gsm",
@@ -166,13 +378,733 @@
       "node_key_column": "gsmNodeName",
       "mo_fdn": "GeranCell={geranCellId}",
       "columns": [
-        {"cdd": "NEW CGI", "attr": "cgi", "norm": "segments"},
-        {"cdd": "NCC", "attr": "ncc"},
-        {"cdd": "BCC", "attr": "bcc"},
-        {"cdd": "BCCHNO", "attr": "bcchNo"},
-        {"cdd": "USER LABEL_CELL", "attr": "userLabel"},
-        {"cdd": "NEW RAC", "attr": "rac"},
-        {"cdd": "CSYSTYPE", "attr": "cSysType"}
+        {
+          "cdd": "NEW CGI",
+          "attr": "cgi",
+          "norm": "segments"
+        },
+        {
+          "cdd": "NCC",
+          "attr": "ncc"
+        },
+        {
+          "cdd": "BCC",
+          "attr": "bcc"
+        },
+        {
+          "cdd": "BCCHNO",
+          "attr": "bcchNo"
+        },
+        {
+          "cdd": "USER LABEL_CELL",
+          "attr": "userLabel"
+        },
+        {
+          "cdd": "NEW RAC",
+          "attr": "rac"
+        },
+        {
+          "cdd": "CSYSTYPE",
+          "attr": "cSysType"
+        },
+        {
+          "cdd": "BCCHTYPE",
+          "attr": "bcchType"
+        },
+        {
+          "cdd": "IRC",
+          "attr": "irc"
+        }
+      ]
+    },
+    {
+      "name": "GSM IdleModeAndPaging (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "IdleModeAndPaging",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "MFRMS",
+          "attr": "mFrms"
+        },
+        {
+          "cdd": "T3212",
+          "attr": "t3212"
+        },
+        {
+          "cdd": "ATT",
+          "attr": "att"
+        },
+        {
+          "cdd": "MAXRET",
+          "attr": "maxRet"
+        },
+        {
+          "cdd": "ACCMIN",
+          "attr": "accMin"
+        },
+        {
+          "cdd": "CRH",
+          "attr": "crh"
+        },
+        {
+          "cdd": "CB",
+          "attr": "cb"
+        },
+        {
+          "cdd": "CRO",
+          "attr": "cro"
+        },
+        {
+          "cdd": "TO",
+          "attr": "to"
+        },
+        {
+          "cdd": "PT",
+          "attr": "pt"
+        },
+        {
+          "cdd": "CRE",
+          "attr": "cre"
+        },
+        {
+          "cdd": "nccPerm",
+          "attr": "nccPerm",
+          "norm": "list"
+        }
+      ]
+    },
+    {
+      "name": "GSM PowerControlUplink (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "PowerControlUplink",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "MSTXPWR",
+          "attr": "msTxPwr"
+        },
+        {
+          "cdd": "msrPwrOffset",
+          "attr": "msrPwrOffset"
+        },
+        {
+          "cdd": "CCHPWR",
+          "attr": "cchPwr"
+        },
+        {
+          "cdd": "DTXU",
+          "attr": "dtxU"
+        },
+        {
+          "cdd": "BSRXMIN",
+          "attr": "bsRxMin"
+        },
+        {
+          "cdd": "MSRXMIN",
+          "attr": "msRxMin"
+        },
+        {
+          "cdd": "BSRXSUFF",
+          "attr": "bsRxSuff"
+        },
+        {
+          "cdd": "SSDESUL",
+          "attr": "ssDesUl"
+        },
+        {
+          "cdd": "QDESUL",
+          "attr": "qDesUl"
+        },
+        {
+          "cdd": "LCOMPUL",
+          "attr": "lCompUl"
+        },
+        {
+          "cdd": "QCOMPUL",
+          "attr": "qCompUl"
+        }
+      ]
+    },
+    {
+      "name": "GSM PowerControlDownlink (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "PowerControlDownlink",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "bsRPwrOffset",
+          "attr": "bsRPwrOffset"
+        },
+        {
+          "cdd": "dlPcE",
+          "attr": "dlPcE"
+        },
+        {
+          "cdd": "dlPcE2a",
+          "attr": "dlPcE2a"
+        },
+        {
+          "cdd": "initDlPcE",
+          "attr": "initDlPcE"
+        },
+        {
+          "cdd": "initDlPcE2a",
+          "attr": "initDlPcE2a"
+        },
+        {
+          "cdd": "initDlPcG",
+          "attr": "initDlPcG"
+        },
+        {
+          "cdd": "DTXD",
+          "attr": "dtxD"
+        },
+        {
+          "cdd": "DLPCG",
+          "attr": "dlPcG"
+        },
+        {
+          "cdd": "bsTxPwr",
+          "attr": "bsTxPwr"
+        },
+        {
+          "cdd": "bsPwr",
+          "attr": "bsPwr"
+        }
+      ]
+    },
+    {
+      "name": "GSM DynamicFrHrModeAdaption (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "DynamicFrHrModeAdaption",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "dmQb",
+          "attr": "dmQb"
+        },
+        {
+          "cdd": "dmQbAmr",
+          "attr": "dmQbAmr"
+        },
+        {
+          "cdd": "dmQbNAmr",
+          "attr": "dmQbNAmr"
+        },
+        {
+          "cdd": "dmQg",
+          "attr": "dmQg"
+        },
+        {
+          "cdd": "dmQgAmr",
+          "attr": "dmQgAmr"
+        },
+        {
+          "cdd": "dmQgNAmr",
+          "attr": "dmQgNAmr"
+        },
+        {
+          "cdd": "dmtFAmr",
+          "attr": "dmtFAmr"
+        },
+        {
+          "cdd": "dmtFNAmr",
+          "attr": "dmtFNAmr"
+        },
+        {
+          "cdd": "dmtHAmr",
+          "attr": "dmtHAmr"
+        },
+        {
+          "cdd": "dmtHNAmr",
+          "attr": "dmtHNAmr"
+        },
+        {
+          "cdd": "DMPR",
+          "attr": "dmPr"
+        }
+      ]
+    },
+    {
+      "name": "GSM InterRanMobility (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "InterRanMobility",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "RATPRIO",
+          "attr": "ratPrio"
+        },
+        {
+          "cdd": "PRIOTHR",
+          "attr": "prioThr"
+        },
+        {
+          "cdd": "HPRIO",
+          "attr": "hPrio"
+        },
+        {
+          "cdd": "TRES",
+          "attr": "tres"
+        },
+        {
+          "cdd": "ISHOLEV",
+          "attr": "isHoLev"
+        },
+        {
+          "cdd": "SPRIO",
+          "attr": "sPrio"
+        },
+        {
+          "cdd": "QSC",
+          "attr": "qsc"
+        },
+        {
+          "cdd": "QSCI",
+          "attr": "qsci"
+        }
+      ]
+    },
+    {
+      "name": "GSM RadioLinkTimeout (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "RadioLinkTimeout",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "RLINKTAHR",
+          "attr": "rLinkTaHr"
+        },
+        {
+          "cdd": "RLINKUPAFR",
+          "attr": "rLinkUpAfr"
+        },
+        {
+          "cdd": "RLINKUPAHR",
+          "attr": "rLinkUpAhr"
+        },
+        {
+          "cdd": "rLinkTAwb",
+          "attr": "rLinkTAwb"
+        },
+        {
+          "cdd": "rLinkUpAwb",
+          "attr": "rLinkUpAwb"
+        },
+        {
+          "cdd": "RLINKT",
+          "attr": "rLinkT"
+        },
+        {
+          "cdd": "RLINKUP",
+          "attr": "rLinkUp"
+        }
+      ]
+    },
+    {
+      "name": "GSM ChannelAllocAndOpt (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "ChannelAllocAndOpt",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "CHAP",
+          "attr": "chap"
+        },
+        {
+          "cdd": "FPDCH",
+          "attr": "fPdch"
+        },
+        {
+          "cdd": "SPDCH",
+          "attr": "sPdch"
+        },
+        {
+          "cdd": "CSPSALLOC",
+          "attr": "csPsAlloc"
+        },
+        {
+          "cdd": "GPRSPRIO",
+          "attr": "gprsPrio"
+        },
+        {
+          "cdd": "qtaStatus",
+          "attr": "qtaStatus"
+        }
+      ]
+    },
+    {
+      "name": "GSM Mobility (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "Mobility",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "AW",
+          "attr": "aw"
+        },
+        {
+          "cdd": "MBCR",
+          "attr": "mbcr"
+        },
+        {
+          "cdd": "MAXTA",
+          "attr": "maxTa"
+        },
+        {
+          "cdd": "emrState",
+          "attr": "emrState"
+        }
+      ]
+    },
+    {
+      "name": "GSM HierarchicalCellStructure (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "HierarchicalCellStructure",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "LAYER",
+          "attr": "layer"
+        },
+        {
+          "cdd": "LAYERTHR",
+          "attr": "layerThr"
+        }
+      ]
+    },
+    {
+      "name": "GSM PowerControl (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "PowerControl",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "AMRPCSTATE",
+          "attr": "amrPcState"
+        },
+        {
+          "cdd": "HPBSTATE",
+          "attr": "hpbState"
+        }
+      ]
+    },
+    {
+      "name": "GSM Dtm (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "Dtm",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "dtmState",
+          "attr": "dtmState"
+        }
+      ]
+    },
+    {
+      "name": "GSM MsQueuing (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "MsQueuing",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "QLENGTH",
+          "attr": "qLength"
+        }
+      ]
+    },
+    {
+      "name": "GSM ChannelGroup (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "ChannelGroup",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId},ChannelGroup={ChannelGroupId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "CHGR_0(SDCCH)",
+          "attr": "sdcch",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0"
+        },
+        {
+          "cdd": "CHGR_1(SDCCH)",
+          "attr": "sdcch",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1"
+        },
+        {
+          "cdd": "CHGR_2(SDCCH)",
+          "attr": "sdcch",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2"
+        },
+        {
+          "cdd": "CHGR_3(SDCCH)",
+          "attr": "sdcch",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3"
+        },
+        {
+          "cdd": "CHGR_0(NUMREQBPC)",
+          "attr": "numReqBpc",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0"
+        },
+        {
+          "cdd": "CHGR_1(NUMREQBPC)",
+          "attr": "numReqBpc",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1"
+        },
+        {
+          "cdd": "CHGR_2(NUMREQBPC)",
+          "attr": "numReqBpc",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2"
+        },
+        {
+          "cdd": "CHGR_3(NUMREQBPC)",
+          "attr": "numReqBpc",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3"
+        },
+        {
+          "cdd": "CHGR_0(DCHNO)",
+          "attr": "dchNo",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_1(DCHNO)",
+          "attr": "dchNo",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_2(DCHNO)",
+          "attr": "dchNo",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_3(DCHNO)",
+          "attr": "dchNo",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_0(HSN)",
+          "attr": "hsn",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_1(HSN)",
+          "attr": "hsn",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_2(HSN)",
+          "attr": "hsn",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_3(HSN)",
+          "attr": "hsn",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_0(HOP)",
+          "attr": "hop",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0"
+        },
+        {
+          "cdd": "CHGR_1(HOP)",
+          "attr": "hop",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1"
+        },
+        {
+          "cdd": "CHGR_2(HOP)",
+          "attr": "hop",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2"
+        },
+        {
+          "cdd": "CHGR_3(HOP)",
+          "attr": "hop",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3"
+        },
+        {
+          "cdd": "CHGR_0(MAIO)",
+          "attr": "maio",
+          "mo": "GeranCell={geranCellId},ChannelGroup=0",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_1(MAIO)",
+          "attr": "maio",
+          "mo": "GeranCell={geranCellId},ChannelGroup=1",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_2(MAIO)",
+          "attr": "maio",
+          "mo": "GeranCell={geranCellId},ChannelGroup=2",
+          "norm": "list"
+        },
+        {
+          "cdd": "CHGR_3(MAIO)",
+          "attr": "maio",
+          "mo": "GeranCell={geranCellId},ChannelGroup=3",
+          "norm": "list"
+        }
+      ]
+    },
+    {
+      "name": "GSM PhysicalData (BSC cmedit)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_scope": "*BS*",
+      "cmedit_mo": "PhysicalData",
+      "cmedit_cmd": "cmedit get {scope} GeranCell.gerancellid=={site_mod}*,{mo}.({attrs}) -t",
+      "key_fdn": "GeranCell={GeranCellId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GeranCell={geranCellId}",
+      "columns": [
+        {
+          "cdd": "Latitude_DMS",
+          "attr": "latitude",
+          "norm": "latlong"
+        },
+        {
+          "cdd": "Longitude_DMS",
+          "attr": "longitude",
+          "norm": "latlong"
+        }
+      ]
+    },
+    {
+      "name": "GSM Trx arfcn (RadioNode)",
+      "tech": "gsm",
+      "category": "cell",
+      "source": "cmedit",
+      "cmedit_mo": "Trx",
+      "cmedit_cmd": "cmedit get {site_id}* Trx.({attrs}) -t",
+      "key_fdn": "GsmSector={GsmSectorId}",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "GsmSector={CELLNAME}",
+      "columns": [
+        {
+          "cdd": "arfcnMin",
+          "attr": "arfcnMin"
+        },
+        {
+          "cdd": "arfcnMax",
+          "attr": "arfcnMax"
+        }
       ]
     }
   ]

@@ -34,9 +34,11 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
     integration-style modified Site ID (e.g. MIN3117 → M3117) used to scope
     the query to this site's cells."""
     from integration_runner import CLI_PY
+    cell_rx = None
     try:
-        from integration_runner import _shortcode_to_cell_id
+        from integration_runner import _shortcode_to_cell_id, gsm_cell_id_re
         site_mod = _shortcode_to_cell_id(site_id) if site_id else ""
+        cell_rx = gsm_cell_id_re(site_id) if site_id else None
     except Exception:
         site_mod = ""
 
@@ -48,9 +50,13 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
         # FDN leaf class — cli.py's cmedit is case-sensitive, and the
         # integration's proven GSM query uses lowercase ``gerancell``.
         mo_class = prof.get("cmedit_mo") or _leaf_class(prof.get("mo_fdn", ""))
-        attrs = [c["attr"] for c in prof.get("columns", []) if c.get("attr")]
+        # de-dup attrs (multi-instance MOs like ChannelGroup repeat an attr
+        # across per-index CDD columns).
+        attrs = list(dict.fromkeys(c["attr"] for c in prof.get("columns", [])
+                                   if c.get("attr")))
         if not mo_class or not attrs:
             continue
+        key_fdn = prof.get("key_fdn", "")
         scope = prof.get("cmedit_scope", "*")
         attr_list = ",".join(attrs)
         tmpl = prof.get("cmedit_cmd", "cmedit get {scope} {mo}.({attrs}) -t")
@@ -68,15 +74,30 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
         except Exception as exc:
             log(f"[audit/cmedit] command failed: {exc}")
             continue
-        # Show the raw cmedit output so a 0-MO result can be diagnosed
-        # (empty query vs a parser mismatch).
-        clean = out.strip()
-        log("[audit/cmedit] -- raw output (first 1500 chars) --")
-        for line in clean[:1500].splitlines():
-            log("   " + line)
-        if len(clean) > 1500:
-            log(f"   ... ({len(clean)} chars total)")
-        parsed = _parse_cmedit_table(out, attrs)
+        # Brief diagnostic only — dumping the full raw output per query (14+
+        # GSM queries) floods the UI log and stalls page.update(). If nothing
+        # parses, show the first couple of lines to distinguish empty vs error.
+        parsed = _parse_cmedit_table(out, attrs, key_fdn=key_fdn)
+        if not parsed:
+            head = " | ".join(out.strip().splitlines()[:2])[:200]
+            log(f"[audit/cmedit] 0 parsed — output head: {head}")
+        # Drop GeranCell-keyed records that don't TRULY belong to the site —
+        # the gerancellid==M<n>* filter also matches foreign sites (M18* →
+        # M1800.., M18328..). GsmSector-keyed (Trx) records are matched by
+        # CELLNAME instead, so they're left untouched.
+        if cell_rx is not None:
+            kept = {}
+            dropped = 0
+            for ldn, a in parsed.items():
+                m = re.search(r"GeranCell=([^,]+)", ldn)
+                if m and not cell_rx.match(m.group(1)):
+                    dropped += 1
+                    continue
+                kept[ldn] = a
+            if dropped:
+                log(f"[audit/cmedit] dropped {dropped} foreign cell(s) not "
+                    f"matching site {site_id}")
+            parsed = kept
         log(f"[audit/cmedit] parsed {len(parsed)} MO(s) for {mo_class}")
         for ldn, a in parsed.items():
             records.setdefault(ldn, {}).update(a)
@@ -97,7 +118,11 @@ def _split_row(ln: str) -> List[str]:
 _INSTANCE_RE = re.compile(r"^\d+\s+instance", re.IGNORECASE)
 
 
-def _parse_cmedit_table(out: str, wanted: List[str]) -> Dict[str, Dict[str, str]]:
+_KEY_PH = re.compile(r"\{([A-Za-z][A-Za-z0-9_]*)\}")
+
+
+def _parse_cmedit_table(out: str, wanted: List[str],
+                        key_fdn: str = "") -> Dict[str, Dict[str, str]]:
     """Parse ``cmedit get ... -t`` output (cli.py table mode).
 
     Real layout (TAB-separated), e.g. for GeranCell:
@@ -137,14 +162,22 @@ def _parse_cmedit_table(out: str, wanted: List[str]) -> Dict[str, Dict[str, str]
     if not attr_pos:
         return {}
 
-    # Leaf identity: last "<Class>Id" column before the first attribute column.
-    first_attr = min(attr_pos.values())
-    leaf_pos = -1
-    for pos in range(first_attr - 1, -1, -1):
-        if header_cols[pos].lower().endswith("id"):
-            leaf_pos = pos
-            break
-    leaf_class = header_cols[leaf_pos][:-2] if leaf_pos >= 0 else ""
+    # Record key. Two modes:
+    #  * key_fdn given (child/multi-instance MOs): build the FDN from named
+    #    id columns, e.g. "GeranCell={GeranCellId},ChannelGroup={ChannelGroupId}".
+    #  * else (default): last "<Class>Id" column before the first attribute
+    #    column becomes the leaf identity, e.g. GeranCellId → GeranCell=<value>.
+    col_pos = {c.lower(): i for i, c in enumerate(header_cols)}
+    key_cols = _KEY_PH.findall(key_fdn) if key_fdn else []
+
+    leaf_pos, leaf_class = -1, ""
+    if not key_fdn:
+        first_attr = min(attr_pos.values())
+        for pos in range(first_attr - 1, -1, -1):
+            if header_cols[pos].lower().endswith("id"):
+                leaf_pos = pos
+                break
+        leaf_class = header_cols[leaf_pos][:-2] if leaf_pos >= 0 else ""
 
     records: Dict[str, Dict[str, str]] = {}
     for ln in lines[header_idx + 1:]:
@@ -156,8 +189,19 @@ def _parse_cmedit_table(out: str, wanted: List[str]) -> Dict[str, Dict[str, str]
         if s.startswith("[") and s.endswith("$"):   # shell prompt echo
             continue
         toks = _split_row(ln)
-        if leaf_pos < 0 or leaf_pos >= len(toks):
-            # Fallback: a single FDN token in column 0.
+        if key_fdn:
+            vals = {}
+            ok = True
+            for name in key_cols:
+                idx = col_pos.get(name.lower(), -1)
+                if idx < 0 or idx >= len(toks) or not toks[idx]:
+                    ok = False
+                    break
+                vals[name] = toks[idx]
+            if not ok:
+                continue
+            key = _KEY_PH.sub(lambda m: vals[m.group(1)], key_fdn)
+        elif leaf_pos < 0 or leaf_pos >= len(toks):
             if toks and _FDN_RE.match(toks[0]):
                 key = _display_ldn(toks[0])
             else:

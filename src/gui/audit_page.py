@@ -50,6 +50,9 @@ class AuditPage:
         self.lte_field = self._tf("LTE CDD file", "", expand=3)
         self.nr_field = self._tf("NR CDD file", "", expand=3)
         self.gsm_field = self._tf("GSM CDD file (audited live via cmedit)", "", expand=3)
+        self.lld_field = self._tf(
+            "LLD file — optional; baseband type + RiLink/CPRI port allocation",
+            "", expand=3)
         self.dump_field = self._tf(
             "Dump file(s) — optional; cm/modump. Blank = auto-find in "
             "LOG/<SiteID>/DUMP/", "", expand=3)
@@ -114,7 +117,11 @@ class AuditPage:
                     ft.Text("CDD Audit", size=22, weight=ft.FontWeight.BOLD, color=TEXT),
                     ft.Container(expand=True),
                     self.editmap_btn,
-                    ft.TextButton("← Back", on_click=lambda e: self.page.go("/form")),
+                    ft.TextButton(
+                        ("← Back to Summary"
+                         if getattr(self.page, "integration_has_summary", False)
+                         else "← Back"),
+                        on_click=self._go_back),
                 ]),
                 ft.Text("Enter the Site ID and pick the CDD(s). Node dumps are "
                         "auto-found in LOG/<SiteID>/DUMP/ (all nodes). GSM is "
@@ -125,6 +132,7 @@ class AuditPage:
                     browse_row(self.lte_field, self._browse_lte, "LTE CDD"),
                     browse_row(self.nr_field, self._browse_nr, "NR CDD"),
                     browse_row(self.gsm_field, self._browse_gsm, "GSM CDD"),
+                    browse_row(self.lld_field, self._browse_lld, "LLD"),
                     browse_row(self.dump_field, self._browse_dump, "Dump(s)"),
                     ft.Divider(height=1, color=BORDER),
                     ft.Text("Batch / Cluster audit — export many nodes live "
@@ -160,6 +168,15 @@ class AuditPage:
         return ft.View(route="/audit", padding=0, spacing=0, bgcolor=BG_TOP,
                        controls=[body], services=[self.file_picker])
 
+    def _go_back(self, e):
+        """Return to the Integration Summary if the audit was opened from it
+        (re-shows the summary without re-running); otherwise go to the form."""
+        if getattr(self.page, "integration_has_summary", False):
+            self.page.integration_show_summary_only = True
+            self.page.go("/integration_run")
+        else:
+            self.page.go("/form")
+
     def _toggle_log_height(self, e):
         self._log_big = not getattr(self, "_log_big", False)
         self.log_col.height = 900 if self._log_big else 460
@@ -193,6 +210,9 @@ class AuditPage:
 
     async def _browse_gsm(self, e):
         await self._pick_cdd(self.gsm_field, "Select GSM CDD")
+
+    async def _browse_lld(self, e):
+        await self._pick_cdd(self.lld_field, "Select LLD (Tx/CPRI) workbook")
 
     def _on_batch_change(self, e):
         nodes = [n for n in re.split(r"[;\n]+", self.batch_field.value)
@@ -231,6 +251,7 @@ class AuditPage:
         lte = self.lte_field.value.strip()
         nr = self.nr_field.value.strip()
         gsm = self.gsm_field.value.strip()
+        lld = self.lld_field.value.strip()
         dumps = [p.strip() for p in self.dump_field.value.split("|") if p.strip()]
         cluster = self.cluster_field.value.strip()
         batch_nodes = [n.strip() for n in re.split(r"[;\n]+", self.batch_field.value)
@@ -242,8 +263,8 @@ class AuditPage:
         if is_batch and not cluster:
             self._set_status("Cluster name is required for batch audit.", DANGER)
             return
-        if not (lte or nr or gsm):
-            self._set_status("Pick at least one CDD (LTE / NR / GSM).", DANGER)
+        if not (lte or nr or gsm or lld):
+            self._set_status("Pick at least one CDD (LTE / NR / GSM / LLD).", DANGER)
             return
         self.run_btn.disabled = True
         self.open_btn.visible = False
@@ -255,7 +276,7 @@ class AuditPage:
         self.page.update()
         threading.Thread(
             target=self._worker,
-            args=(site, lte, nr, gsm, dumps, cluster, batch_nodes),
+            args=(site, lte, nr, gsm, dumps, cluster, batch_nodes, lld),
             daemon=True).start()
 
     # ── Elapsed timer ────────────────────────────────────────────
@@ -304,7 +325,8 @@ class AuditPage:
         self.status_text.color = color
         self.page.update()
 
-    def _worker(self, site, lte, nr, gsm, dumps=None, cluster="", batch_nodes=None):
+    def _worker(self, site, lte, nr, gsm, dumps=None, cluster="", batch_nodes=None,
+                lld=""):
         ssh = None
         dumps = dumps or []
         batch_nodes = batch_nodes or []
@@ -332,36 +354,45 @@ class AuditPage:
                     port = int(self._form.get("port", 5023) or 5023)
                 except (ValueError, TypeError):
                     port = 5023
-                self._log(f"Batch: {len(batch_nodes)} node(s) → live cmedit "
-                          f"export (cluster '{cluster}').")
-                zip_path = os.path.join(get_app_dir(), "LOG", safe, "DUMP",
-                                        f"{safe}_batch_cmdump.zip")
                 ssh = IntegrationSSH(host=host, port=port, username=user,
                                      password=pwd, log_callback=self._log)
                 ssh.connect(timeout=30)
-                ok, _out = run_take_cm_dump_batch(
-                    ssh, batch_nodes, cluster, zip_path, self._log)
-                if not ok:
-                    self._fail("Batch CM export failed — see log.")
-                    return
-                self._log(f"Parsing combined dump: {os.path.basename(zip_path)} ...")
-                records.update(dump_parser.parse_dump(zip_path))
-                # Nodes come from the records themselves (one file, many nodes).
-                seen = set()
-                for ldn in records:
-                    m = re.search(r"ManagedElement=([^,]+)", ldn)
-                    if m:
-                        seen.add(m.group(1))
-                nodes = sorted(seen)
-                self._log(f"  → {len(records)} MO(s) across {len(nodes)} node(s): "
-                          f"{', '.join(nodes[:6])}{' …' if len(nodes) > 6 else ''}")
+                if lte or nr or lld:
+                    self._log(f"Batch: {len(batch_nodes)} node(s) → live cmedit "
+                              f"export (cluster '{cluster}').")
+                    zip_path = os.path.join(get_app_dir(), "LOG", safe, "DUMP",
+                                            f"{safe}_batch_cmdump.zip")
+                    ok, _out = run_take_cm_dump_batch(
+                        ssh, batch_nodes, cluster, zip_path, self._log)
+                    if not ok:
+                        self._fail("Batch CM export failed — see log.")
+                        return
+                    self._log(f"Parsing combined dump: "
+                              f"{os.path.basename(zip_path)} ...")
+                    records.update(dump_parser.parse_dump(zip_path))
+                    seen = set()
+                    for ldn in records:
+                        m = re.search(r"ManagedElement=([^,]+)", ldn)
+                        if m:
+                            seen.add(m.group(1))
+                    nodes = sorted(seen)
+                    self._log(f"  → {len(records)} MO(s) across {len(nodes)} "
+                              f"node(s): {', '.join(nodes[:6])}"
+                              f"{' …' if len(nodes) > 6 else ''}")
+                else:
+                    # GSM-only batch — no dump needed; use the node names for
+                    # CDD row matching (GSM values come live via cmedit).
+                    nodes = list(dict.fromkeys(n.strip() for n in batch_nodes
+                                               if n.strip()))
+                    self._log(f"GSM-only batch: {len(nodes)} node(s), no dump "
+                              "export.")
 
             # ── 1. Parse node dumps — browsed file(s) first, then auto-find ──
             # Browsed dumps let you audit a node whose dump isn't in the site
             # folder, or point at a specific cm/modump. Both formats are
             # auto-detected by the parser. Auto-find still runs for LTE/NR.
             found = list(dumps)
-            if not is_batch and (lte or nr):
+            if not is_batch and (lte or nr or lld):
                 dump_dir = os.path.join(get_app_dir(), "LOG", safe, "DUMP")
                 auto = (sorted(glob.glob(os.path.join(dump_dir, "*_cmdump.zip")))
                         + sorted(glob.glob(os.path.join(dump_dir, "*_modump.zip"))))
@@ -406,9 +437,23 @@ class AuditPage:
             audit_map = cdd_reader.load_map()
 
             # ── 2. GSM: live cmedit (BSC), SSH creds from main form ──
-            # Single-site only — GSM is scoped by one Site ID; batch is LTE/NR.
-            if gsm and is_batch:
-                self._log("⚠ GSM CDD ignored in batch mode (batch = LTE/NR dump).")
+            gsm_cmedit = [p for p in audit_map.get("profiles", [])
+                          if p.get("tech") == "gsm" and p.get("source") == "cmedit"]
+            # Batch: derive Site IDs from the node list (part before '_',
+            # de-duplicated), then fetch GSM per site — reusing the batch SSH.
+            if gsm and is_batch and gsm_cmedit and ssh is not None:
+                sites = sorted({n.split("_")[0].strip()
+                                for n in batch_nodes if n.strip()})
+                self._log(f"GSM batch: {len(sites)} site(s) from node list → "
+                          f"{', '.join(sites)}")
+                for s in sites:
+                    self._log(f"  GSM cmedit for site {s} ...")
+                    try:
+                        recs = cmedit_source.fetch_cmedit_records(
+                            ssh, "", gsm_cmedit, site_id=s, log=self._log)
+                        records.update(recs)
+                    except Exception as exc:
+                        self._log(f"  ✗ GSM cmedit {s}: {exc}")
             if gsm and not is_batch:
                 gsm_cmedit = [p for p in audit_map.get("profiles", [])
                               if p.get("tech") == "gsm" and p.get("source") == "cmedit"]
@@ -471,14 +516,65 @@ class AuditPage:
                     items.append(it)
             self._log(f"Total expected params: {len(items)} across "
                       f"{len(read_keys)} key(s).")
-            if not items:
+            if not items and not lld:
                 self._fail("No CDD rows matched these nodes "
                            "(check node names vs eNodeBName/gsmNodeName in CDD).")
                 return
 
             # ── 4. Compare + Excel ─────────────────────────────────
-            results = audit_core.compare(items, records)
             from collections import Counter
+            results = audit_core.compare(items, records)
+
+            # Reverse pass: nodes present in the data but with NO CDD rows (e.g.
+            # a batch node the CDD doesn't cover) — surface their ACTUAL audited
+            # params with the CDD column blank and status "CDD missing", instead
+            # of the node silently vanishing from the report.
+            covered = {(it.node or "").strip().lower() for it in items}
+            uncovered = [n for n in nodes
+                         if n and n.strip().lower() not in covered]
+            if uncovered:
+                gsm_attrs, lte_ca, ref_attrs = audit_core.audited_attr_sets(
+                    audit_map)
+                try:
+                    from integration_runner import gsm_cell_id_re
+                except Exception:
+                    gsm_cell_id_re = None
+                for n in uncovered:
+                    cell_rx = None
+                    if gsm_cell_id_re:
+                        try:
+                            cell_rx = gsm_cell_id_re(n.split("_")[0])
+                        except Exception:
+                            cell_rx = None
+                    rev = audit_core.build_reverse_rows(
+                        n, records, gsm_attrs, lte_ca, ref_attrs, cell_rx)
+                    if rev:
+                        results += rev
+                        self._log(f"CDD missing: {n} not in CDD → "
+                                  f"{len(rev)} node param(s) listed.")
+
+            # LLD (baseband type + RiLink/CPRI port allocation) — driven off the
+            # node dump (FieldReplaceableUnit / RiLink MOs), per dump-node. Kept
+            # in its own list → its own styled 'LLD' sheet (layout columns), not
+            # mixed into the logical CDD Detail rows.
+            lld_results = []
+            if lld:
+                if os.path.isfile(lld):
+                    from audit import lld_audit
+                    self._log(f"LLD audit ({os.path.basename(lld)}) for "
+                              f"{len(nodes)} node(s)...")
+                    for node in nodes:
+                        try:
+                            lld_results += lld_audit.audit_lld(
+                                lld, node, records, log=self._log)
+                        except Exception as exc:
+                            self._log(f"  ✗ LLD audit {node}: {exc}")
+                    lc = Counter(x.status for x in lld_results)
+                    self._log(f"LLD: Match={lc['Match']} Mismatch={lc['Mismatch']} "
+                              f"NotFound={lc['NotFound']} Extra={lc['Extra']}")
+                else:
+                    self._log(f"⚠ LLD file not found: {lld}")
+
             c = Counter(r.status for r in results)
             self._log(f"Result: Match={c['Match']} Mismatch={c['Mismatch']} "
                       f"ParamNotFound={c['NotFound']} MO_NotFound={c['MO_NotFound']}")
@@ -494,17 +590,23 @@ class AuditPage:
                 "NR CDD": os.path.basename(nr) if nr else "-",
                 "GSM CDD": ("(n/a in batch)" if is_batch
                             else (os.path.basename(gsm) if gsm else "-")),
+                "LLD": os.path.basename(lld) if lld else "-",
                 "Mode": "Batch / Cluster" if is_batch else "Single site",
                 "Generated": ts,
-            })
+            }, lld_results=lld_results)
             self._result_path = out
             self._results = results
             self._gen_ctx = {"site": label, "out_dir": out_dir, "xlsx": out}
             self._log(f"✓ Report saved: {out}")
+            lc = Counter(x.status for x in lld_results)
+            lld_tail = (f" · LLD {lc['Mismatch']} mismatch/"
+                        f"{lc['NotFound']} not-found/{lc['Extra']} extra"
+                        if lld_results else "")
             self.status_text.value = (
                 f"Done — {c['Mismatch']} mismatch, "
-                f"{c['NotFound']+c['MO_NotFound']} not found.")
-            self.status_text.color = SUCCESS if c["Mismatch"] == 0 else ACCENT_WARM
+                f"{c['NotFound']+c['MO_NotFound']} not found.{lld_tail}")
+            clean = c["Mismatch"] == 0 and lc["Mismatch"] == 0 and lc["NotFound"] == 0
+            self.status_text.color = SUCCESS if clean else ACCENT_WARM
             self.open_btn.visible = True
             self.gen_btn.visible = c["Mismatch"] > 0
         except Exception as exc:
@@ -547,6 +649,24 @@ class AuditPage:
             ctx = self._gen_ctx
             script_dir = os.path.join(ctx["out_dir"], "SCRIPTS")
             by = (self._form.get("username") or "").strip() or "NodeCraft"
+            fdn_prefix = (self._form.get("subnetwork") or "").strip()
+            # GSM GeranCell lives on the BSC (not the RadioNode): build its FDN
+            # from the configurable audit_map template, filling {bsc} from the
+            # main form's BSC name (left as <BSC> to edit if unknown).
+            gsm_fdn_prefix = ""
+            gsm_child_map = {}
+            try:
+                from audit import cdd_reader
+                amap = cdd_reader.load_map()
+                tmpl = amap.get("gsm_fdn_prefix", "")
+                bsc = (self._form.get("bsc_name") or "").strip() or "<BSC>"
+                gsm_fdn_prefix = tmpl.replace("{bsc}", bsc)
+                gsm_child_map = audit_core.build_gsm_child_map(amap)
+            except Exception:
+                pass
+            # Three formats from the same Mismatch rows: moshell (.mos, the only
+            # one the Run button executes) + ENM CMEdit + CM Bulk (separate .txt
+            # files — different command syntax, review-and-apply manually).
             paths = audit_core.generate_moshell_scripts(
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",))
@@ -554,10 +674,22 @@ class AuditPage:
                 self._log("No Mismatch rows — nothing to generate.")
                 self._set_status("No mismatches to script.", ACCENT_WARM)
                 return
-            self._log(f"✓ Generated {len(paths)} script(s) in {script_dir}:")
-            for p in paths:
+            cmedit_paths = audit_core.generate_cmedit_scripts(
+                self._results, script_dir, ctx["site"], ctx["xlsx"],
+                generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
+                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+            cmbulk_paths = audit_core.generate_cmbulk_scripts(
+                self._results, script_dir, ctx["site"], ctx["xlsx"],
+                generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
+                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+            allp = paths + cmedit_paths + cmbulk_paths
+            self._log(f"✓ Generated {len(allp)} script(s) in {script_dir} "
+                      f"(.mos runnable; cmedit/cmbulk are separate files):")
+            for p in allp:
                 self._log("   " + os.path.basename(p))
-            self._set_status(f"Generated {len(paths)} script(s).", SUCCESS)
+            self._set_status(
+                f"Generated {len(paths)} .mos + {len(cmedit_paths)} cmedit + "
+                f"{len(cmbulk_paths)} cmbulk.", SUCCESS)
             self._script_dir = script_dir
             self.runscript_btn.visible = True
             self.page.update()

@@ -2171,7 +2171,9 @@ def run_install_lkf(
     # used to early-exit the poll with a false fatal-error.
     log_cb(f"Checking LKF installation status for job: {job_name}...")
     status_cmd = f"python {_LKF_STATUS} {job_name}"
-    max_attempts = 20
+    # lkfinstall can take a while to settle; give the job more polling time
+    # before we fall back to the node-side alt check.
+    max_attempts = 30
     completed = False
 
     # Real fatal states the LKF status tool prints — anchored to a
@@ -2254,12 +2256,43 @@ def run_install_lkf(
                    f"waiting {delay}s...")
             time.sleep(delay)
 
+    # ── 5. Second-side verification via alt (node-side ground truth) ──
+    # The install job status can lag or report SKIPPED while the license is
+    # in fact present on the node. The node's own alarm list is authoritative:
+    # if there is NO "License Key File Fault" alarm in ``alt``, the LKF is
+    # installed. Only used to RESCUE a skipped/timeout verdict (never to
+    # downgrade a job that already reported success), and we re-read a few
+    # times so a slow-finishing install has a chance to clear the alarm.
+    _LKF_FAULT_RE = re.compile(r"licen[cs]e\s*key\s*file\s*fault", re.IGNORECASE)
+    if skipped or not completed:
+        for a in range(1, 4):
+            try:
+                log_cb(f"Verifying via alt (#{a}/3): checking the node's alarm "
+                       "list for 'License Key File Fault'...")
+                alt_out = ssh.run_amos_command_safe("alt", node_name, timeout=120)
+                all_output += alt_out
+                log_cb(f"alt output:\n{alt_out}")
+            except Exception as exc:
+                log_cb(f"(alt check failed: {exc})")
+                break
+            if not _LKF_FAULT_RE.search(alt_out):
+                log_cb(f"✓ No 'License Key File Fault' alarm on {node_name} — "
+                       "LKF confirmed installed via alt (job status was "
+                       "SKIPPED/incomplete but the node is fine).")
+                return True, all_output
+            if a < 3:
+                log_cb("'License Key File Fault' still present — the install "
+                       "may still be finishing; waiting 20s before re-check...")
+                time.sleep(20)
+        log_cb("alt still shows 'License Key File Fault' (or alt unavailable).")
+
     if skipped:
         msg = (
             f"LKF NOT installed for {node_name} — the job completed but "
-            f"the install was SKIPPED (Licence Key File not found). "
-            f"Make sure the LKF for this node is imported in ENM / present "
-            f"in SMRS, or provide the LKF zip."
+            f"the install was SKIPPED (Licence Key File not found), and the "
+            f"node still raises a 'License Key File Fault' alarm. Make sure "
+            f"the LKF for this node is imported in ENM / present in SMRS, or "
+            f"provide the LKF zip."
         )
         log_cb(f"✗ {msg}")
         if wait_for_user:
@@ -2269,7 +2302,9 @@ def run_install_lkf(
     if not completed:
         msg = (
             f"LKF installation is failed, need manual check.\n"
-            f"Job '{job_name}' did not reach COMPLETED after {max_attempts} attempts."
+            f"Job '{job_name}' did not reach COMPLETED after {max_attempts} "
+            f"attempts, and the node still raises a 'License Key File Fault' "
+            f"alarm."
         )
         log_cb(f"✗ {msg}")
         if wait_for_user:
@@ -4144,6 +4179,33 @@ def _shortcode_to_cell_id(shortcode: str) -> str:
     return shortcode  # fallback: return as-is
 
 
+def gsm_cell_id_re(shortcode: str):
+    """Precise regex matching ONLY this site's GSM cell ids.
+
+    A GSM cell id is ``<letter><siteDigits><band 8|9><sector…>`` — e.g. MIN18 →
+    M189S1 (GSM900) / M188S1 (GSM1800). A bare prefix wildcard ``M18*`` also
+    wrongly matches M1800.. (MIN1800), M18328.. (MIN1832) etc. Anchoring the
+    band digit (8/9) AND requiring a NON-digit sector char right after the exact
+    site digits excludes those foreign sites.
+    """
+    import re
+    m = re.match(r"([A-Za-z])[A-Za-z]*(\d+)", shortcode or "")
+    if not m:
+        return None
+    return re.compile(rf"^{m.group(1)}{m.group(2)}[89]\D", re.IGNORECASE)
+
+
+def gsm_cells_in_output(output: str, shortcode: str) -> set:
+    """Distinct GSM cell ids in a cmedit output that TRULY belong to the site
+    (precise-regex filtered — see gsm_cell_id_re). Use this instead of cmedit's
+    'N instance(s)' line, which counts prefix-wildcard false matches too."""
+    import re
+    rx = gsm_cell_id_re(shortcode)
+    if not rx:
+        return set()
+    return {t for t in re.split(r"[\s,]+", output or "") if t and rx.match(t)}
+
+
 def run_gsm_cell_define(
     ssh: IntegrationSSH,
     node_name: str,
@@ -4232,17 +4294,17 @@ def run_gsm_cell_define(
     all_output += out
     log_cb(f"Cell check output:\n{out}")
 
-    cell_ok = False
-    for line in out.split("\n"):
-        if "instance" in line.lower():
-            if "0 instance" not in line.lower():
-                cell_ok = True
-            break
+    # Count only cells that TRULY belong to this site — a prefix wildcard
+    # (gerancellid==M18*) also matches M1800.. / M18328.. from other sites.
+    cells = gsm_cells_in_output(out, shortcode)
+    cell_ok = len(cells) > 0
 
     if cell_ok:
-        log_cb(f"✓ GSM Cell found for {modified_sc}.")
+        log_cb(f"✓ GSM Cell found for {modified_sc} — {len(cells)} cell(s) "
+               "(precise match).")
     else:
-        log_cb(f"✗ GSM Cell not found (0 instances for gerancellid=={modified_sc}*).")
+        log_cb(f"✗ GSM Cell not found (0 precise matches for site {shortcode}; "
+               "any prefix hits were other sites).")
 
     # ── Result ──────────────────────────────────────────────────
     if mo_ok and cell_ok:
@@ -4290,11 +4352,7 @@ def run_gsm_cell_define(
             out = ssh.run_amos_command_safe(cell_cmd, node_name, timeout=60)
             all_output += out
             log_cb(f"Cell re-check:\n{out}")
-            for line in out.split("\n"):
-                if "instance" in line.lower():
-                    if "0 instance" not in line.lower():
-                        cell_ok = True
-                    break
+            cell_ok = len(gsm_cells_in_output(out, shortcode)) > 0
             if cell_ok:
                 log_cb(f"✓ GSM Cell now found.")
 
@@ -4359,14 +4417,18 @@ def run_bsc_neighbours(
     def _check(label: str, cmd: str) -> tuple[bool, str]:
         log_cb(f"Checking BSC {label} (gerancellid=={modified_sc}*)...")
         out = ssh.run_amos_command_safe(cmd, node_name, timeout=60)
-        ok = _has_instances(out)
+        # Only count relations on cells that TRULY belong to this site — a
+        # prefix wildcard also matches other sites (M18* → M1800.., M18328..).
+        cells = gsm_cells_in_output(out, shortcode)
+        ok = len(cells) > 0
         log_cb(f"{label} output:\n{out}")
         if ok:
-            log_cb(f"✓ BSC {label} found for {modified_sc}.")
+            log_cb(f"✓ BSC {label} found for {modified_sc} "
+                   f"({len(cells)} site cell(s)).")
         else:
             log_cb(
-                f"✗ BSC {label} not found (0 instances for "
-                f"gerancellid=={modified_sc}*)."
+                f"✗ BSC {label} not found (0 precise matches for site "
+                f"{shortcode}; any prefix hits were other sites)."
             )
         return ok, out
 
@@ -4665,8 +4727,13 @@ def run_mobatch_scripts(ssh: IntegrationSSH, node_files: list, stamp: str,
     same timestamp and is named ``<node>_SetParameter_<stamp>.mos``, so a single
     mobatch command with the ``$nodename`` variable runs each node's own script:
 
-        mobatch -p <N> <sitelist> <dir>/$nodename_SetParameter_<stamp>.mos <logdir>
+        mobatch -p <N> <sitelist> 'lt all;run <dir>/$nodename_SetParameter_<stamp>.mos' <logdir>
 
+    The argument must be a moshell COMMAND (``lt all`` then ``run <script>``) —
+    not a bare file path. Passing just the path makes mobatch hand the literal
+    string to moshell as a command (``no such command: …``) and never
+    substitutes ``$nodename``. As a command string, mobatch substitutes
+    ``$nodename`` per node and moshell ``run``s that node's own script.
     ``$nodename`` is single-quoted so the local bash doesn't expand it — mobatch
     on the gateway substitutes it per node. Returns (output, remote_logdir)."""
     import os as _os
@@ -4689,12 +4756,15 @@ def run_mobatch_scripts(ssh: IntegrationSSH, node_files: list, stamp: str,
 
     p = max(1, min(len(node_files), parallel_cap))
     logdir = f"{home}/mobatch_logs/{label}"
-    script_tmpl = f"'{rdir}/$nodename_SetParameter_{stamp}.mos'"
+    # Pass a moshell COMMAND ('lt all' then 'run <script>'), not a bare path —
+    # so mobatch substitutes $nodename per node and moshell actually runs the
+    # per-node script (a bare path is taken as a literal command → fails).
+    run_cmd = f"'lt all;run {rdir}/$nodename_SetParameter_{stamp}.mos'"
     # 'yes |' auto-answers mobatch's y/n confirmation so the run doesn't hang.
     cmd = (f"mkdir -p {logdir}; yes | mobatch -p {p} {sitelist} "
-           f"{script_tmpl} {logdir}")
+           f"{run_cmd} {logdir}")
     log_cb(f"Running: mobatch -p {p} {sitelist} "
-           f"$nodename_SetParameter_{stamp}.mos {logdir}")
+           f"'lt all;run $nodename_SetParameter_{stamp}.mos' {logdir}")
     out = ssh.run_command(cmd, timeout=5400)
     return out, logdir
 

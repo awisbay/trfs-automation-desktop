@@ -718,6 +718,22 @@ class IntegrationRunPage:
 
     # ── Build ────────────────────────────────────────────────────
     def build(self) -> ft.View:
+        # Returning from the CDD Audit page? Restore the last run's results and
+        # re-show the summary instead of re-running the whole integration.
+        self._summary_only = bool(
+            getattr(self.page, "integration_show_summary_only", False))
+        if self._summary_only:
+            self.page.integration_show_summary_only = False
+            self._step_results = (
+                getattr(self.page, "integration_step_results", {}) or {})
+            self._node_durations = (
+                getattr(self.page, "integration_node_durations", {}) or {})
+            self._run_finished = True
+        else:
+            # Fresh run — no summary to return to until this one finishes, so a
+            # stale "Back to Summary" from a previous run can't fire.
+            self.page.integration_has_summary = False
+
         # Put the SHORTCODE in the OS window title so the taskbar
         # preview / Alt-Tab shows which site each window is running —
         # essential when the operator opens several NodeCraft windows.
@@ -959,8 +975,13 @@ class IntegrationRunPage:
         # Start timer and workflow
         self._start_time = datetime.now()
         self._timer_running = True
-        threading.Thread(target=self._tick_timer, daemon=True).start()
-        threading.Thread(target=self._run_workflow, daemon=True).start()
+        if self._summary_only:
+            # Re-entry from CDD Audit: don't re-run — just re-show the summary.
+            self._timer_running = False
+            self.page.run_task(self._reshow_summary_task)
+        else:
+            threading.Thread(target=self._tick_timer, daemon=True).start()
+            threading.Thread(target=self._run_workflow, daemon=True).start()
         # Phone monitor pusher (no-op thread exits immediately if the
         # Telegram monitor isn't configured).
         self.page.run_task(self._flush_loop)
@@ -2117,7 +2138,26 @@ class IntegrationRunPage:
 
         wb.save(path)
 
+    async def _reshow_summary_task(self):
+        """Re-open the Integration Summary after returning from CDD Audit —
+        the view has just rebuilt, so wait a beat for it to mount, then show
+        the popup from the restored (not re-run) results."""
+        import asyncio
+        await asyncio.sleep(0.4)
+        try:
+            self._show_summary_popup()
+        except Exception as exc:
+            print(f"[summary] re-show failed: {exc}")
+
     def _show_summary_popup(self):
+        # Persist just enough state on the page object so this summary can be
+        # re-shown after a trip to the CDD Audit page (which rebuilds this view
+        # from scratch) WITHOUT re-running the integration.
+        self.page.integration_step_results = {
+            k: dict(v) for k, v in self._step_results.items()}
+        self.page.integration_node_durations = dict(self._node_durations)
+        self.page.integration_has_summary = True
+
         node_order = []
         node_labels = {}
         node_order.append("lte")
@@ -2269,6 +2309,14 @@ class IntegrationRunPage:
             self._close_dialog_safe(dlg)
             close_event.set()
 
+        def _on_next_audit(e):
+            # Go to the CDD Audit page; the audit page shows a "Back to
+            # Summary" button that returns here (see integration_show_summary
+            # _only handling in build()).
+            self._close_dialog_safe(dlg)
+            close_event.set()
+            self.page.go("/audit")
+
         window = getattr(self.page, "window", None)
         window_width = getattr(window, "width", None) or 1380
         window_height = getattr(window, "height", None) or 920
@@ -2382,6 +2430,15 @@ class IntegrationRunPage:
                     ),
                     style=ft.ButtonStyle(color=ACCENT),
                     on_click=_on_save_xlsx,
+                ),
+                # Continue to the CDD Audit page (returns to this summary).
+                ft.TextButton(
+                    "Next → CDD Audit",
+                    icon=ft.Icons.FACT_CHECK,
+                    tooltip="Open the CDD Audit page. You can return to this "
+                            "summary with the Back button there.",
+                    style=ft.ButtonStyle(color=SUCCESS),
+                    on_click=_on_next_audit,
                 ),
                 ft.TextButton("Close",
                               style=ft.ButtonStyle(color=TEXT_MUTED),

@@ -351,9 +351,23 @@ def _vs_attributes(el) -> Dict[str, str]:
         if tag.startswith("vsData"):
             for a in child:
                 _add_attr(out, _local(a.tag), _attr_value(a))
+                _flatten_struct(out, _local(a.tag), a)
         else:
             _add_attr(out, tag, _attr_value(child))
+            _flatten_struct(out, tag, child)
     return out
+
+
+def _flatten_struct(out: Dict[str, str], name: str, el) -> None:
+    """Expose scalar members of a nested struct as dotted keys, e.g.
+    ``productData`` → ``productData.productName``. Additive: the struct's own
+    combined value (from ``_attr_value``) is still kept. Only single-level
+    scalar members are flattened; deeper/list structs are left as-is."""
+    if len(el) == 0:
+        return
+    for c in el:
+        if len(c) == 0:
+            _add_attr(out, f"{name}.{_local(c.tag)}", c.text or "")
 
 
 def _attr_value(el) -> str:

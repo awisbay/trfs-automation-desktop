@@ -93,37 +93,70 @@ def _norm(s) -> str:
 def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
                      audit_map: dict, log=lambda m: None) -> List[AuditItem]:
     """Read all profiles whose tech has a CDD file provided → AuditItems for
-    the audited ``node_name``."""
+    the audited ``node_name``.
+
+    Each workbook is opened ONCE and every sheet is materialized ONCE into a
+    cache shared across profiles — many GSM profiles hit the same big sheet, so
+    re-reading per profile made audits take minutes."""
     node_l = _norm(node_name)
     items: List[AuditItem] = []
-    for prof in audit_map.get("profiles", []):
-        tech = prof.get("tech", "")
-        path = cdd_paths.get(tech)
-        if not path or not os.path.isfile(path):
-            continue
-        try:
-            items += _read_profile(path, node_l, prof, log)
-        except Exception as exc:
-            log(f"[audit] profile '{prof.get('name')}' failed: {exc}")
+    wbcache: Dict[str, object] = {}       # path -> workbook
+    sheet_cache: Dict[tuple, tuple] = {}  # (path, sheet, header_row) -> (col_idx, rows)
+    try:
+        for prof in audit_map.get("profiles", []):
+            tech = prof.get("tech", "")
+            path = cdd_paths.get(tech)
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                items += _read_profile(path, node_l, prof, log,
+                                       sheet_cache, wbcache)
+            except Exception as exc:
+                log(f"[audit] profile '{prof.get('name')}' failed: {exc}")
+    finally:
+        for wb in wbcache.values():
+            try:
+                wb.close()
+            except Exception:
+                pass
     return items
 
 
-def _build_cell_map(wb, expand: dict, log) -> Dict[tuple, List[str]]:
+def _get_sheet(path, sheet, header_row, sheet_cache, wbcache):
+    """Return (col_idx, data_rows) for a sheet, reading it at most once."""
+    key = (path, sheet, header_row)
+    if key in sheet_cache:
+        return sheet_cache[key]
+    wb = wbcache.get(path)
+    if wb is None:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        wbcache[path] = wb
+    if sheet not in wb.sheetnames:
+        sheet_cache[key] = (None, None)
+        return sheet_cache[key]
+    rows = list(wb[sheet].iter_rows(min_row=header_row, values_only=True))
+    if not rows:
+        sheet_cache[key] = ({}, [])
+        return sheet_cache[key]
+    col_idx: Dict[str, int] = {}
+    for i, h in enumerate(rows[0]):
+        name = str(h).strip() if h is not None else ""
+        if name and name not in col_idx:
+            col_idx[name] = i
+    sheet_cache[key] = (col_idx, rows[1:])
+    return sheet_cache[key]
+
+
+def _build_cell_map(expand, sheet_cache, wbcache, log) -> Dict[tuple, List[str]]:
     """Map (eNodeBName, Freq Band) → [CellName,...] from a pairing sheet, so a
     relation row keyed by band (e.g. EUTRANCell='L18') can be expanded to every
     real cell of that band on the node."""
     sh = expand["sheet"]
     hr = int(expand.get("header_row", 1))
-    if sh not in wb.sheetnames:
+    idx, data = _get_sheet(expand.get("_path"), sh, hr, sheet_cache, wbcache)
+    if idx is None:
         log(f"[audit] cell_expand sheet '{sh}' not found — relation not expanded")
         return {}
-    ws = wb[sh]
-    hdr = next(ws.iter_rows(min_row=hr, max_row=hr, values_only=True))
-    idx: Dict[str, int] = {}
-    for i, h in enumerate(hdr):
-        name = str(h).strip() if h is not None else ""
-        if name and name not in idx:
-            idx[name] = i
     try:
         ei, bi, ci = (idx[expand["enb_column"]], idx[expand["band_column"]],
                       idx[expand["cell_column"]])
@@ -131,7 +164,7 @@ def _build_cell_map(wb, expand: dict, log) -> Dict[tuple, List[str]]:
         log(f"[audit] cell_expand column {k} missing in '{sh}' — not expanded")
         return {}
     cmap: Dict[tuple, List[str]] = {}
-    for row in ws.iter_rows(min_row=hr + 1, values_only=True):
+    for row in data:
         if max(ei, bi, ci) >= len(row):
             continue
         enb, band, cell = row[ei], row[bi], row[ci]
@@ -141,37 +174,35 @@ def _build_cell_map(wb, expand: dict, log) -> Dict[tuple, List[str]]:
     return cmap
 
 
-def _read_profile(path: str, node_l: str, prof: dict, log) -> List[AuditItem]:
+def _read_profile(path: str, node_l: str, prof: dict, log,
+                  sheet_cache, wbcache) -> List[AuditItem]:
     sheet = prof["sheet"]
     header_row = int(prof.get("header_row", 1))
     node_key = prof["node_key_column"]
+    # How the CDD node-key column relates to the audited node name:
+    #  * default: the CDD value IS (or is a prefix of) the full node name
+    #    (eNodeBName/gNBName style).
+    #  * "prefix_of_node": the CDD value is the site/PLA ID (e.g. MIN2782) — a
+    #    prefix of the node name (MIN2782_ROCA…B03), as in the LLD workbook.
+    node_key_match = prof.get("node_key_match", "")
     default_mo = prof.get("mo_fdn", "")
     columns = prof["columns"]
     category = prof.get("category", "")
     tech = prof.get("tech", "")
     expand = prof.get("cell_expand")   # optional band→cell expansion
 
-    wb = load_workbook(path, read_only=True, data_only=True)
-    if sheet not in wb.sheetnames:
-        wb.close()
+    col_idx, data = _get_sheet(path, sheet, header_row, sheet_cache, wbcache)
+    if col_idx is None:
         log(f"[audit] sheet '{sheet}' not in {os.path.basename(path)} — skipped")
         return []
-    ws = wb[sheet]
-
-    # header name -> column index (first occurrence wins)
-    hdr_row = next(ws.iter_rows(min_row=header_row, max_row=header_row,
-                                values_only=True))
-    col_idx: Dict[str, int] = {}
-    for i, h in enumerate(hdr_row):
-        name = str(h).strip() if h is not None else ""
-        if name and name not in col_idx:
-            col_idx[name] = i
     if node_key not in col_idx:
-        wb.close()
         log(f"[audit] node_key '{node_key}' not in sheet '{sheet}' — skipped")
         return []
 
-    cell_map = _build_cell_map(wb, expand, log) if expand else {}
+    if expand:
+        expand = dict(expand)
+        expand["_path"] = path        # cell_expand reads a sheet in the same file
+    cell_map = _build_cell_map(expand, sheet_cache, wbcache, log) if expand else {}
     band_col = expand.get("row_band_column") if expand else None
 
     # Optional: pick the cell MO class from the Freq Band (TDD vs FDD). The
@@ -183,14 +214,19 @@ def _read_profile(path: str, node_l: str, prof: dict, log) -> List[AuditItem]:
 
     items: List[AuditItem] = []
     nk = col_idx[node_key]
-    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+    for row in data:
         if nk >= len(row):
             continue
         keyval = _norm(row[nk])
         if not keyval:
             continue
         # Row belongs to the audited node?
-        if not (keyval == node_l or keyval.startswith(node_l)):
+        if node_key_match == "prefix_of_node":
+            # CDD key is the site/PLA ID; match when the node name starts with
+            # it at a segment boundary (MIN2782 → MIN2782_…, not MIN27820…).
+            if not (keyval == node_l or node_l.startswith(keyval + "_")):
+                continue
+        elif not (keyval == node_l or keyval.startswith(node_l)):
             continue
         rowdict = {name: (row[i] if i < len(row) else "")
                    for name, i in col_idx.items()}
@@ -254,5 +290,4 @@ def _read_profile(path: str, node_l: str, prof: dict, log) -> List[AuditItem]:
                     via_ref=col.get("via_ref", ""),
                     attr_format=col.get("attr_format", ""),
                     node=node_val))
-    wb.close()
     return items
