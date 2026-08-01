@@ -27,6 +27,7 @@ self-contained executable built with [Flet](https://flet.dev) (UI) +
 - [Building the executable](#building-the-executable)
 - [Configuration files](#configuration-files)
 - [Versioning](#versioning)
+- [Publishing a release](#publishing-a-release)
 - [License](#license)
 
 ---
@@ -208,6 +209,22 @@ The version is defined once in [`src/version.py`](src/version.py) and read
 everywhere (window title, in-app label, and the exe's Windows file metadata via
 `NodeCraft.spec`). Bump it and add a [CHANGELOG.md](CHANGELOG.md) entry on every
 release: **PATCH** = fixes, **MINOR** = new feature, **MAJOR** = breaking change.
+
+## Publishing a release
+
+Every official build is published at the canonical
+[GitHub Releases page](https://github.com/awisbay/trfs-automation-desktop/releases).
+After the version and changelog are committed to `main`, push a matching tag:
+
+```bash
+git tag v1.7.1
+git push origin v1.7.1
+```
+
+The tag must match `src/version.py`. GitHub Actions then runs the tests, builds
+the Windows executable, and creates the GitHub Release with
+`NodeCraft-<version>-windows.exe`. A release is not complete until the workflow
+succeeds and that file is visible on the GitHub Releases page.
 
 ---
 
