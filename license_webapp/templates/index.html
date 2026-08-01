@@ -74,6 +74,12 @@
   td.key { font-family: "Consolas", monospace; font-size: 11px; color: var(--accent);
            word-break: break-all; max-width: 380px; }
   td.err { color: var(--error); font-size: 12px; }
+  .feature-grid { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 6px 0 4px; }
+  .feature-grid .feat { display: flex; align-items: center; gap: 6px; font-size: 13px;
+                        color: var(--text); cursor: pointer; }
+  .feature-grid .feat input { width: auto; margin: 0; cursor: pointer; }
+  code { background: var(--bg-bottom); padding: 1px 5px; border-radius: 4px;
+         font-family: "Consolas", monospace; font-size: 12px; }
   .upload-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .muted { color: var(--text-muted); font-size: 13px; }
   a { color: var(--accent); text-decoration: none; }
@@ -117,6 +123,16 @@
         <input type="text" id="s-note" placeholder="Q1 batch">
       </div>
     </div>
+    <div class="field">
+      <label>Features (which modules this key unlocks)</label>
+      <div class="feature-grid">
+        <label class="feat"><input type="checkbox" class="s-feat" value="integration" checked> Integration</label>
+        <label class="feat"><input type="checkbox" class="s-feat" value="terminal" checked> Terminal</label>
+        <label class="feat"><input type="checkbox" class="s-feat" value="audit" checked> CDD Audit</label>
+        <label class="feat"><input type="checkbox" class="s-feat" value="trfs" checked> TRFS</label>
+      </div>
+      <span class="muted">Leave all checked for a full license. Uncheck to restrict this key.</span>
+    </div>
     <button class="btn btn-primary" onclick="genSingle()">Generate License</button>
     <div id="s-result"></div>
   </div>
@@ -126,7 +142,7 @@
     <div class="upload-row">
       <input type="file" id="b-file" accept=".xlsx,.csv,.xlsm">
       <button class="btn btn-primary" onclick="genBulk()">Upload & Generate</button>
-      <span class="muted">Template columns: <b>Name, Hostname, Expires, Note</b></span>
+      <span class="muted">Template columns: <b>Name, Hostname, Expires, Note, Features</b> — Features accepts <code>all</code>, blank, or a list like <code>integration, audit</code>.</span>
       <a href="/template.xlsx" class="btn btn-secondary" style="text-decoration:none;">Download Template</a>
     </div>
     <div id="b-result"></div>
@@ -152,6 +168,13 @@ async function genSingle() {
   fd.append('hostname', document.getElementById('s-hostname').value);
   fd.append('expires', document.getElementById('s-expires').value);
   fd.append('note', document.getElementById('s-note').value);
+  const feats = document.querySelectorAll('.s-feat:checked');
+  if (feats.length === 0) {
+    document.getElementById('s-result').innerHTML =
+      '<div class="error">Select at least one feature.</div>';
+    return;
+  }
+  feats.forEach(cb => fd.append('features', cb.value));
   const box = document.getElementById('s-result');
   box.innerHTML = '<div class="muted">Generating...</div>';
   const res = await fetch('/generate_single', { method: 'POST', body: fd });
@@ -164,12 +187,13 @@ async function genSingle() {
         <div class="k">Hostname</div><div>${escapeHtml(j.hostname)}</div>
         <div class="k">Expires</div><div>${escapeHtml(j.expires)}</div>
         <div class="k">Note</div><div>${escapeHtml(j.note || '—')}</div>
+        <div class="k">Features</div><div>${escapeHtml(j.features || '—')}</div>
       </div>
       <div class="key-box" id="single-key">${escapeHtml(j.key)}</div>
       <button class="copy-btn" onclick="copyText('single-key', this)">Copy Key</button>
       <button class="copy-btn" onclick="downloadSingle()">Download Excel</button>
     </div>`;
-  lastResults = [{ name: j.name, hostname: j.hostname, expires: j.expires, note: j.note, key: j.key, error: '' }];
+  lastResults = [{ name: j.name, hostname: j.hostname, expires: j.expires, note: j.note, features: j.features, key: j.key, error: '' }];
 }
 
 async function genBulk() {
@@ -186,13 +210,14 @@ async function genBulk() {
   const bad = j.results.length - ok;
   let html = `<div class="success" style="margin-top:14px;">Generated ${ok} / ${j.results.length} licenses${bad ? ` (${bad} errors)` : ''}.</div>`;
   html += `<button class="btn btn-primary" style="margin-top:12px;" onclick="downloadAll()">Download All as Excel</button>`;
-  html += '<table><thead><tr><th>#</th><th>Name</th><th>Hostname</th><th>Expires</th><th>Key / Error</th></tr></thead><tbody>';
+  html += '<table><thead><tr><th>#</th><th>Name</th><th>Hostname</th><th>Expires</th><th>Features</th><th>Key / Error</th></tr></thead><tbody>';
   j.results.forEach(r => {
     html += `<tr>
       <td>${r.row}</td>
       <td>${escapeHtml(r.name)}</td>
       <td>${escapeHtml(r.hostname || '—')}</td>
       <td>${escapeHtml(r.expires)}</td>
+      <td>${escapeHtml(r.features || '—')}</td>
       <td class="${r.error ? 'err' : 'key'}">${escapeHtml(r.error || r.key)}</td>
     </tr>`;
   });

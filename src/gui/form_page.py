@@ -9,7 +9,14 @@ import flet as ft
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from command_parser import parse_commands_file
-from license_manager import get_license_info
+from license_manager import (
+    FEATURE_AUDIT,
+    FEATURE_INTEGRATION,
+    FEATURE_TERMINAL,
+    FEATURE_TRFS,
+    get_enabled_features,
+    get_license_info,
+)
 
 
 def _get_license_user() -> str:
@@ -54,7 +61,20 @@ from gui.theme import (
 class FormPage:
     def __init__(self, page: ft.Page):
         self.page = page
+        # Which features the current license unlocks. Legacy licenses
+        # (no "features" field) return the full set, so existing keys
+        # keep working exactly as before.
+        try:
+            self._features = get_enabled_features(get_license_info())
+        except Exception:
+            self._features = set()
         self._try_load_defaults()
+
+    def _feature_locked_tooltip(self, label: str) -> str:
+        return (
+            f"{label} is not included in your license.\n"
+            "Contact your administrator to enable this feature."
+        )
 
     def _try_load_defaults(self):
         self.defaults = {
@@ -459,6 +479,12 @@ class FormPage:
                             ft.ElevatedButton(
                                 "Integration Launch",
                                 icon=ft.Icons.INTEGRATION_INSTRUCTIONS,
+                                disabled=FEATURE_INTEGRATION not in self._features,
+                                tooltip=(
+                                    None
+                                    if FEATURE_INTEGRATION in self._features
+                                    else self._feature_locked_tooltip("Integration")
+                                ),
                                 style=ft.ButtonStyle(
                                     bgcolor=ACCENT_WARM,
                                     color="#06242A",
@@ -472,7 +498,12 @@ class FormPage:
                             ft.OutlinedButton(
                                 "Terminal",
                                 icon=ft.Icons.TERMINAL,
-                                tooltip="Open interactive SSH terminal (multi-tab)",
+                                disabled=FEATURE_TERMINAL not in self._features,
+                                tooltip=(
+                                    "Open interactive SSH terminal (multi-tab)"
+                                    if FEATURE_TERMINAL in self._features
+                                    else self._feature_locked_tooltip("Terminal")
+                                ),
                                 style=ft.ButtonStyle(
                                     color=ACCENT,
                                     side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
@@ -486,7 +517,12 @@ class FormPage:
                             ft.OutlinedButton(
                                 "CDD Audit",
                                 icon=ft.Icons.FACT_CHECK,
-                                tooltip="Compare node dump (modump/cmdump) against CDD",
+                                disabled=FEATURE_AUDIT not in self._features,
+                                tooltip=(
+                                    "Compare node dump (modump/cmdump) against CDD"
+                                    if FEATURE_AUDIT in self._features
+                                    else self._feature_locked_tooltip("CDD Audit")
+                                ),
                                 style=ft.ButtonStyle(
                                     color=ACCENT_WARM,
                                     side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT_WARM)),
@@ -1001,6 +1037,9 @@ class FormPage:
         self.page.update()
 
     def _on_start(self, e):
+        if FEATURE_TRFS not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("TRFS"))
+            return
         f = self._collect_form()
 
         errors = []
@@ -1053,6 +1092,9 @@ class FormPage:
         self.page.go("/progress")
 
     def _on_terminal(self, e):
+        if FEATURE_TERMINAL not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("Terminal"))
+            return
         # Open the multi-tab SSH terminal. Pre-fills the first tab with
         # the SSH credentials currently in the form (so the operator
         # gets a connected session to the gateway in one click).
@@ -1072,12 +1114,18 @@ class FormPage:
         self.page.go("/terminal")
 
     def _on_audit(self, e):
+        if FEATURE_AUDIT not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("CDD Audit"))
+            return
         # Standalone CDD audit — no field validation required. Hand off the
         # form so the audit page can prefill Site ID + Node Name.
         self.page.integration_form = self._collect_form()
         self.page.go("/audit")
 
     def _on_integration(self, e):
+        if FEATURE_INTEGRATION not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("Integration"))
+            return
         f = self._collect_form()
 
         errors = []

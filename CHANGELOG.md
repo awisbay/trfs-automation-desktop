@@ -4,6 +4,27 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.5.0] — 2026-08-01
+
+### Added
+- **Per-feature licensing.** A single license key can now unlock any subset of
+  the four modules — **Integration**, **Terminal**, **CDD Audit**, and **TRFS** —
+  instead of granting everything. The enabled modules are stored in a new
+  `features` field inside the signed payload, so they cannot be tampered with.
+  - `license_manager.py`: new `ALL_FEATURES`, `get_enabled_features(payload)`
+    and `has_feature(payload, feature)` helpers. **Backward compatible** — keys
+    issued before this change (no `features` field) still unlock everything, and
+    `features: "all"`/`"*"` is treated as a full license.
+  - `gui/form_page.py`: the Integration, Terminal, CDD Audit and TRFS buttons
+    are disabled (with an explanatory tooltip) when the active license does not
+    include that feature; the click handlers also guard against it.
+  - **License generator web app**: the single-key form gained per-feature
+    checkboxes, and the bulk template gained an optional **Features** column
+    (accepts `all`, blank, or a list like `integration, audit`). Keys are now
+    signed directly in the web app so the feature list is embedded without
+    touching the private keygen module. Generated Excel/results now show a
+    **Features** column.
+
 ## [1.4.0] — 2026-07-30
 
 ### Added

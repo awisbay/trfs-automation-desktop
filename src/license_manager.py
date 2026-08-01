@@ -18,6 +18,63 @@ _PUBLIC_KEY_B64 = "2Nz/qcut2Ro3W0BFe3ErZ6HivtAqmwEzWPozavPJCxA="
 
 LICENSE_FILE = "license.key"
 
+# ── Per-feature licensing ────────────────────────────────────────
+# Canonical feature keys. A license may enable any subset of these.
+# The values here MUST match what the license generator writes into
+# the "features" field of the payload and what the GUI checks with
+# ``has_feature`` below.
+FEATURE_INTEGRATION = "integration"
+FEATURE_TERMINAL = "terminal"
+FEATURE_AUDIT = "audit"
+FEATURE_TRFS = "trfs"
+
+ALL_FEATURES = [
+    FEATURE_INTEGRATION,
+    FEATURE_TERMINAL,
+    FEATURE_AUDIT,
+    FEATURE_TRFS,
+]
+
+# Human-friendly labels (used for messages / admin UI).
+FEATURE_LABELS = {
+    FEATURE_INTEGRATION: "Integration",
+    FEATURE_TERMINAL: "Terminal",
+    FEATURE_AUDIT: "CDD Audit",
+    FEATURE_TRFS: "TRFS",
+}
+
+
+def get_enabled_features(payload: dict | None) -> set:
+    """Return the set of feature keys enabled by a license payload.
+
+    Backward compatibility: a license WITHOUT a ``features`` field
+    (older keys, issued before per-feature licensing) grants *all*
+    features. A license with ``features`` set to ``"*"`` or ``"all"``
+    also grants everything. Otherwise only the listed features are
+    enabled.
+    """
+    if not payload:
+        return set()
+
+    feats = payload.get("features")
+
+    # Legacy license → full access.
+    if feats is None:
+        return set(ALL_FEATURES)
+
+    # Wildcard string.
+    if isinstance(feats, str):
+        if feats.strip().lower() in ("*", "all"):
+            return set(ALL_FEATURES)
+        feats = [f for f in feats.replace(";", ",").split(",")]
+
+    return {str(f).strip().lower() for f in feats if str(f).strip()}
+
+
+def has_feature(payload: dict | None, feature: str) -> bool:
+    """True if the given feature key is enabled by the license payload."""
+    return feature.strip().lower() in get_enabled_features(payload)
+
 
 def get_hostname() -> str:
     """Return the current PC hostname (normalized: lowercase, stripped)."""
