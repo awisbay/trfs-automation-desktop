@@ -57,13 +57,19 @@ from cutover_model import (
     RunPhase,
 )
 from cutover_parsers import (
+    diff_alarms,
     looks_like_unknown_command,
     match_row,
     parse_alarm_summary,
+    parse_barred_state,
     parse_cells_from_hgetc,
+    parse_radio_status,
     parse_st_cell_rows,
+    parse_stzrc,
     parse_ue_counts,
+    st_rows_from_stzrc,
     strip_ansi,
+    ue_for_cell,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +106,9 @@ _DEFAULTS = {
     "stop_on_group_failure": False,
     "unlock": {
         "command_template": "ldeb {mo_type}={cell_dn}",
+        "lock_command_template": "bl {mo_type}={cell_dn}",
+        "graceful_lock": False,
+        "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
         "expects_confirm": True,
         "confirm_answer": "y",
         "command_timeout_s": 120,
@@ -109,7 +118,23 @@ _DEFAULTS = {
         "error_patterns": ["ERROR", "Unable to", "not found", "No MOs",
                            "Syntax error", "failed"],
     },
+    "prestate": {
+        "enabled": True,
+        "skip_already_in_service": True,
+    },
+    "diagnosis": {
+        "enabled": True,
+        "radio_status_template": "st B{band_number}",
+        "barred_command_template": "hget {mo_type}={cell_dn} cellBarred|cellReservedForOperatorUse",
+        "command_timeout_s": 60,
+        "check_barred_before_traffic": True,
+    },
+    "endc": {
+        "warn_nr_without_anchor": True,
+        "lte_before_nr": True,
+    },
     "enable_poll": {
+        "source": "stzrc",
         "commands": ["st cell"],
         "command_timeout_s": 90,
         "interval_s": 15,
@@ -134,6 +159,7 @@ _DEFAULTS = {
                             "connectedUsers", "RrcConnected"],
         "ue_regex": "",
         "ue_threshold": 1,
+        "required_consecutive_samples": 2,
         "use_peak": True,
         "on_parse_failure": "manual_confirm",
         "unknown_command_patterns": ["Unknown command", "Syntax error",
@@ -142,6 +168,7 @@ _DEFAULTS = {
     "alarm": {
         "command": "alt",
         "command_timeout_s": 120,
+        "baseline_before_unlock": True,
         "no_alarm_patterns": ["No Active alarms"],
     },
     "report": {
@@ -323,8 +350,37 @@ def run_cutover_unlock(ssh, node_name: str, cells: list,
 
 def run_cutover_st_cell(ssh, node_name: str, log_cb: Callable[[str], None],
                         cfg: dict, wait_for_user=None) -> tuple:
-    """Run the status command(s). Returns (ok, output, rows)."""
+    """Run the status command(s). Returns (ok, output, rows).
+
+    ``enable_poll.source`` selects where cell state comes from:
+
+    * ``stzrc`` (default) — reuse the traffic command, whose LTECell/NRCell
+      tables already carry an ``S`` state column. One command instead of two,
+      which halves the polling load on a node that is busy mid-cutover.
+    * ``st`` — run ``enable_poll.commands`` and parse them.
+    """
     poll = cfg["enable_poll"]
+
+    if poll.get("source", "stzrc") == "stzrc":
+        traffic = cfg["traffic"]
+        command = traffic["command"].format(node=node_name)
+        out = ssh.run_amos_command_safe(
+            command, node_name, timeout=traffic["command_timeout_s"])
+        bad = looks_like_unknown_command(
+            out, tuple(traffic.get("unknown_command_patterns", [])))
+        if bad:
+            log_cb(f"[{node_name}] ✗ {command!r} was rejected by moshell "
+                   f"(matched {bad!r}).")
+            return False, out, []
+        stz = parse_stzrc(out)
+        if stz.ok:
+            for table, (total, up) in sorted(stz.totals.items()):
+                log_cb(f"[{node_name}] {table}: {up}/{total} cell(s) up")
+            return True, out, st_rows_from_stzrc(stz)
+        # Not stzrc-shaped after all — fall through to the st commands.
+        log_cb(f"[{node_name}] {command!r} output had no cell table; "
+               f"falling back to the status command(s).")
+
     commands = poll.get("commands") or ["st cell"]
     if isinstance(commands, str):
         commands = [commands]
@@ -341,6 +397,142 @@ def run_cutover_st_cell(ssh, node_name: str, log_cb: Callable[[str], None],
             row_regex=poll.get("row_regex", ""),
         ))
     return bool(rows), out_all, rows
+
+
+def run_cutover_prestate(ssh, node_name: str, cells: list,
+                         log_cb: Callable[[str], None], cfg: dict,
+                         wait_for_user=None) -> tuple:
+    """Snapshot cell state **before** anything is sent. Returns (ok, output).
+
+    This is what makes rollback safe. A cell that is already UNLOCKED+ENABLED
+    when the run starts may be carrying live customers — it is not ours to
+    unlock, and above all not ours to re-lock later.
+    """
+    ok, out, rows = run_cutover_st_cell(ssh, node_name, log_cb, cfg)
+    if not ok:
+        log_cb(f"[{node_name}] could not read pre-state — every cell will be "
+               f"treated as not-previously-unlocked.")
+        return False, out
+
+    mode = cfg["enable_poll"].get("match_mode", "suffix")
+    already = 0
+    for row in rows:
+        cell = match_row(cells, node_name, row, mode=mode)
+        if cell is None:
+            continue
+        cell.admin_state = row.admin_state
+        cell.op_state = row.op_state
+        if row.admin_state.upper() == "UNLOCKED":
+            cell.was_unlocked_before = True
+            if row.op_state.upper() == "ENABLED":
+                cell.already_in_service = True
+                already += 1
+
+    if already:
+        log_cb(f"[{node_name}] {already} cell(s) were already in service before "
+               f"this run — they will not be unlocked, and rollback will not "
+               f"touch them.")
+    return True, out
+
+
+def run_cutover_relock(ssh, node_name: str, cells: list,
+                       log_cb: Callable[[str], None], cfg: dict,
+                       wait_for_user=None, dry_run: bool = False,
+                       cancel_event: Optional[threading.Event] = None,
+                       on_cell=None) -> tuple:
+    """Roll back: lock the cells **this session** unlocked. Returns (ok, output).
+
+    The caller is responsible for passing only relockable cells; this function
+    additionally refuses any cell that fails the check, because getting this
+    wrong takes a live cell out of service.
+    """
+    unlock = cfg["unlock"]
+    template = (unlock.get("graceful_lock_template")
+                if unlock.get("graceful_lock")
+                else unlock.get("lock_command_template", "bl {mo_type}={cell_dn}"))
+    combined = ""
+    any_ok = False
+
+    for cell in cells:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if not cell.is_relockable:
+            log_cb(f"[{node_name}] refusing to re-lock {cell.mo_ref} — it was "
+                   f"not unlocked by this run.")
+            continue
+
+        command = template.format(
+            mo_type=cell.mo_type, cell_dn=cell.cell_dn,
+            mo_ref=cell.mo_ref, node=node_name)
+
+        if dry_run:
+            log_cb(f"[{node_name}] DRY RUN — would send: {command}")
+            combined += f"[DRY RUN] {command}\n"
+            any_ok = True
+            if on_cell:
+                on_cell(cell, True, "[dry run]", "")
+            continue
+
+        log_cb(f"[{node_name}] {command}")
+        try:
+            if unlock.get("expects_confirm"):
+                out = ssh.run_amos_set_with_confirm(
+                    command, node_name, answer=unlock.get("confirm_answer", "y"),
+                    timeout=unlock["command_timeout_s"])
+            else:
+                out = ssh.run_amos_command_safe(
+                    command, node_name, timeout=unlock["command_timeout_s"])
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            log_cb(f"[{node_name}] ✗ re-lock {cell.mo_ref}: {msg}")
+            if on_cell:
+                on_cell(cell, False, "", msg)
+            continue
+
+        combined += out + "\n"
+        any_ok = True
+        if on_cell:
+            on_cell(cell, True, out, "")
+        delay = unlock.get("inter_command_delay_s") or 0
+        if delay:
+            time.sleep(delay)
+
+    return any_ok, combined
+
+
+def run_cutover_radio_status(ssh, node_name: str, band_number: int,
+                             log_cb: Callable[[str], None], cfg: dict,
+                             wait_for_user=None) -> tuple:
+    """Check the band's radio via ``st B<band>``. Returns (ok, output, summary).
+
+    A cell reporting DEPENDENCY_LOCKED is almost always waiting on its radio /
+    Carrier rather than on itself, so this turns a silent 15-minute timeout
+    into an actionable message.
+    """
+    diag = cfg["diagnosis"]
+    command = diag["radio_status_template"].format(
+        band_number=band_number, node=node_name)
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=diag["command_timeout_s"])
+    return True, out, parse_radio_status(out)
+
+
+def run_cutover_barred_check(ssh, node_name: str, cell,
+                             log_cb: Callable[[str], None], cfg: dict,
+                             wait_for_user=None) -> tuple:
+    """Read the cell's barring state. Returns (ok, output, barred|None).
+
+    A barred cell can be UNLOCKED and ENABLED and still never attract a UE, so
+    checking this before the traffic wait avoids burning the whole timeout on a
+    cell that was never going to report traffic.
+    """
+    diag = cfg["diagnosis"]
+    command = diag["barred_command_template"].format(
+        mo_type=cell.mo_type, cell_dn=cell.cell_dn,
+        mo_ref=cell.mo_ref, node=node_name)
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=diag["command_timeout_s"])
+    return True, out, parse_barred_state(out)
 
 
 def run_cutover_traffic(ssh, node_name: str, log_cb: Callable[[str], None],
@@ -503,6 +695,15 @@ class CutoverEngine:
         self._spawn(lambda: self._grouped_action(list(self.cfg["group_order"])),
                     "cutover-all")
 
+    def relock_group(self, group: str) -> None:
+        """Roll back one group — only cells this session unlocked."""
+        self._spawn(lambda: self._relock_action([group]), f"cutover-relock-{group}")
+
+    def relock_all(self) -> None:
+        """Roll back everything this session unlocked, highest band first."""
+        order = list(reversed(list(self.cfg["group_order"])))
+        self._spawn(lambda: self._relock_action(order), "cutover-relock-all")
+
     def run_final_verification(self) -> None:
         self._spawn(self._final_verify_worker, "cutover-verify")
 
@@ -660,11 +861,50 @@ class CutoverEngine:
                     c.status_detail = "band not mapped to a group"
             run.touch()
 
+        # Pre-state, BEFORE anything is sent. This is what lets rollback be
+        # safe later: cells already in service are not ours to unlock, and
+        # above all not ours to re-lock.
+        if self.cfg.get("prestate", {}).get("enabled", True):
+            for node_name, sess in run.sessions.items():
+                if run.is_cancelled():
+                    break
+                try:
+                    run_cutover_prestate(sess.ssh, node_name, run.cells,
+                                         self.log, self.cfg)
+                except Exception as exc:
+                    self.log(f"[{node_name}] pre-state check failed: "
+                             f"{type(exc).__name__}: {exc}")
+            with run.lock:
+                for c in run.cells:
+                    if c.already_in_service:
+                        c.status = CellStatus.ALREADY_IN_SERVICE
+                        c.status_detail = "already in service — not touched"
+                run.touch()
+
+        # Alarm baseline, so the evidence can distinguish alarms this cut over
+        # caused from ones the site already had.
+        if self.cfg["alarm"].get("baseline_before_unlock", True):
+            for node_name, sess in run.sessions.items():
+                if run.is_cancelled():
+                    break
+                try:
+                    _ok, out, total = run_cutover_alarms(
+                        sess.ssh, node_name, self.log, self.cfg)
+                    run.alarm_baseline[node_name] = out
+                    self.log(f"[{node_name}] alarm baseline: {total} active "
+                             f"before cut over.")
+                except Exception as exc:
+                    self.log(f"[{node_name}] alarm baseline failed: "
+                             f"{type(exc).__name__}: {exc}")
+
         unmapped = len(run.cells_of(UNMAPPED))
+        in_service = sum(1 for c in run.cells if c.already_in_service)
         msg = f"Discovered {len(all_cells)} cell(s) across {len(run.sessions)} node(s)."
         if unmapped:
             msg += (f" {unmapped} in an unmapped band — shown but never "
                     f"unlocked; add the band to cutover.band_groups to include it.")
+        if in_service:
+            msg += f" {in_service} already in service."
         self.log(msg)
         run.set_phase(RunPhase.READY)
         self.emit(CutoverEvent(kind="discovery_done", message=msg))
@@ -681,6 +921,8 @@ class CutoverEngine:
         if not targets:
             self.log("No unlockable cells in the selected group(s).")
             return
+
+        self._check_endc_anchor(targets)
 
         # One confirmation covering everything this click will do.
         if self.cfg.get("require_confirmation") and self._confirm_cb:
@@ -713,6 +955,116 @@ class CutoverEngine:
         run.set_phase(RunPhase.CANCELLED if run.is_cancelled() else RunPhase.READY,
                       active_group="")
 
+    def _check_endc_anchor(self, groups: list) -> None:
+        """Warn when NR cells are about to be unlocked with no LTE anchor up.
+
+        NR needs its LTE anchor in service. LB/MB/HB cuts across RAT — an
+        NR2600 cell sits in HB while its L1800 anchor sits in MB — so unlocking
+        a high group first can produce NR cells that can never take traffic,
+        for a reason that is purely ordering and looks like a fault.
+        """
+        endc = self.cfg.get("endc", {})
+        if not endc.get("warn_nr_without_anchor", True):
+            return
+        run = self.run
+
+        nr_pending = [c for g in groups for c in run.unlockable_cells_of(g)
+                      if c.rat == "NR"]
+        if not nr_pending:
+            return
+        lte_up = [c for c in run.cells
+                  if c.rat == "LTE"
+                  and (c.already_in_service
+                       or c.status in (CellStatus.ENABLED, CellStatus.TRAFFIC_OK,
+                                       CellStatus.WAITING_TRAFFIC))]
+        if lte_up:
+            return
+        lte_total = sum(1 for c in run.cells if c.rat == "LTE")
+        if not lte_total:
+            return
+        self.log(
+            f"⚠ {len(nr_pending)} NR cell(s) are about to be unlocked but no "
+            f"LTE cell is in service yet. NR needs its LTE anchor up — these "
+            f"cells will likely show 0 UEs until an LTE group is unlocked.")
+        self.emit(CutoverEvent(
+            kind="diagnostic",
+            message=(f"{len(nr_pending)} NR cell(s) are being unlocked while no "
+                     f"LTE anchor is in service.\n\nNR traffic depends on the "
+                     f"LTE anchor, so these cells will probably report 0 UEs. "
+                     f"Consider unlocking the LTE band group first.")))
+
+    def _relock_action(self, groups: list) -> None:
+        run = self.run
+        run.cancel_event.clear()
+
+        targets = [(g, run.relockable_cells_of(g)) for g in groups]
+        targets = [(g, cells) for g, cells in targets if cells]
+        if not targets:
+            self.log("Nothing to roll back — no cell in these group(s) was "
+                     "unlocked by this run.")
+            return
+
+        all_cells = [c for _g, cells in targets for c in cells]
+        unlock = self.cfg["unlock"]
+        template = (unlock.get("graceful_lock_template")
+                    if unlock.get("graceful_lock")
+                    else unlock.get("lock_command_template"))
+
+        if self.cfg.get("require_confirmation") and self._confirm_cb:
+            lines = [
+                template.format(mo_type=c.mo_type, cell_dn=c.cell_dn,
+                                mo_ref=c.mo_ref, node=c.node_name)
+                + f"    ({c.node_name}, {c.band_key})"
+                for c in all_cells
+            ]
+            label = "ROLL BACK " + ", ".join(g for g, _ in targets)
+            if not self._confirm_cb(label, lines):
+                self.log("Rollback cancelled — nothing was sent.")
+                return
+
+        run.set_phase(RunPhase.UNLOCKING)
+        dry = bool(self.cfg.get("dry_run"))
+        self.log(f"── Rolling back {len(all_cells)} cell(s) ──")
+
+        for group, cells in targets:
+            by_node: dict = {}
+            for c in cells:
+                by_node.setdefault(c.node_name, []).append(c)
+
+            def _worker(node_name: str, node_cells: list):
+                sess = run.sessions.get(node_name)
+                if sess is None:
+                    return
+
+                def _on_cell(cell, ok, out, err):
+                    if ok:
+                        run.set_cell(cell, CellStatus.RELOCKED,
+                                     status_detail="re-locked",
+                                     admin_state="LOCKED", ue_count=None)
+                    else:
+                        run.set_cell(cell, CellStatus.ERROR,
+                                     status_detail=(err or "re-lock failed")[:60],
+                                     last_error=err or "")
+
+                try:
+                    run_cutover_relock(
+                        sess.ssh, node_name, node_cells, self.log, self.cfg,
+                        dry_run=dry, cancel_event=run.cancel_event,
+                        on_cell=_on_cell)
+                except Exception as exc:
+                    self.log(f"[{node_name}] ✗ rollback failed: "
+                             f"{type(exc).__name__}: {exc}")
+
+            self._run_per_node(by_node, _worker)
+            done = sum(1 for c in cells if c.status == CellStatus.RELOCKED)
+            run.set_group(group, GroupStatus.CANCELLED,
+                          message=f"rolled back {done}/{len(cells)}")
+            self.log(f"── {group}: rolled back {done}/{len(cells)} cell(s) ──")
+
+        run.set_phase(RunPhase.READY, active_group="")
+        self.emit(CutoverEvent(kind="group_done",
+                               message=f"Rolled back {len(all_cells)} cell(s)."))
+
     def _run_group(self, group: str) -> None:
         run = self.run
         grp = run.groups[group]
@@ -725,6 +1077,12 @@ class CutoverEngine:
         by_node: dict = {}
         for c in cells:
             by_node.setdefault(c.node_name, []).append(c)
+        # LTE before NR within the group — NR cannot take traffic until its
+        # anchor is up, so sending it second costs nothing and avoids a
+        # confusing 0-UE window.
+        if self.cfg.get("endc", {}).get("lte_before_nr", True):
+            for node_cells in by_node.values():
+                node_cells.sort(key=lambda c: 0 if c.rat == "LTE" else 1)
 
         self._start_group_logs(group, by_node.keys())
         try:
@@ -951,6 +1309,10 @@ class CutoverEngine:
                 return True
 
             if time.monotonic() >= deadline or polls >= poll.get("max_polls", 200):
+                # Before reporting a bare timeout, say WHY where we can. The
+                # usual cause is the band's radio still being locked, which no
+                # amount of further waiting on the cell will fix.
+                self._diagnose_stuck(pending)
                 self._mark_remaining(
                     pending, CellStatus.ENABLE_TIMEOUT,
                     f"not enabled after {int(time.monotonic() - started)}s")
@@ -1013,6 +1375,85 @@ class CutoverEngine:
                 run.set_cell(cell, **fields)
         return matched
 
+    def _diagnose_stuck(self, cells: list) -> None:
+        """Explain cells that never enabled, instead of a bare timeout.
+
+        Checks the band's radio (``st B<band>``) once per band. If the radio is
+        itself locked, the cell was never going to come up and the operator
+        needs to unlock the radio — a message worth far more than "timeout".
+        """
+        if not self.cfg.get("diagnosis", {}).get("enabled", True):
+            return
+        run = self.run
+        checked: set = set()
+
+        for cell in cells:
+            if cell.avail_status.upper() == "DEPENDENCY_LOCKED":
+                run.set_cell(cell, dependency_locked=True)
+
+            key = (cell.node_name, cell.band_number)
+            if key in checked or cell.band_number < 0:
+                continue
+            checked.add(key)
+            sess = run.sessions.get(cell.node_name)
+            if sess is None or sess.degraded:
+                continue
+            try:
+                _ok, _out, summary = run_cutover_radio_status(
+                    sess.ssh, cell.node_name, cell.band_number,
+                    self.log, self.cfg)
+            except Exception as exc:
+                self.log(f"[{cell.node_name}] radio check failed: "
+                         f"{type(exc).__name__}: {exc}")
+                continue
+
+            if summary["total"] and (summary["locked"] or summary["disabled"]):
+                msg = (f"[{cell.node_name}] B{cell.band_number} radio is "
+                       f"{summary['locked']} locked / {summary['disabled']} "
+                       f"disabled of {summary['total']} — the cells cannot come "
+                       f"up until the radio is unlocked.")
+                self.log(f"✗ {msg}")
+                self.emit(CutoverEvent(kind="diagnostic", message=msg))
+                for c in cells:
+                    if (c.node_name == cell.node_name
+                            and c.band_number == cell.band_number):
+                        run.set_cell(c, CellStatus.BLOCKED_BY_DEPENDENCY,
+                                     dependency_locked=True,
+                                     status_detail=f"B{c.band_number} radio locked")
+
+    def _check_barred(self, cells: list) -> list:
+        """Drop cells that are barred — they can never attract a UE.
+
+        Returns the cells still worth waiting on. Without this, a barred cell
+        burns the entire traffic timeout and reports nothing about the cause.
+        """
+        diag = self.cfg.get("diagnosis", {})
+        if not diag.get("enabled", True) or not diag.get(
+                "check_barred_before_traffic", True):
+            return cells
+        run = self.run
+        keep = []
+        for cell in cells:
+            sess = run.sessions.get(cell.node_name)
+            if sess is None or sess.degraded:
+                keep.append(cell)
+                continue
+            try:
+                _ok, _out, barred = run_cutover_barred_check(
+                    sess.ssh, cell.node_name, cell, self.log, self.cfg)
+            except Exception:
+                keep.append(cell)
+                continue
+            run.set_cell(cell, cell_barred=barred)
+            if barred is True:
+                self.log(f"✗ [{cell.node_name}] {cell.mo_ref} is BARRED — no UE "
+                         f"can camp on it, so it will never report traffic.")
+                run.set_cell(cell, CellStatus.BARRED,
+                             status_detail="barred — no UE can camp")
+            else:
+                keep.append(cell)
+        return keep
+
     def _mark_remaining(self, cells: list, status: CellStatus, detail: str) -> None:
         for c in cells:
             if c.status not in TERMINAL_FAIL and c.status != CellStatus.TRAFFIC_OK:
@@ -1035,6 +1476,11 @@ class CutoverEngine:
         targets = [c for c in run.cells_of(group) if c.status == CellStatus.ENABLED]
         if not targets:
             return
+        # A barred cell is up but unreachable to UEs — find that out now
+        # rather than after a full timeout.
+        targets = self._check_barred(targets)
+        if not targets:
+            return
         for c in targets:
             run.set_cell(c, CellStatus.WAITING_TRAFFIC, status_detail="waiting for UE…")
 
@@ -1046,6 +1492,7 @@ class CutoverEngine:
 
         threshold = int(traffic.get("ue_threshold", 1))
         use_peak = bool(traffic.get("use_peak", True))
+        need_samples = max(1, int(traffic.get("required_consecutive_samples", 2)))
         started = time.monotonic()
         deadline = started + traffic["timeout_s"]
         run.set_group(group, traffic_deadline=deadline)
@@ -1084,22 +1531,30 @@ class CutoverEngine:
                         self.log(f"[{node_name}] {res.warning}")
                     continue
 
+                match_mode = self.cfg["enable_poll"].get("match_mode", "suffix")
                 for c in targets:
                     if c.node_name != node_name:
                         continue
-                    ue = res.counts.get(c.mo_ref.upper())
+                    ue = ue_for_cell(res.counts, c, mode=match_mode)
                     if ue is None:
                         continue
                     peak = max(c.ue_peak, ue)
-                    fields = {"ue_count": ue, "ue_peak": peak}
                     effective = peak if use_peak else ue
-                    if (effective >= threshold
-                            and c.status == CellStatus.WAITING_TRAFFIC):
+                    # Require N consecutive samples at/above threshold so a
+                    # single transient UE does not end the gate early.
+                    samples = c.traffic_samples + 1 if ue >= threshold else 0
+                    fields = {"ue_count": ue, "ue_peak": peak,
+                              "traffic_samples": samples}
+                    confirmed = (effective >= threshold and samples >= need_samples)
+                    if confirmed and c.status == CellStatus.WAITING_TRAFFIC:
                         run.set_cell(c, CellStatus.TRAFFIC_OK,
                                      status_detail=f"UE {ue}",
                                      t_traffic_ok=time.monotonic(), **fields)
                     else:
-                        run.set_cell(c, status_detail=f"UE {ue}", **fields)
+                        detail = f"UE {ue}"
+                        if ue >= threshold and samples < need_samples:
+                            detail += f" ({samples}/{need_samples} samples)"
+                        run.set_cell(c, status_detail=detail, **fields)
 
             pending = [c for c in targets if c.status == CellStatus.WAITING_TRAFFIC]
             if not pending:
@@ -1189,9 +1644,21 @@ class CutoverEngine:
             return ""
 
         alarm_cmd = self.cfg["alarm"]["command"]
-        alarm_out = "\n\n".join(
-            f"--- {n} ---\n{s.alarm_output}"
-            for n, s in run.sessions.items() if s.alarm_output)
+        # Show the full alarm list, but call out what is NEW since the
+        # baseline — a pre-existing alarm is not evidence about this cut over.
+        parts = []
+        for n, s in run.sessions.items():
+            if not s.alarm_output:
+                continue
+            block = f"--- {n} ---\n{s.alarm_output}"
+            baseline = run.alarm_baseline.get(n)
+            if baseline:
+                new = diff_alarms(baseline, s.alarm_output)
+                block += ("\n--- NEW since cut over started ---\n"
+                          + ("\n".join(new) if new
+                             else "(none — no new alarms)"))
+            parts.append(block)
+        alarm_out = "\n\n".join(parts)
 
         pairs = []
         if grp.traffic_output:

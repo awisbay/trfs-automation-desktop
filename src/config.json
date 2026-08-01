@@ -76,8 +76,11 @@
         "stop_on_group_failure": false,
 
         "unlock": {
-            "_comment": "SPELLING UNCONFIRMED. One MO per command — never a regex that could match a whole node.",
+            "_comment": "One MO per command — never a regex that could match a whole node. NOTE: `deb`/`bl` is the standard moshell deblock/block pair; `ldeb` is kept here because that is what was specified for this environment. Correct either here without a rebuild.",
             "command_template": "ldeb {mo_type}={cell_dn}",
+            "lock_command_template": "bl {mo_type}={cell_dn}",
+            "graceful_lock": false,
+            "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
             "expects_confirm": true,
             "confirm_answer": "y",
             "command_timeout_s": 120,
@@ -87,8 +90,30 @@
             "error_patterns": ["ERROR", "Unable to", "not found", "No MOs", "Syntax error", "failed"]
         },
 
+        "_comment_prestate": "Snapshot cell state BEFORE anything is sent. This is what makes rollback safe: a cell already unlocked when the run starts may be carrying live customers, so it is neither unlocked nor re-locked by this app.",
+        "prestate": {
+            "enabled": true,
+            "skip_already_in_service": true
+        },
+
+        "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",
+        "diagnosis": {
+            "enabled": true,
+            "radio_status_template": "st B{band_number}",
+            "barred_command_template": "hget {mo_type}={cell_dn} cellBarred|cellReservedForOperatorUse",
+            "command_timeout_s": 60,
+            "check_barred_before_traffic": true
+        },
+
+        "_comment_endc": "NR needs its LTE anchor in service. LB/MB/HB cuts across RAT, so unlocking a high group first can leave NR cells at 0 UEs for a reason that is purely ordering.",
+        "endc": {
+            "warn_nr_without_anchor": true,
+            "lte_before_nr": true
+        },
+
         "enable_poll": {
-            "_comment": "commands is a LIST — add 'st nrcelldu' if NR cells are missing from 'st cell'. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
+            "_comment": "source=stzrc reuses the traffic command, whose LTECell/NRCell tables carry an S state column — one command per poll instead of two. Set source=st to use the commands list instead. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
+            "source": "stzrc",
             "commands": ["st cell"],
             "command_timeout_s": 90,
             "interval_s": 15,
@@ -106,7 +131,7 @@
         },
 
         "traffic": {
-            "_comment": "SPELLING UNCONFIRMED ('stzrc'). Traffic = the UE column going 0 -> non-zero. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
+            "_comment": "stzrc prints ;-delimited LTECell/NRCell tables carrying both an S state column and a UEs column, and is parsed natively. Traffic = the UEs column going 0 -> non-zero for required_consecutive_samples polls in a row. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
             "command": "stzrc",
             "command_timeout_s": 120,
             "interval_s": 20,
@@ -114,14 +139,17 @@
             "ue_column_names": ["UE", "UEs", "NoOfUsers", "nrOfRrcConnected", "connectedUsers", "RrcConnected"],
             "ue_regex": "",
             "ue_threshold": 1,
+            "required_consecutive_samples": 2,
             "use_peak": true,
             "on_parse_failure": "manual_confirm",
             "unknown_command_patterns": ["Unknown command", "Syntax error", "command not found", "Invalid command"]
         },
 
+        "_comment_alarm": "baseline_before_unlock captures `alt` before the first unlock so the evidence can separate alarms this cut over caused from ones the site already had.",
         "alarm": {
             "command": "alt",
             "command_timeout_s": 120,
+            "baseline_before_unlock": true,
             "no_alarm_patterns": ["No Active alarms"]
         },
 

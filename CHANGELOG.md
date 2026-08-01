@@ -4,6 +4,59 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.0] — 2026-08-01
+
+### Fixed
+- **Cut Over traffic detection never matched a single cell.** Real `stzrc`
+  output abbreviates the MO class — `FDD=…`, `TDD=…`, `DU=…` — but the parser
+  only accepted the full `EUtranCellFDD=` / `NRCellDU=` forms. Every run would
+  therefore have fallen into the manual-confirmation gate. The short forms are
+  now accepted and canonicalised, so `hgetc` names and `stzrc` names resolve to
+  the same cell.
+- **UE lookup could silently read 0 forever.** Traffic used an exact `mo_ref`
+  match while cell status used tolerant matching, so any difference in DN form
+  between the two commands looked identical to "no traffic" and stalled the run
+  for the full timeout. New `ue_for_cell()` mirrors `match_row` (exact → DN →
+  suffix; ambiguity resolves to nothing rather than a guess).
+
+### Added
+- **`stzrc` parsed natively.** Its `;`-delimited LTECell/NRCell tables are read
+  header-first, giving per-cell state (`S`), UE count, band, alarm indicator and
+  the `TABREMDF` flags, plus the `Total: N Cells (M up)` footer as a free sanity
+  check. Because `stzrc` carries state *and* traffic, the enable poll now
+  sources state from it too (`enable_poll.source`) — one command per poll
+  instead of two, which matters on a node that is busy mid-cutover.
+- **Rollback.** A **Re-lock** button per band group plus **Roll Back All**, so a
+  cutover that isn't working can be reversed from the app instead of hand-typing
+  MOs in a terminal at the worst possible moment. It only ever touches cells
+  *this run* unlocked, and has its own confirmation listing the literal commands.
+- **Pre-state snapshot.** Cell state is captured before anything is sent. A cell
+  already unlocked and carrying customers is marked *already in service*, is not
+  unlocked, and — the point of the whole thing — is never re-locked by a
+  rollback. Such rows render dimmed so they read as "not ours".
+- **Diagnosis instead of silent timeouts.** A cell stuck at
+  `DEPENDENCY_LOCKED` now triggers a radio check (`st B<band>`) and reports
+  *"the B3 radio is locked"* rather than spinning for 15 minutes; a cell that is
+  up but **barred** is detected before the traffic wait starts, since no UE can
+  ever camp on it.
+- **Alarm baseline diff.** `alt` is captured before the first unlock, so the
+  evidence screenshot highlights alarms this cut over actually caused instead of
+  ones the site already had.
+- **EN-DC ordering.** Unlocking NR with no LTE anchor in service now warns
+  first, and `Unlock All` sends LTE before NR within a group — otherwise NR
+  cells sit at 0 UEs for a reason that is purely ordering and looks like a fault.
+- **Traffic needs to be sustained.** A cell is confirmed only after N
+  consecutive samples at or above the threshold (default 2), so a transient blip
+  no longer ends the gate early.
+
+### Changed
+- New `config.json` keys, all editable without a rebuild: `enable_poll.source`,
+  `unlock.lock_command_template` / `graceful_lock`,
+  `diagnosis.radio_status_template` / `barred_command_template`,
+  `traffic.required_consecutive_samples`, `alarm.baseline_before_unlock`,
+  `prestate.*`, `endc.*`. Note in the config that `deb`/`bl` is the standard
+  moshell pair — `ldeb` is kept because that is what this environment specified.
+
 ## [1.6.0] — 2026-08-01
 
 ### Added

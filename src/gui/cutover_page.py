@@ -131,12 +131,16 @@ class _CellRow:
             ft.Colors.with_opacity(0.07, ACCENT)
             if icon_state == "running" else None
         )
+        # A cell that was already carrying customers before this run is not
+        # ours — dim the whole row so it reads as "don't touch" at a glance.
+        self.control.opacity = 0.55 if cell.already_in_service else 1.0
+        self._mo.color = TEXT_MUTED if cell.already_in_service else TEXT
 
 
 class _GroupSection:
-    """A band group: coloured header with counts and its own Unlock button."""
+    """A band group: coloured header with counts, Unlock and Re-lock buttons."""
 
-    def __init__(self, name: str, on_unlock):
+    def __init__(self, name: str, on_unlock, on_relock=None):
         self.name = name
         accent = GROUP_ACCENT.get(name, ACCENT)
 
@@ -155,6 +159,23 @@ class _GroupSection:
             ),
             on_click=lambda e, g=name: on_unlock(g),
         )
+        # Rollback. Hidden until this group actually has something to undo, so
+        # it never sits there inviting a click that would do nothing — but
+        # present the moment it matters, which is when traffic has not shown up
+        # and the operator needs a way back that isn't hand-typing MOs.
+        self.relock_button = ft.OutlinedButton(
+            "Re-lock",
+            icon=ft.Icons.LOCK_OUTLINE,
+            visible=False,
+            tooltip="Lock the cells this run unlocked (rollback)",
+            style=ft.ButtonStyle(
+                color=DANGER,
+                side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, DANGER)),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=12, vertical=12),
+            ),
+            on_click=(lambda e, g=name: on_relock(g)) if on_relock else None,
+        )
         self.rows_column = ft.Column([], spacing=2)
         #: When set, the counts line keeps this text instead of live counts.
         self.static_note = ""
@@ -170,6 +191,7 @@ class _GroupSection:
                     self.counts,
                     self.status_chip,
                     ft.Container(expand=True),
+                    self.relock_button,
                     self.button,
                 ],
                 spacing=10,
@@ -179,7 +201,7 @@ class _GroupSection:
         self.control = ft.Column([header, self.rows_column], spacing=4)
 
     def set_counts(self, counts: dict, status: GroupStatus, busy: bool,
-                   unlockable: int) -> None:
+                   unlockable: int, relockable: int = 0) -> None:
         total = counts["total"]
         if self.static_note:
             self.counts.value = self.static_note
@@ -217,6 +239,13 @@ class _GroupSection:
             "No cells in this band group" if unlockable == 0 else
             "Another action is running" if busy else
             f"Unlock the {unlockable} {self.name} cell(s) on this site"
+        )
+
+        self.relock_button.visible = relockable > 0
+        self.relock_button.disabled = busy or relockable == 0
+        self.relock_button.tooltip = (
+            f"Roll back: lock the {relockable} {self.name} cell(s) this run "
+            f"unlocked. Cells that were already in service are not touched."
         )
 
 
@@ -296,7 +325,8 @@ class CutOverPage:
             dry_banner = ft.Container(visible=False)
 
         for name in list(self.cfg["group_order"]) + [UNMAPPED]:
-            self._sections[name] = _GroupSection(name, self._on_unlock_group)
+            self._sections[name] = _GroupSection(
+                name, self._on_unlock_group, self._on_relock_group)
         # The unmapped bucket has no button by design — these cells are
         # deliberately unreachable from any unlock action. Say why, so an
         # operator who expected to see them in a group isn't left guessing.
@@ -330,10 +360,19 @@ class CutOverPage:
                                  padding=ft.Padding.symmetric(horizontal=18, vertical=14)),
             on_click=self._on_verify,
         )
+        self.relock_all_btn = ft.OutlinedButton(
+            "Roll Back All", icon=ft.Icons.UNDO_ROUNDED, visible=False,
+            tooltip="Lock every cell this run unlocked",
+            style=ft.ButtonStyle(color=DANGER,
+                                 side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, DANGER)),
+                                 shape=ft.RoundedRectangleBorder(radius=12),
+                                 padding=ft.Padding.symmetric(horizontal=18, vertical=14)),
+            on_click=self._on_relock_all,
+        )
         self.summary_text = ft.Text("", size=12, color=TEXT_MUTED)
 
         action_bar = ft.Row(
-            [self.unlock_all_btn, self.verify_btn,
+            [self.unlock_all_btn, self.verify_btn, self.relock_all_btn,
              ft.Container(width=8), self.summary_text],
             spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True,
             run_spacing=10,
@@ -465,13 +504,22 @@ class CutOverPage:
                 run.groups[name].status if name in run.groups else GroupStatus.PENDING,
                 busy,
                 len(run.unlockable_cells_of(name)),
+                len(run.relockable_cells_of(name)),
             )
 
         discovered = bool(run.cells)
         any_unlockable = any(run.unlockable_cells_of(g)
                              for g in self.cfg["group_order"])
+        any_relockable = sum(len(run.relockable_cells_of(g))
+                             for g in self.cfg["group_order"])
         self.unlock_all_btn.disabled = busy or not any_unlockable
         self.verify_btn.disabled = busy or not discovered
+        self.relock_all_btn.visible = any_relockable > 0
+        self.relock_all_btn.disabled = busy or not any_relockable
+        self.relock_all_btn.tooltip = (
+            f"Lock the {any_relockable} cell(s) this run unlocked. "
+            f"Cells already in service before this run are not touched."
+        )
         self.cancel_btn.disabled = not busy
 
         phase_text = {
@@ -709,6 +757,16 @@ class CutOverPage:
     # ── button handlers ──────────────────────────────────────────
     def _on_unlock_group(self, group: str) -> None:
         self.engine.unlock_group(group)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_relock_group(self, group: str) -> None:
+        self.engine.relock_group(group)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_relock_all(self, e) -> None:
+        self.engine.relock_all()
         self._refresh_chrome()
         self.page.update()
 

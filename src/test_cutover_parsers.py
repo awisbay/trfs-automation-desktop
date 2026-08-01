@@ -17,12 +17,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cutover_model import UNMAPPED
 from cutover_parsers import (
+    band_prefix_for,
+    diff_alarms,
     looks_like_unknown_command,
     match_row,
     parse_alarm_summary,
+    parse_barred_state,
     parse_cells_from_hgetc,
+    parse_radio_status,
     parse_st_cell_rows,
+    parse_stzrc,
     parse_ue_counts,
+    st_rows_from_stzrc,
 )
 
 BAND_GROUPS = {
@@ -247,6 +253,110 @@ check("unknown command detected",
       == "Unknown command")
 check("normal output not flagged",
       looks_like_unknown_command(TRAFFIC, pats) is None)
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[9] parse_stzrc — the real command's table format")
+STZRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "testdata", "stzrc_sample.txt")).read()
+z = parse_stzrc(STZRC)
+zb = {r.mo_ref: r for r in z.rows}
+check("12 cell rows parsed", len(z.rows) == 12, str(len(z.rows)))
+check("LTE footer says 8 cells / 6 up", z.totals.get("LTE") == (8, 6),
+      str(z.totals.get("LTE")))
+check("NR footer says 4 cells / 3 up", z.totals.get("NR") == (4, 3),
+      str(z.totals.get("NR")))
+check("row count matches the footers",
+      len(z.rows) == z.totals["LTE"][0] + z.totals["NR"][0])
+check("up count matches the footers",
+      sum(1 for r in z.rows if r.is_up) == z.totals["LTE"][1] + z.totals["NR"][1])
+
+check("short form FDD= expands to EUtranCellFDD",
+      "EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNY-121" in zb)
+check("short form TDD= expands to EUtranCellTDD",
+      "EUtranCellTDD=TCPHTP3ACANOCOTAGUMDDNK-161" in zb)
+check("short form DU= expands to NRCellDU",
+      "NRCellDU=TCPHTP3ACANOCOTAGUMDDNP-181" in zb)
+
+check("UE count read from the UEs column",
+      zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNF-141"].ue_count == 193,
+      str(zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNF-141"].ue_count))
+check("S=1 means up",
+      zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNY-121"].is_up)
+check("S=L means locked, UE 0",
+      zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNF-142"].is_locked
+      and zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNF-142"].ue_count == 0)
+check("UE 0 is a real zero, not 'missing'",
+      zb["EUtranCellDU" if False else
+         "NRCellDU=TCPHTP3ACANOCOTAGUMDDNP-181"].ue_count == 0)
+check("band column read", zb["EUtranCellTDD=TCPHTP3ACANOCOTAGUMDDNV-171"].band == "41")
+check("TABREMDF flags captured verbatim",
+      zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNY-121"].flags == "--------",
+      repr(zb["EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNY-121"].flags))
+
+check("FRU/board rows are not mistaken for cells",
+      not any("RRU" in r.cell_dn or "RANP" in r.cell_dn for r in z.rows))
+check("subCarrS '15 (LB)' never read as a band",
+      all(r.band in ("", "8", "28", "3", "1", "40", "41") for r in z.rows),
+      sorted({r.band for r in z.rows}))
+
+zu = parse_ue_counts(STZRC)
+check("parse_ue_counts picks the stzrc strategy", zu.strategy == "stzrc", zu.strategy)
+check("all 12 cells got a UE count", len(zu.counts) == 12, str(len(zu.counts)))
+check("stzrc result handed back for state reuse", zu.stzrc is not None)
+
+zst = st_rows_from_stzrc(z)
+check("state adapter yields 9 up / 3 locked",
+      sum(1 for r in zst if r.op_state == "ENABLED") == 9
+      and sum(1 for r in zst if r.admin_state == "LOCKED") == 3,
+      f"{sum(1 for r in zst if r.op_state=='ENABLED')} up")
+
+# The whole point of the short-form fix: hgetc names and stzrc names must
+# resolve to the same cell.
+hg = parse_cells_from_hgetc(
+    "EUtranCellFDD=TCPHTP3ACANOCOTAGUMDDNY-121 ;8\n",
+    "NRCellDU=TCPHTP3ACANOCOTAGUMDDNP-182 ;i[1] = 28\n", "MIN3117", BAND_GROUPS)
+check("hgetc LTE cell matches its stzrc row",
+      match_row(hg, "MIN3117", zst[0]) is not None)
+nr_row = next(r for r in zst if r.cell_dn.endswith("P-182"))
+check("hgetc NRCellDU matches the stzrc DU= row",
+      match_row(hg, "MIN3117", nr_row) is not None)
+
+non_stzrc = parse_ue_counts(TRAFFIC)
+check("non-stzrc output still uses the generic strategy",
+      non_stzrc.strategy == "column_span", non_stzrc.strategy)
+check("garbage output still refuses to guess",
+      parse_ue_counts("hello world\n").strategy == "none")
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[10] diagnosis helpers")
+check("cellBarred BARRED -> True",
+      parse_barred_state("EUtranCellFDD=X-1 cellBarred BARRED") is True)
+check("cellBarred NOT_BARRED -> False",
+      parse_barred_state("EUtranCellFDD=X-1 cellBarred NOT_BARRED") is False)
+check("absent attribute -> None, never assumed unbarred",
+      parse_barred_state("EUtranCellFDD=X-1 someOtherAttr 3") is None)
+
+radio = parse_radio_status(
+    " Proxy(MO)      AdmState  OpState\n"
+    " Carrier=B3     LOCKED    DISABLED\n"
+    " Carrier=B3-2   UNLOCKED  ENABLED\n")
+check("radio status counts locked/disabled",
+      radio["total"] == 2 and radio["locked"] == 1 and radio["disabled"] == 1,
+      str(radio))
+
+new_alarms = diff_alarms(
+    "1 ;MAJOR ;VSWR on branch A\n",
+    "1 ;MAJOR ;VSWR on branch A\n2 ;CRITICAL ;Cell out of service\n")
+check("alarm diff returns only the new alarm",
+      len(new_alarms) == 1 and "Cell out of service" in new_alarms[0],
+      str(new_alarms))
+check("alarm diff is empty when nothing changed",
+      diff_alarms("1 ;MAJOR ;VSWR\n", "1 ;MAJOR ;VSWR\n") == [])
+
+check("band_prefix_for inverts the prefix map",
+      band_prefix_for("L1800") == "F" and band_prefix_for("NR2600") == "N",
+      f"{band_prefix_for('L1800')}/{band_prefix_for('NR2600')}")
+check("unknown band has no prefix", band_prefix_for("L9999") == "")
 
 # ──────────────────────────────────────────────────────────────────
 print()

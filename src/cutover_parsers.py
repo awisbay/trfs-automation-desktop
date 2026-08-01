@@ -34,8 +34,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]|\x1b\
 
 #: ``EUtranCellFDD=SITE-1`` anywhere in a line. Also matches inside a comma
 #: joined DN (``ManagedElement=1,ENodeBFunction=1,EUtranCellFDD=SITE-1``).
+#:
+#: The short forms matter: ``stzrc`` prints ``FDD=CCL09149_2A_1`` and
+#: ``DU=CCSN003383_N002A_1``, not the full MO class names. Accepting only the
+#: long forms meant the traffic parser matched nothing at all on real output.
+#: Longest alternative first so ``EUtranCellFDD`` is not truncated to ``FDD``.
 _MO_ASSIGN_RE = re.compile(
-    r"\b(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU)\s*=\s*([A-Za-z0-9_.\-]+)",
+    r"\b(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|FDD|TDD|DU|CU)"
+    r"\s*=\s*([A-Za-z0-9_.\-]+)",
     re.IGNORECASE,
 )
 
@@ -50,6 +56,11 @@ _MO_CANONICAL = {
     "eutrancelltdd": "EUtranCellTDD",
     "nrcelldu": "NRCellDU",
     "nrcellcu": "NRCellCU",
+    # stzrc abbreviations
+    "fdd": "EUtranCellFDD",
+    "tdd": "EUtranCellTDD",
+    "du": "NRCellDU",
+    "cu": "NRCellCU",
 }
 
 
@@ -391,6 +402,36 @@ def parse_st_cell_rows(
     return rows
 
 
+def ue_for_cell(counts: dict, cell, mode: str = "suffix") -> Optional[int]:
+    """Look up a cell's UE count tolerantly, mirroring :func:`match_row`.
+
+    An exact ``mo_ref`` lookup is not enough. The traffic command and the
+    discovery command do not have to print the DN in the same form — that is
+    exactly why status matching has a suffix fallback — and a silent miss here
+    would look identical to "this cell has no traffic", stalling the run for
+    the whole timeout on a cell that is actually fine.
+
+    As everywhere else, ambiguity resolves to ``None`` rather than a guess.
+    """
+    exact = counts.get(cell.mo_ref.upper())
+    if exact is not None or mode == "exact":
+        return exact
+
+    def _dn(key: str) -> str:
+        return key.split("=", 1)[-1]
+
+    dn = cell.cell_dn.upper()
+    hits = [v for k, v in counts.items() if _dn(k) == dn]
+    if len(hits) == 1:
+        return hits[0]
+    if hits or mode == "dn":
+        return None
+
+    hits = [v for k, v in counts.items()
+            if _dn(k).endswith(dn) or dn.endswith(_dn(k))]
+    return hits[0] if len(hits) == 1 else None
+
+
 def match_row(cells: list, node_name: str, row: StCellRow,
               mode: str = "suffix") -> Optional[CutoverCell]:
     """Find the cell a ``st cell`` row refers to, or ``None``.
@@ -427,14 +468,193 @@ def match_row(cells: list, node_name: str, row: StCellRow,
 
 
 # ──────────────────────────────────────────────────────────────────
-# 3. UE / traffic counts
+# 3. `stzrc` — the composite status/traffic command
+# ──────────────────────────────────────────────────────────────────
+@dataclass
+class StzrcRow:
+    """One cell row from an ``stzrc`` LTECell / NRCell table."""
+
+    table: str                       # "LTE" | "NR"
+    mo_type: str
+    cell_dn: str
+    state: str = ""                  # raw S column: "1" = up, "L" = locked
+    flags: str = ""                  # TABREMDF column, kept verbatim
+    alm: str = ""                    # Alm column
+    ue_count: Optional[int] = None
+    band: str = ""                   # may be "5,26" for multi-band NR
+    raw: str = ""
+
+    @property
+    def mo_ref(self) -> str:
+        return f"{self.mo_type}={self.cell_dn}"
+
+    @property
+    def is_up(self) -> bool:
+        return self.state.strip() == "1"
+
+    @property
+    def is_locked(self) -> bool:
+        return self.state.strip().upper() == "L"
+
+
+@dataclass
+class StzrcResult:
+    rows: list = field(default_factory=list)
+    totals: dict = field(default_factory=dict)   # "LTE"/"NR" -> (total, up)
+    warning: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.rows)
+
+
+#: Header cell naming the table and the column that holds the cell name.
+_STZRC_TABLES = {"LTECell": "LTE", "NRCell": "NR"}
+_STZRC_TOTAL_RE = re.compile(r"Total:\s*(\d+)\s*Cells?\s*\((\d+)\s*up\)", re.IGNORECASE)
+
+
+def _split_semis(line: str) -> list:
+    return [p.strip() for p in strip_ansi(line).split(";")]
+
+
+def parse_stzrc(output: str) -> StzrcResult:
+    """Parse the LTECell / NRCell tables out of ``stzrc`` output.
+
+    ``stzrc`` is a composite command: it loads the MO tree, collects alarms and
+    prints several ``;``-delimited tables. Only the two cell tables matter here.
+    They look like::
+
+        Id ;LTECell            ;S ;TABREMDF ;Alm ; UEs ;cId ; ... ;Band ; ...
+         1 ;FDD=CCL09149_2A_1  ;1 ;-------- ;  - ;  59 ; 22 ; ... ;   4 ; ...
+        ------------------------------------------------------------------
+        Total: 11 Cells (11 up)
+
+    Columns are located **by header name**, not by position, since the LTE and
+    NR tables have different column sets (NR adds ``subCarrS`` and an
+    ``NRCellCU (State:UEs)`` tail).
+
+    One trap worth naming: the NR table's ``subCarrS`` column reads ``15 (LB)``
+    / ``30 (MB)``. That is subcarrier spacing, not this app's LB/MB band
+    grouping — the two must never be conflated, which is why the band comes
+    only from the column literally named ``Band``.
+    """
+    result = StzrcResult()
+    lines = (output or "").splitlines()
+
+    table = None          # "LTE" | "NR" while inside a cell table
+    idx: dict = {}
+
+    for raw_line in lines:
+        line = strip_ansi(raw_line).rstrip()
+        s = line.strip()
+        if not s:
+            continue
+
+        # A header row names the table and gives us the column layout.
+        if ";" in s:
+            parts = _split_semis(line)
+            found = None
+            for i, name in enumerate(parts):
+                if name in _STZRC_TABLES:
+                    found = (i, _STZRC_TABLES[name])
+                    break
+            if found is not None:
+                cell_col, table = found
+                idx = {"cell": cell_col}
+                for i, name in enumerate(parts):
+                    key = name.strip().lower()
+                    if key == "s" and "state" not in idx:
+                        idx["state"] = i
+                    elif key == "tabremdf":
+                        idx["flags"] = i
+                    elif key == "alm":
+                        idx["alm"] = i
+                    elif key in ("ues", "ue"):
+                        idx["ue"] = i
+                    elif key == "band":
+                        idx["band"] = i
+                continue
+
+        if table is None:
+            continue
+
+        # End of the current table.
+        m = _STZRC_TOTAL_RE.search(s)
+        if m:
+            result.totals[table] = (int(m.group(1)), int(m.group(2)))
+            table = None
+            idx = {}
+            continue
+        if set(s) <= set("=- ") and len(s) >= 6:
+            continue
+
+        parts = _split_semis(line)
+        cell_col = idx.get("cell", 1)
+        if cell_col >= len(parts):
+            continue
+        mm = _MO_ASSIGN_RE.search(parts[cell_col])
+        if not mm:
+            continue
+
+        def _at(key: str) -> str:
+            i = idx.get(key, -1)
+            return parts[i] if 0 <= i < len(parts) else ""
+
+        ue_raw = _at("ue")
+        ue = int(ue_raw) if ue_raw.isdigit() else None
+
+        result.rows.append(StzrcRow(
+            table=table,
+            mo_type=_canon_mo(mm.group(1)),
+            cell_dn=mm.group(2),
+            state=_at("state"),
+            flags=_at("flags"),
+            alm=_at("alm"),
+            ue_count=ue,
+            band=_at("band"),
+            raw=s,
+        ))
+
+    if not result.rows:
+        result.warning = ("No LTECell/NRCell table found in the output — this "
+                          "does not look like stzrc output.")
+    return result
+
+
+def st_rows_from_stzrc(result: StzrcResult) -> list:
+    """Adapt ``stzrc`` rows to :class:`StCellRow` so the enable poll can reuse
+    the same folding logic regardless of which command produced the state.
+
+    ``S`` is a compact state: ``1`` means unlocked and enabled, ``L`` means
+    locked. Anything else is reported as unknown rather than guessed.
+    """
+    rows = []
+    for r in result.rows:
+        if r.is_up:
+            adm, op = "UNLOCKED", "ENABLED"
+        elif r.is_locked:
+            adm, op = "LOCKED", "DISABLED"
+        else:
+            adm, op = "", ""
+        rows.append(StCellRow(
+            mo_type=r.mo_type, cell_dn=r.cell_dn,
+            admin_state=adm, op_state=op, avail_status="", raw=r.raw,
+        ))
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────
+# 4. UE / traffic counts
 # ──────────────────────────────────────────────────────────────────
 @dataclass
 class UeParseResult:
     counts: dict = field(default_factory=dict)   # mo_ref.upper() -> int
-    strategy: str = "none"                       # regex|column_span|token_index|none
+    strategy: str = "none"                       # stzrc|regex|column_span|token_index|none
     header_line: str = ""
     warning: str = ""
+    #: Populated when the output was recognised as ``stzrc``, so the caller can
+    #: reuse the same poll for cell state instead of running a second command.
+    stzrc: Optional[StzrcResult] = None
 
     @property
     def ok(self) -> bool:
@@ -492,6 +712,16 @@ def parse_ue_counts(
         if chosen is None:
             return None
         return f"{_canon_mo(chosen.group(1))}={chosen.group(2)}".upper()
+
+    # ── Strategy 0: stzrc's own cell tables ──────────────────────
+    # Tried first because it is the known-good real-node format, and it also
+    # hands back cell state so the caller can skip a separate `st cell`.
+    if not ue_regex:
+        stz = parse_stzrc(output)
+        if stz.ok:
+            counts = {r.mo_ref.upper(): r.ue_count
+                      for r in stz.rows if r.ue_count is not None}
+            return UeParseResult(counts=counts, strategy="stzrc", stzrc=stz)
 
     # ── Strategy 1: operator-supplied regex ──────────────────────
     if ue_regex:
@@ -605,6 +835,97 @@ def parse_alarm_summary(output: str,
     m = re.search(r"(\d+)\s+alarms?\b", text, re.IGNORECASE)
     total = int(m.group(1)) if m else sum(by_severity.values())
     return total, by_severity, False
+
+
+def diff_alarms(before: str, after: str) -> list:
+    """Return alarm lines present in *after* but not in *before*.
+
+    `alt` is captured before the first unlock so the evidence can distinguish
+    alarms this cut over caused from ones the site already had. Comparison is
+    on the alarm text with leading timestamps/ids stripped, since those differ
+    between captures of the same underlying alarm.
+    """
+    def _keys(text: str) -> dict:
+        out = {}
+        for raw in strip_ansi(text or "").splitlines():
+            s = raw.strip()
+            if not s or set(s) <= set("=- "):
+                continue
+            if not re.search(r"\b(CRITICAL|MAJOR|MINOR|WARNING|INDETERMINATE)\b",
+                             s, re.IGNORECASE):
+                continue
+            key = re.sub(r"^\s*\d+\s*;?\s*", "", s)
+            key = re.sub(r"\b\d{6}-\d{2}:\d{2}:\d{2}\S*", "", key)
+            out[re.sub(r"\s+", " ", key).strip()] = s
+        return out
+
+    before_keys = _keys(before)
+    return [line for key, line in _keys(after).items() if key not in before_keys]
+
+
+_BARRED_RE = re.compile(
+    r"\b(cellBarred|cellReservedForOperatorUse)\b[^\S\n]*[=:;]?[^\S\n]*"
+    r"([A-Za-z_0-9]+)", re.IGNORECASE)
+
+#: Values that mean "a UE may camp here".
+_NOT_BARRED_VALUES = {"NOT_BARRED", "NOTBARRED", "0", "FALSE", "NOT_RESERVED"}
+_BARRED_VALUES = {"BARRED", "1", "TRUE", "RESERVED"}
+
+
+def parse_barred_state(output: str) -> Optional[bool]:
+    """Return True if barred, False if not barred, ``None`` if unknown.
+
+    ``None`` matters: an absent attribute must not be read as "not barred",
+    or we would wait out the whole traffic timeout on a cell that can never
+    attract a UE and report nothing useful about why.
+    """
+    result = None
+    for m in _BARRED_RE.finditer(strip_ansi(output or "")):
+        value = m.group(2).strip().upper()
+        if value in _BARRED_VALUES:
+            return True
+        if value in _NOT_BARRED_VALUES:
+            result = False
+    return result
+
+
+def parse_radio_status(output: str) -> dict:
+    """Summarise ``st B<band>`` (radio / Carrier) output.
+
+    Returns ``{"total": n, "locked": n, "disabled": n, "rows": [...]}``. Used to
+    explain a cell stuck at DEPENDENCY_LOCKED: if the band's radio is itself
+    locked, unlocking the cell alone will never bring it up.
+    """
+    rows, locked, disabled = [], 0, 0
+    for raw in strip_ansi(output or "").splitlines():
+        s = raw.strip()
+        if not s or set(s) <= set("=- "):
+            continue
+        low = s.lower()
+        if "adm state" in low or "admstate" in low or s.startswith("Proxy"):
+            continue
+        adm = _first_group(_ADM_RE.search(s))
+        op = _first_group(_OP_RE.search(s))
+        if not adm and not op:
+            continue
+        rows.append({"raw": s, "admin_state": adm, "op_state": op})
+        if adm == "LOCKED":
+            locked += 1
+        if op == "DISABLED":
+            disabled += 1
+    return {"total": len(rows), "locked": locked, "disabled": disabled, "rows": rows}
+
+
+def band_prefix_for(band_key: str) -> str:
+    """Invert ``CELL_PREFIX_TO_BAND`` — ``L1800`` -> ``F``.
+
+    Supports the prefix-filtered status form the team already uses
+    (``st cellfdd=.*F-``). Returns "" when the band has no known prefix.
+    """
+    for prefix, key in CELL_PREFIX_TO_BAND.items():
+        if key == band_key:
+            return prefix
+    return ""
 
 
 def looks_like_unknown_command(output: str, patterns: tuple) -> Optional[str]:

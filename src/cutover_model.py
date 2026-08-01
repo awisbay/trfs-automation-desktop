@@ -32,15 +32,19 @@ class CellStatus(str, Enum):
 
     PENDING = "pending"                  # discovered, not touched
     SKIPPED = "skipped"                  # UNMAPPED band, or group not run
-    UNLOCK_SENT = "unlock_sent"          # ldeb issued, awaiting st cell
+    ALREADY_IN_SERVICE = "already_in_service"  # was up before we started
+    UNLOCK_SENT = "unlock_sent"          # ldeb issued, awaiting status
     UNLOCK_FAILED = "unlock_failed"      # ldeb output matched an error pattern
-    WAITING_ENABLE = "waiting_enable"    # seen in st cell, still DISABLED
+    WAITING_ENABLE = "waiting_enable"    # seen in status, still DISABLED
+    BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"  # radio/parent still locked
     ENABLED = "enabled"                  # op state ENABLED (+ adm UNLOCKED)
     ENABLE_TIMEOUT = "enable_timeout"    # deadline hit, never came up
+    BARRED = "barred"                    # up but barred — no UE can ever camp
     WAITING_TRAFFIC = "waiting_traffic"  # enabled, UE still below threshold
     TRAFFIC_OK = "traffic_ok"            # UE >= threshold        [terminal OK]
     TRAFFIC_TIMEOUT = "traffic_timeout"  # deadline hit, UE stayed 0
     TRAFFIC_UNKNOWN = "traffic_unknown"  # UE column unparseable -> manual gate
+    RELOCKED = "relocked"                # rolled back by the operator
     CANCELLED = "cancelled"
     ERROR = "error"
 
@@ -52,13 +56,19 @@ TERMINAL_OK = frozenset({CellStatus.TRAFFIC_OK})
 TERMINAL_FAIL = frozenset({
     CellStatus.UNLOCK_FAILED,
     CellStatus.ENABLE_TIMEOUT,
+    CellStatus.BLOCKED_BY_DEPENDENCY,
+    CellStatus.BARRED,
     CellStatus.TRAFFIC_TIMEOUT,
     CellStatus.CANCELLED,
     CellStatus.ERROR,
 })
 
 #: Anything the state machine considers "done with this cell".
-TERMINAL = TERMINAL_OK | TERMINAL_FAIL | frozenset({CellStatus.SKIPPED})
+TERMINAL = TERMINAL_OK | TERMINAL_FAIL | frozenset({
+    CellStatus.SKIPPED,
+    CellStatus.ALREADY_IN_SERVICE,
+    CellStatus.RELOCKED,
+})
 
 #: Maps a CellStatus onto the icon palette already used by the integration
 #: page's ``_StepRow`` (pending / running / done / warn / error / skip), so the
@@ -66,15 +76,19 @@ TERMINAL = TERMINAL_OK | TERMINAL_FAIL | frozenset({CellStatus.SKIPPED})
 STATUS_ICON_STATE = {
     CellStatus.PENDING: "pending",
     CellStatus.SKIPPED: "skip",
+    CellStatus.ALREADY_IN_SERVICE: "skip",
     CellStatus.UNLOCK_SENT: "running",
     CellStatus.UNLOCK_FAILED: "error",
     CellStatus.WAITING_ENABLE: "running",
+    CellStatus.BLOCKED_BY_DEPENDENCY: "error",
     CellStatus.ENABLED: "running",
     CellStatus.ENABLE_TIMEOUT: "error",
+    CellStatus.BARRED: "error",
     CellStatus.WAITING_TRAFFIC: "running",
     CellStatus.TRAFFIC_OK: "done",
     CellStatus.TRAFFIC_TIMEOUT: "error",
     CellStatus.TRAFFIC_UNKNOWN: "warn",
+    CellStatus.RELOCKED: "skip",
     CellStatus.CANCELLED: "skip",
     CellStatus.ERROR: "error",
 }
@@ -137,6 +151,19 @@ class CutoverCell:
     ue_count: Optional[int] = None   # None = not parsed yet / unparseable
     ue_peak: int = 0                 # max ever seen — latches traffic evidence
     alarm_count: Optional[int] = None
+    flags: str = ""              # stzrc TABREMDF column, verbatim
+
+    # ── pre-state (captured before we send anything) ─────────────
+    #: True if this cell was ALREADY unlocked when the run started. Such a cell
+    #: is not ours: we neither unlock it nor — critically — re-lock it during a
+    #: rollback, because it may be carrying live customers.
+    was_unlocked_before: bool = False
+    already_in_service: bool = False
+
+    # ── diagnosis ────────────────────────────────────────────────
+    cell_barred: Optional[bool] = None   # None = unknown, never assumed False
+    dependency_locked: bool = False
+    traffic_samples: int = 0             # consecutive samples at/above threshold
 
     # ── phase status ─────────────────────────────────────────────
     status: CellStatus = CellStatus.PENDING
@@ -170,8 +197,24 @@ class CutoverCell:
 
     @property
     def is_unlockable(self) -> bool:
-        """UNMAPPED cells are never unlocked by any button."""
-        return self.group != UNMAPPED
+        """UNMAPPED cells are never unlocked by any button, and a cell that
+        was already in service before we started is not ours to touch."""
+        return self.group != UNMAPPED and not self.already_in_service
+
+    @property
+    def is_relockable(self) -> bool:
+        """True only for cells **this session** actually unlocked.
+
+        This is the whole safety property of rollback: a cell that was already
+        unlocked when the run started must never be re-locked, or we would take
+        a live cell carrying customers out of service.
+        """
+        return (
+            not self.was_unlocked_before
+            and not self.already_in_service
+            and self.status not in (CellStatus.PENDING, CellStatus.SKIPPED,
+                                    CellStatus.RELOCKED)
+        )
 
     def short_label(self) -> str:
         return f"{self.mo_ref} [{self.band_key or '?'}]"
@@ -288,6 +331,9 @@ class CutoverRun:
     phase: RunPhase = RunPhase.IDLE
     active_group: str = ""
     error: str = ""
+    #: node -> raw `alt` output captured before the first unlock, so the
+    #: evidence can show alarms this cut over actually caused.
+    alarm_baseline: dict = field(default_factory=dict)
 
     # ── concurrency ──────────────────────────────────────────────
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -343,6 +389,10 @@ class CutoverRun:
 
     def unlockable_cells_of(self, group: str) -> list:
         return [c for c in self.cells_of(group) if c.is_unlockable]
+
+    def relockable_cells_of(self, group: str) -> list:
+        """Only cells this session unlocked — see :attr:`CutoverCell.is_relockable`."""
+        return [c for c in self.cells_of(group) if c.is_relockable]
 
     def group_counts(self, group: str) -> dict:
         """Counts used by the group header: total / enabled / traffic / failed."""
