@@ -51,6 +51,27 @@ jobs:
         shell: pwsh
         run: python -m unittest discover -s src -p "test_*.py"
 
+      # The Flet desktop client (~40 MB) is NOT in the repo (build_assets/
+      # flet-windows.zip is gitignored), so on a clean runner NodeCraft.spec
+      # would fall back to a client-less build whose exe must download the
+      # client from GitHub on first launch — and fails to open when that
+      # download can't happen. Fetch the exact release artifact for the
+      # installed flet version so the spec bundles it (offline, self-contained,
+      # identical to the local build).
+      - name: Fetch Flet desktop client (offline bundle)
+        shell: pwsh
+        run: |
+          $ver = python -c "import flet_desktop.version as v; print(v.version)"
+          $url = "https://github.com/flet-dev/flet/releases/download/v$ver/flet-windows.zip"
+          New-Item -ItemType Directory -Force build_assets | Out-Null
+          Write-Host "Downloading Flet desktop client for v$ver -> $url"
+          Invoke-WebRequest -Uri $url -OutFile build_assets/flet-windows.zip
+          $size = (Get-Item build_assets/flet-windows.zip).Length
+          if ($size -lt 5MB) {
+            throw "flet-windows.zip is only $size bytes - download likely failed."
+          }
+          Write-Host ("flet-windows.zip ready ({0:N1} MB)" -f ($size / 1MB))
+
       - name: Build NodeCraft
         shell: pwsh
         run: python -m PyInstaller --noconfirm --clean NodeCraft.spec

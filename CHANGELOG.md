@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.1] — 2026-08-02
+
+### Fixed
+- **GitHub Actions release built a broken exe.** `build_assets/flet-windows.zip`
+  (the ~40 MB Flet desktop client) is gitignored, so it never reached the CI
+  runner — `NodeCraft.spec` then produced a client-less exe that tried to
+  download the client from GitHub on first launch and failed to open on
+  restricted networks. The release workflow now fetches the exact
+  `flet-windows.zip` for the installed flet version before building, so the CI
+  artifact is offline and self-contained, identical to the local build.
+
 ## [1.7.0] — 2026-08-01
 
 ### Fixed
