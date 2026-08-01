@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.2] — 2026-08-02
+
+### Fixed
+- **Pin `flet`/`flet-desktop` to 0.84.0.** With `>=`, CI resolved to flet 0.86.5
+  and the resulting exe failed to launch on Windows: extracting the newer
+  desktop client to `~/.flet/client/flet-desktop-full-0.86.5` raised
+  `PermissionError: [WinError 5] Access is denied` on the final rename (AV /
+  locked-file races during unpack). The app is developed and tested on 0.84.0,
+  which is already cached and validated on target machines, so the build now
+  pins to the tested version and matches the local build exactly.
+
 ## [1.7.1] — 2026-08-02
 
 ### Fixed
