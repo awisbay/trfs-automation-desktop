@@ -31,12 +31,13 @@ app.secret_key = "nodecraft-license-gen-local-only"
 
 # ── Per-feature licensing ────────────────────────────────────────
 # Feature keys MUST match src/license_manager.py (ALL_FEATURES).
-ALL_FEATURES = ["integration", "terminal", "audit", "trfs"]
+ALL_FEATURES = ["integration", "terminal", "audit", "trfs", "cutover"]
 FEATURE_LABELS = {
     "integration": "Integration",
     "terminal": "Terminal",
     "audit": "CDD Audit",
     "trfs": "TRFS",
+    "cutover": "Cut Over",
 }
 
 

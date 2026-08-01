@@ -4,6 +4,46 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.6.0] — 2026-08-01
+
+### Added
+- **Cut Over.** A new workflow that brings a newly integrated node into service
+  by unlocking its cells one band group at a time and proving each group carries
+  traffic before moving on. Replaces doing this by hand in a terminal.
+  - **Discovery**: SSHes and AMOSes into every node on the form, lists all cells
+    with their bands, and sorts them into **LB** (700/900), **MB** (1800/2100)
+    and **HB** (2300/2600). One combined list across nodes.
+  - **Per-group unlock**: each band group has its own `Unlock` button in its
+    section header (so it is never ambiguous which cells a button acts on), plus
+    an `Unlock All` that runs LB→MB→HB in order. After unlocking, the app polls
+    `st cell` until the cells report enabled, then polls the traffic command
+    until the UE column goes non-zero, updating each row live.
+  - **Evidence**: once a group is carrying traffic, the traffic and alarm output
+    is rendered to a PNG under `LOG/<SHORTCODE>/CUTOVER/`, copied to the
+    clipboard, and WhatsApp is opened so the operator can paste and send.
+  - **Safety**: a confirmation dialog lists the literal commands before anything
+    is sent; one command is issued per MO so no pattern can unlock a whole node
+    at once; cells whose band is not mapped to a group are shown but never
+    unlocked; and a `dry_run` flag logs commands without sending them.
+    Cancelling stops the run but does **not** re-lock cells.
+  - **Everything is configurable** in `config.json` under `cutover` — commands,
+    band→group mapping, poll intervals and timeouts — so a command spelling can
+    be corrected without a rebuild. A `final_verification.steps` list is the
+    pluggable slot for the post-cutover checks (empty for now).
+  - Parsers are deliberately conservative: both known `st cell` layouts are
+    handled, NR multi-band array output (`i[1]`/`i[2]` continuation lines) is
+    parsed correctly, an ambiguous status row never resolves to a guess, and an
+    unreadable UE column raises a manual-confirmation gate rather than inventing
+    a traffic figure.
+- `cutover` added as a licensable feature, alongside the existing four.
+
+### Changed
+- **Main form buttons regrouped.** They were a single row of five; adding Cut
+  Over made six, which overflowed the panel. Now two labelled tiers —
+  **Workflows** (Integration Launch, Cut Over, TRFS Launch) and **Tools**
+  (Terminal, CDD Audit, Clear Data) — both wrapping, so nothing collides at the
+  1080 px window minimum.
+
 ## [1.5.0] — 2026-08-01
 
 ### Added

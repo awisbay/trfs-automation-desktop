@@ -27,12 +27,14 @@ FEATURE_INTEGRATION = "integration"
 FEATURE_TERMINAL = "terminal"
 FEATURE_AUDIT = "audit"
 FEATURE_TRFS = "trfs"
+FEATURE_CUTOVER = "cutover"
 
 ALL_FEATURES = [
     FEATURE_INTEGRATION,
     FEATURE_TERMINAL,
     FEATURE_AUDIT,
     FEATURE_TRFS,
+    FEATURE_CUTOVER,
 ]
 
 # Human-friendly labels (used for messages / admin UI).
@@ -41,6 +43,7 @@ FEATURE_LABELS = {
     FEATURE_TERMINAL: "Terminal",
     FEATURE_AUDIT: "CDD Audit",
     FEATURE_TRFS: "TRFS",
+    FEATURE_CUTOVER: "Cut Over",
 }
 
 

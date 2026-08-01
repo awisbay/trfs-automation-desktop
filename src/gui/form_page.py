@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from command_parser import parse_commands_file
 from license_manager import (
     FEATURE_AUDIT,
+    FEATURE_CUTOVER,
     FEATURE_INTEGRATION,
     FEATURE_TERMINAL,
     FEATURE_TRFS,
@@ -474,6 +475,15 @@ class FormPage:
                     ),
                     self.error_box,
                     ft.Container(height=12),
+                    # ── Action area, in two tiers ────────────────────
+                    # These used to be one flat row. With Cut Over added
+                    # that is six buttons competing for a panel that only
+                    # gets `expand=2` of the window, which overflowed and
+                    # read as a jumble. Splitting them into "things that
+                    # run a procedure against the node" and "utilities",
+                    # and letting both wrap, keeps them legible at the
+                    # 1080px window minimum.
+                    self._section_label("Workflows"),
                     ft.Row(
                         [
                             ft.ElevatedButton(
@@ -494,61 +504,25 @@ class FormPage:
                                 ),
                                 on_click=self._on_integration,
                             ),
-                            ft.Container(width=12),
-                            ft.OutlinedButton(
-                                "Terminal",
-                                icon=ft.Icons.TERMINAL,
-                                disabled=FEATURE_TERMINAL not in self._features,
+                            ft.ElevatedButton(
+                                "Cut Over",
+                                icon=ft.Icons.SWAP_HORIZ_ROUNDED,
+                                disabled=FEATURE_CUTOVER not in self._features,
                                 tooltip=(
-                                    "Open interactive SSH terminal (multi-tab)"
-                                    if FEATURE_TERMINAL in self._features
-                                    else self._feature_locked_tooltip("Terminal")
+                                    "Unlock cells band group by band group and "
+                                    "verify traffic"
+                                    if FEATURE_CUTOVER in self._features
+                                    else self._feature_locked_tooltip("Cut Over")
                                 ),
                                 style=ft.ButtonStyle(
-                                    color=ACCENT,
-                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
+                                    bgcolor=ACCENT,
+                                    color="#06242A",
                                     mouse_cursor=ft.MouseCursor.CLICK,
-                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
+                                    padding=ft.Padding.symmetric(horizontal=20, vertical=18),
                                     shape=ft.RoundedRectangleBorder(radius=16),
                                 ),
-                                on_click=self._on_terminal,
+                                on_click=self._on_cutover,
                             ),
-                            ft.Container(width=12),
-                            ft.OutlinedButton(
-                                "CDD Audit",
-                                icon=ft.Icons.FACT_CHECK,
-                                disabled=FEATURE_AUDIT not in self._features,
-                                tooltip=(
-                                    "Compare node dump (modump/cmdump) against CDD"
-                                    if FEATURE_AUDIT in self._features
-                                    else self._feature_locked_tooltip("CDD Audit")
-                                ),
-                                style=ft.ButtonStyle(
-                                    color=ACCENT_WARM,
-                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT_WARM)),
-                                    mouse_cursor=ft.MouseCursor.CLICK,
-                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
-                                    shape=ft.RoundedRectangleBorder(radius=16),
-                                ),
-                                on_click=self._on_audit,
-                            ),
-                            ft.Container(width=12),
-                            ft.OutlinedButton(
-                                "Clear Data",
-                                icon=ft.Icons.CLEANING_SERVICES_OUTLINED,
-                                icon_color="#FF8A8A",
-                                tooltip="Clear all site fields (SSH credentials are kept)",
-                                style=ft.ButtonStyle(
-                                    color="#FF8A8A",
-                                    bgcolor=ft.Colors.with_opacity(0.08, "#FF6B6B"),
-                                    mouse_cursor=ft.MouseCursor.CLICK,
-                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, "#FF6B6B")),
-                                    padding=ft.Padding.symmetric(horizontal=18, vertical=18),
-                                    shape=ft.RoundedRectangleBorder(radius=16),
-                                ),
-                                on_click=self._on_clear_data,
-                            ),
-                            ft.Container(expand=True),
                             # TRFS Launch — disabled in this build to
                             # shrink the distribution (no Playwright /
                             # Chromium dependency needed). The code path
@@ -568,17 +542,79 @@ class FormPage:
                                     "Playwright + Chromium."
                                 ),
                                 style=ft.ButtonStyle(
-                                    bgcolor=ACCENT,
-                                    color="#06242A",
+                                    bgcolor=PANEL_RAISED,
+                                    color=TEXT_MUTED,
                                     mouse_cursor=ft.MouseCursor.CLICK,
                                     padding=ft.Padding.symmetric(horizontal=20, vertical=18),
                                     shape=ft.RoundedRectangleBorder(radius=16),
                                 ),
                                 on_click=self._on_start,
                             ),
-                            ft.Container(width=16),
                         ],
                         spacing=12,
+                        run_spacing=10,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Container(height=6),
+                    self._section_label("Tools"),
+                    ft.Row(
+                        [
+                            ft.OutlinedButton(
+                                "Terminal",
+                                icon=ft.Icons.TERMINAL,
+                                disabled=FEATURE_TERMINAL not in self._features,
+                                tooltip=(
+                                    "Open interactive SSH terminal (multi-tab)"
+                                    if FEATURE_TERMINAL in self._features
+                                    else self._feature_locked_tooltip("Terminal")
+                                ),
+                                style=ft.ButtonStyle(
+                                    color=ACCENT,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                                    shape=ft.RoundedRectangleBorder(radius=14),
+                                ),
+                                on_click=self._on_terminal,
+                            ),
+                            ft.OutlinedButton(
+                                "CDD Audit",
+                                icon=ft.Icons.FACT_CHECK,
+                                disabled=FEATURE_AUDIT not in self._features,
+                                tooltip=(
+                                    "Compare node dump (modump/cmdump) against CDD"
+                                    if FEATURE_AUDIT in self._features
+                                    else self._feature_locked_tooltip("CDD Audit")
+                                ),
+                                style=ft.ButtonStyle(
+                                    color=ACCENT_WARM,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT_WARM)),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                                    shape=ft.RoundedRectangleBorder(radius=14),
+                                ),
+                                on_click=self._on_audit,
+                            ),
+                            ft.OutlinedButton(
+                                "Clear Data",
+                                icon=ft.Icons.CLEANING_SERVICES_OUTLINED,
+                                icon_color="#FF8A8A",
+                                tooltip="Clear all site fields (SSH credentials are kept)",
+                                style=ft.ButtonStyle(
+                                    color="#FF8A8A",
+                                    bgcolor=ft.Colors.with_opacity(0.08, "#FF6B6B"),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, "#FF6B6B")),
+                                    padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                                    shape=ft.RoundedRectangleBorder(radius=14),
+                                ),
+                                on_click=self._on_clear_data,
+                            ),
+                        ],
+                        spacing=12,
+                        run_spacing=10,
+                        wrap=True,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ],
@@ -1112,6 +1148,30 @@ class FormPage:
             "password": f.get("password", ""),
         }
         self.page.go("/terminal")
+
+    def _on_cutover(self, e):
+        if FEATURE_CUTOVER not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("Cut Over"))
+            return
+
+        # Cut Over only needs a node to reach and SSH credentials — the
+        # cell list comes from the node itself, not from the form.
+        f = self._collect_form()
+        errors = []
+        if not f["node_name"]:
+            errors.append("Node name is required.")
+        if not f["host"]:
+            errors.append("ENM IP is required.")
+        if not f["username"]:
+            errors.append("Username is required.")
+        if not f["password"]:
+            errors.append("Password is required.")
+        if errors:
+            self._show_errors(errors)
+            return
+
+        self.page.integration_form = f
+        self.page.go("/cutover")
 
     def _on_audit(self, e):
         if FEATURE_AUDIT not in self._features:
