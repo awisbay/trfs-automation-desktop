@@ -150,6 +150,10 @@ hiddenimports = (
         "audit", "audit.dump_parser", "audit.cdd_reader", "audit.audit_core",
         "audit.cmedit_source",
         "xml.etree.ElementTree",
+        # Cut Over (engine + renderer imported lazily inside worker threads)
+        "gui.cutover_page",
+        "cutover_model", "cutover_parsers", "cutover_runner",
+        "whatsapp_sender", "terminal_renderer", "band_detector",
     ]
 )
 

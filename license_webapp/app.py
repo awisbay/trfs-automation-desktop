@@ -29,6 +29,67 @@ from nodecraft_keygen import generate_license, _PRIVATE_KEY_B64  # noqa
 app = Flask(__name__)
 app.secret_key = "nodecraft-license-gen-local-only"
 
+# ── Per-feature licensing ────────────────────────────────────────
+# Feature keys MUST match src/license_manager.py (ALL_FEATURES).
+ALL_FEATURES = ["integration", "terminal", "audit", "trfs", "cutover"]
+FEATURE_LABELS = {
+    "integration": "Integration",
+    "terminal": "Terminal",
+    "audit": "CDD Audit",
+    "trfs": "TRFS",
+    "cutover": "Cut Over",
+}
+
+
+def _normalize_features(raw) -> list:
+    """Accept a list, or a comma/semicolon/space/pipe separated string,
+    or the wildcards '*'/'all', and return a clean ordered list of the
+    known feature keys. Empty / unknown input → all features (so a blank
+    column in a bulk sheet still yields a fully-featured key, matching
+    the previous behaviour)."""
+    if raw is None:
+        return list(ALL_FEATURES)
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        s = str(raw).strip()
+        if not s or s.lower() in ("*", "all"):
+            return list(ALL_FEATURES)
+        for sep in (";", "|", " "):
+            s = s.replace(sep, ",")
+        items = s.split(",")
+    picked = []
+    for it in items:
+        k = it.strip().lower()
+        if k in ALL_FEATURES and k not in picked:
+            picked.append(k)
+    return picked or list(ALL_FEATURES)
+
+
+def build_license(user: str, expires: str, note: str, hostname: str,
+                  features: list) -> str:
+    """Sign a license payload directly (Ed25519), embedding the enabled
+    feature list. Produces the same wire format the desktop app verifies:
+    base64( payload_json_bytes + b"|SIG|" + signature )."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    payload = {
+        "product": "NodeCraft",
+        "user": user,
+        "expires": expires,
+        "issued": datetime.now().strftime("%Y-%m-%d"),
+        "note": note or "",
+        "features": list(features),
+    }
+    if hostname:
+        payload["hostname"] = hostname
+
+    payload_bytes = json.dumps(payload, separators=(",", ":"),
+                               sort_keys=True).encode("utf-8")
+    priv = Ed25519PrivateKey.from_private_bytes(base64.b64decode(_PRIVATE_KEY_B64))
+    signature = priv.sign(payload_bytes)
+    return base64.b64encode(payload_bytes + b"|SIG|" + signature).decode("ascii")
+
 
 def parse_date(raw: str) -> str:
     """Accept YYYYMMDD or YYYY-MM-DD, return YYYY-MM-DD."""
@@ -62,6 +123,8 @@ def generate_single():
     hostname = request.form.get("hostname", "").strip()
     expires = request.form.get("expires", "").strip()
     note = request.form.get("note", "").strip()
+    # Checkboxes: features=integration&features=terminal&...
+    features = _normalize_features(request.form.getlist("features"))
 
     if not name or not expires:
         return jsonify({"ok": False, "error": "Name and Expires are required."})
@@ -72,7 +135,8 @@ def generate_single():
         return jsonify({"ok": False, "error": str(ex)})
 
     try:
-        key = generate_license(user=name, expires=exp_date, note=note, hostname=hostname)
+        key = build_license(user=name, expires=exp_date, note=note,
+                            hostname=hostname, features=features)
     except Exception as ex:
         return jsonify({"ok": False, "error": f"Generation failed: {ex}"})
 
@@ -82,6 +146,7 @@ def generate_single():
         "hostname": hostname or "(any PC)",
         "expires": exp_date,
         "note": note,
+        "features": ", ".join(FEATURE_LABELS.get(f, f) for f in features),
         "key": key,
     })
 
@@ -124,6 +189,11 @@ def generate_bulk():
         expires_raw = r.get("expires") or r.get("Expires") or r.get("expired") \
             or r.get("Expired") or r.get("expired date") or r.get("Expired Date") or ""
         note = str(r.get("note") or r.get("Note") or "").strip()
+        # Optional "features" column: comma/space separated keys, or
+        # blank / "all" / "*" for every feature.
+        features_raw = r.get("features") or r.get("Features") or r.get("feature") \
+            or r.get("Feature") or ""
+        features = _normalize_features(features_raw)
 
         if not name or not expires_raw:
             results.append({
@@ -134,10 +204,13 @@ def generate_bulk():
 
         try:
             exp_date = parse_date(str(expires_raw))
-            key = generate_license(user=name, expires=exp_date, note=note, hostname=hostname)
+            key = build_license(user=name, expires=exp_date, note=note,
+                                hostname=hostname, features=features)
             results.append({
                 "row": i, "name": name, "hostname": hostname or "(any PC)",
-                "expires": exp_date, "note": note, "key": key, "error": "",
+                "expires": exp_date, "note": note,
+                "features": ", ".join(FEATURE_LABELS.get(f, f) for f in features),
+                "key": key, "error": "",
             })
         except Exception as ex:
             results.append({
@@ -158,7 +231,7 @@ def download_excel():
     ws = wb.active
     ws.title = "Licenses"
 
-    headers = ["Name", "Hostname", "Expires", "Note", "License Key", "Error"]
+    headers = ["Name", "Hostname", "Expires", "Note", "Features", "License Key", "Error"]
     ws.append(headers)
 
     # Style header
@@ -176,6 +249,7 @@ def download_excel():
             r.get("hostname", ""),
             r.get("expires", ""),
             r.get("note", ""),
+            r.get("features", ""),
             r.get("key", ""),
             r.get("error", ""),
         ])
@@ -185,8 +259,9 @@ def download_excel():
     ws.column_dimensions["B"].width = 20
     ws.column_dimensions["C"].width = 14
     ws.column_dimensions["D"].width = 22
-    ws.column_dimensions["E"].width = 90
-    ws.column_dimensions["F"].width = 30
+    ws.column_dimensions["E"].width = 28
+    ws.column_dimensions["F"].width = 90
+    ws.column_dimensions["G"].width = 30
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -202,9 +277,10 @@ def template():
     wb = Workbook()
     ws = wb.active
     ws.title = "Licenses"
-    ws.append(["Name", "Hostname", "Expires", "Note"])
-    ws.append(["John Doe", "DESKTOP-ABC123", "20270101", "Q1 batch"])
-    ws.append(["Jane Smith", "", "20261231", "Portable — any PC"])
+    ws.append(["Name", "Hostname", "Expires", "Note", "Features"])
+    ws.append(["John Doe", "DESKTOP-ABC123", "20270101", "Q1 batch", "all"])
+    ws.append(["Jane Smith", "", "20261231", "Portable — any PC", "integration, terminal"])
+    ws.append(["Bob Audit", "", "20261231", "Audit only", "audit"])
 
     from openpyxl.styles import Font, PatternFill, Alignment
     header_fill = PatternFill("solid", fgColor="39C0BA")
@@ -213,7 +289,7 @@ def template():
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
-    for col, w in zip("ABCD", [20, 20, 14, 30]):
+    for col, w in zip("ABCDE", [20, 20, 14, 30, 28]):
         ws.column_dimensions[col].width = w
 
     buf = io.BytesIO()

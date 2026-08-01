@@ -47,5 +47,160 @@
         "enm_login_url":      "https://lhgenm1.globetel.com/login",
         "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
         "upgrade_package_id": "CXP2010174/2-R42J13"
+    },
+
+    "_comment_cutover": "Cut Over. EVERY command below is operator-editable — no rebuild and no app restart needed (this block is re-read at the start of each run). WARNING: unlock.command_template is DESTRUCTIVE — it unlocks live cells on a production network. Validate with dry_run=true first. Placeholders: {mo_type} {cell_dn} {mo_ref} {node}.",
+    "cutover": {
+        "enabled": true,
+        "dry_run": false,
+        "require_confirmation": true,
+        "max_cells_per_unlock": 0,
+
+        "discovery": {
+            "lte_band_command": "hgetc ^eutrancell[FT]DD= freqBand$",
+            "nr_band_command":  "hgetc nrcelldu bandListManual",
+            "command_timeout_s": 120,
+            "amos_timeout_s": 180,
+            "mo_types": ["EUtranCellFDD", "EUtranCellTDD", "NRCellDU"],
+            "nr_multiband_policy": "first",
+            "include_unmapped_bands": true
+        },
+
+        "_comment_band_groups": "band_key -> group. Band keys come from band_detector.LTE_FREQ_BAND_MAP / NR_BAND_LIST_MAP. A band_key not listed here lands in UNMAPPED and is NEVER unlocked by any button.",
+        "band_groups": {
+            "LB": ["L700", "L800", "L900", "NR700"],
+            "MB": ["L1800", "L1900", "L2100", "NR1800", "NR1900", "NR2100"],
+            "HB": ["L2300", "L2600", "NR2600", "NR3500"]
+        },
+        "group_order": ["LB", "MB", "HB"],
+        "stop_on_group_failure": false,
+
+        "unlock": {
+            "_comment": "One MO per command — never a regex that could match a whole node. NOTE: `deb`/`bl` is the standard moshell deblock/block pair; `ldeb` is kept here because that is what was specified for this environment. Correct either here without a rebuild.",
+            "command_template": "ldeb {mo_type}={cell_dn}",
+            "lock_command_template": "bl {mo_type}={cell_dn}",
+            "graceful_lock": false,
+            "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
+            "expects_confirm": true,
+            "confirm_answer": "y",
+            "command_timeout_s": 120,
+            "inter_command_delay_s": 0.5,
+            "parallel_nodes": true,
+            "abort_group_on_first_error": true,
+            "error_patterns": ["ERROR", "Unable to", "not found", "No MOs", "Syntax error", "failed"]
+        },
+
+        "_comment_prestate": "Snapshot cell state BEFORE anything is sent. This is what makes rollback safe: a cell already unlocked when the run starts may be carrying live customers, so it is neither unlocked nor re-locked by this app.",
+        "prestate": {
+            "enabled": true,
+            "skip_already_in_service": true
+        },
+
+        "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",
+        "diagnosis": {
+            "enabled": true,
+            "radio_status_template": "st B{band_number}",
+            "barred_command_template": "hget {mo_type}={cell_dn} cellBarred|cellReservedForOperatorUse",
+            "command_timeout_s": 60,
+            "check_barred_before_traffic": true
+        },
+
+        "_comment_endc": "NR needs its LTE anchor in service. LB/MB/HB cuts across RAT, so unlocking a high group first can leave NR cells at 0 UEs for a reason that is purely ordering.",
+        "endc": {
+            "warn_nr_without_anchor": true,
+            "lte_before_nr": true
+        },
+
+        "enable_poll": {
+            "_comment": "source=stzrc reuses the traffic command, whose LTECell/NRCell tables carry an S state column — one command per poll instead of two. Set source=st to use the commands list instead. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
+            "source": "stzrc",
+            "commands": ["st cell"],
+            "command_timeout_s": 90,
+            "interval_s": 15,
+            "interval_max_s": 60,
+            "backoff_after_s": 120,
+            "timeout_s": 900,
+            "max_polls": 200,
+            "require_admin_unlocked": true,
+            "enabled_op_states": ["ENABLED"],
+            "row_regex": "",
+            "match_mode": "suffix",
+            "max_unmatched_polls": 3,
+            "min_enabled_ratio": 0.0,
+            "reconnect_credit_threshold_s": 60
+        },
+
+        "traffic": {
+            "_comment": "stzrc prints ;-delimited LTECell/NRCell tables carrying both an S state column and a UEs column, and is parsed natively. Traffic = the UEs column going 0 -> non-zero for required_consecutive_samples polls in a row. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
+            "command": "stzrc",
+            "command_timeout_s": 120,
+            "interval_s": 20,
+            "timeout_s": 600,
+            "ue_column_names": ["UE", "UEs", "NoOfUsers", "nrOfRrcConnected", "connectedUsers", "RrcConnected"],
+            "ue_regex": "",
+            "ue_threshold": 1,
+            "required_consecutive_samples": 2,
+            "use_peak": true,
+            "on_parse_failure": "manual_confirm",
+            "unknown_command_patterns": ["Unknown command", "Syntax error", "command not found", "Invalid command"]
+        },
+
+        "_comment_alarm": "baseline_before_unlock captures `alt` before the first unlock so the evidence can separate alarms this cut over caused from ones the site already had.",
+        "alarm": {
+            "command": "alt",
+            "command_timeout_s": 120,
+            "baseline_before_unlock": true,
+            "no_alarm_patterns": ["No Active alarms"]
+        },
+
+        "report": {
+            "screenshot_subdir": "CUTOVER",
+            "filename_template": "{shortcode}_CUTOVER_{group}_{timestamp}.png",
+            "title_template": "{shortcode} - Cut Over {group} - {nodes}",
+            "max_width": 1600,
+            "terminal_style": {
+                "bg_color": [12, 12, 12],
+                "text_color": [204, 204, 204],
+                "header_color": [0, 255, 0],
+                "font_size": 13,
+                "font": "Consolas",
+                "padding": 20,
+                "line_spacing": 4
+            },
+            "whatsapp": {
+                "enabled": true,
+                "mode": "semi_auto",
+                "group_link": "",
+                "caption_template": "Cut Over {group} - {shortcode}\nNodes: {nodes}\nCells enabled: {ok}/{total}\nTraffic OK: {traffic_ok}\nAlarms: {alarms}"
+            }
+        },
+
+        "_comment_final_verification": "PLUGGABLE — add the real post-cutover checks here later, no rebuild. scope: per_node | once. expect_regex empty = informational only (always passes). fail_regex, when matched, forces a fail.",
+        "final_verification": {
+            "enabled": true,
+            "stop_on_failure": false,
+            "steps": [
+                {
+                    "key": "final_alarms",
+                    "label": "Final alarm check",
+                    "command": "alt",
+                    "scope": "per_node",
+                    "timeout_s": 120,
+                    "expect_regex": "",
+                    "fail_regex": "CRITICAL|MAJOR",
+                    "screenshot": true
+                },
+                {
+                    "key": "final_cell_state",
+                    "label": "Final cell state",
+                    "command": "st cell",
+                    "scope": "per_node",
+                    "timeout_s": 120,
+                    "expect_regex": "",
+                    "fail_regex": "DISABLED",
+                    "screenshot": true
+                }
+            ]
+        }
     }
 }

@@ -12,7 +12,7 @@ Everything that shows a version (window title, About, exe metadata) reads it
 from here, so there is exactly one place to update.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.7.0"
 
 # Human-friendly app name used in titles.
 APP_NAME = "NodeCraft"

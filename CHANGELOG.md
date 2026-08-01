@@ -4,6 +4,120 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.0] — 2026-08-01
+
+### Fixed
+- **Cut Over traffic detection never matched a single cell.** Real `stzrc`
+  output abbreviates the MO class — `FDD=…`, `TDD=…`, `DU=…` — but the parser
+  only accepted the full `EUtranCellFDD=` / `NRCellDU=` forms. Every run would
+  therefore have fallen into the manual-confirmation gate. The short forms are
+  now accepted and canonicalised, so `hgetc` names and `stzrc` names resolve to
+  the same cell.
+- **UE lookup could silently read 0 forever.** Traffic used an exact `mo_ref`
+  match while cell status used tolerant matching, so any difference in DN form
+  between the two commands looked identical to "no traffic" and stalled the run
+  for the full timeout. New `ue_for_cell()` mirrors `match_row` (exact → DN →
+  suffix; ambiguity resolves to nothing rather than a guess).
+
+### Added
+- **`stzrc` parsed natively.** Its `;`-delimited LTECell/NRCell tables are read
+  header-first, giving per-cell state (`S`), UE count, band, alarm indicator and
+  the `TABREMDF` flags, plus the `Total: N Cells (M up)` footer as a free sanity
+  check. Because `stzrc` carries state *and* traffic, the enable poll now
+  sources state from it too (`enable_poll.source`) — one command per poll
+  instead of two, which matters on a node that is busy mid-cutover.
+- **Rollback.** A **Re-lock** button per band group plus **Roll Back All**, so a
+  cutover that isn't working can be reversed from the app instead of hand-typing
+  MOs in a terminal at the worst possible moment. It only ever touches cells
+  *this run* unlocked, and has its own confirmation listing the literal commands.
+- **Pre-state snapshot.** Cell state is captured before anything is sent. A cell
+  already unlocked and carrying customers is marked *already in service*, is not
+  unlocked, and — the point of the whole thing — is never re-locked by a
+  rollback. Such rows render dimmed so they read as "not ours".
+- **Diagnosis instead of silent timeouts.** A cell stuck at
+  `DEPENDENCY_LOCKED` now triggers a radio check (`st B<band>`) and reports
+  *"the B3 radio is locked"* rather than spinning for 15 minutes; a cell that is
+  up but **barred** is detected before the traffic wait starts, since no UE can
+  ever camp on it.
+- **Alarm baseline diff.** `alt` is captured before the first unlock, so the
+  evidence screenshot highlights alarms this cut over actually caused instead of
+  ones the site already had.
+- **EN-DC ordering.** Unlocking NR with no LTE anchor in service now warns
+  first, and `Unlock All` sends LTE before NR within a group — otherwise NR
+  cells sit at 0 UEs for a reason that is purely ordering and looks like a fault.
+- **Traffic needs to be sustained.** A cell is confirmed only after N
+  consecutive samples at or above the threshold (default 2), so a transient blip
+  no longer ends the gate early.
+
+### Changed
+- New `config.json` keys, all editable without a rebuild: `enable_poll.source`,
+  `unlock.lock_command_template` / `graceful_lock`,
+  `diagnosis.radio_status_template` / `barred_command_template`,
+  `traffic.required_consecutive_samples`, `alarm.baseline_before_unlock`,
+  `prestate.*`, `endc.*`. Note in the config that `deb`/`bl` is the standard
+  moshell pair — `ldeb` is kept because that is what this environment specified.
+
+## [1.6.0] — 2026-08-01
+
+### Added
+- **Cut Over.** A new workflow that brings a newly integrated node into service
+  by unlocking its cells one band group at a time and proving each group carries
+  traffic before moving on. Replaces doing this by hand in a terminal.
+  - **Discovery**: SSHes and AMOSes into every node on the form, lists all cells
+    with their bands, and sorts them into **LB** (700/900), **MB** (1800/2100)
+    and **HB** (2300/2600). One combined list across nodes.
+  - **Per-group unlock**: each band group has its own `Unlock` button in its
+    section header (so it is never ambiguous which cells a button acts on), plus
+    an `Unlock All` that runs LB→MB→HB in order. After unlocking, the app polls
+    `st cell` until the cells report enabled, then polls the traffic command
+    until the UE column goes non-zero, updating each row live.
+  - **Evidence**: once a group is carrying traffic, the traffic and alarm output
+    is rendered to a PNG under `LOG/<SHORTCODE>/CUTOVER/`, copied to the
+    clipboard, and WhatsApp is opened so the operator can paste and send.
+  - **Safety**: a confirmation dialog lists the literal commands before anything
+    is sent; one command is issued per MO so no pattern can unlock a whole node
+    at once; cells whose band is not mapped to a group are shown but never
+    unlocked; and a `dry_run` flag logs commands without sending them.
+    Cancelling stops the run but does **not** re-lock cells.
+  - **Everything is configurable** in `config.json` under `cutover` — commands,
+    band→group mapping, poll intervals and timeouts — so a command spelling can
+    be corrected without a rebuild. A `final_verification.steps` list is the
+    pluggable slot for the post-cutover checks (empty for now).
+  - Parsers are deliberately conservative: both known `st cell` layouts are
+    handled, NR multi-band array output (`i[1]`/`i[2]` continuation lines) is
+    parsed correctly, an ambiguous status row never resolves to a guess, and an
+    unreadable UE column raises a manual-confirmation gate rather than inventing
+    a traffic figure.
+- `cutover` added as a licensable feature, alongside the existing four.
+
+### Changed
+- **Main form buttons regrouped.** They were a single row of five; adding Cut
+  Over made six, which overflowed the panel. Now two labelled tiers —
+  **Workflows** (Integration Launch, Cut Over, TRFS Launch) and **Tools**
+  (Terminal, CDD Audit, Clear Data) — both wrapping, so nothing collides at the
+  1080 px window minimum.
+
+## [1.5.0] — 2026-08-01
+
+### Added
+- **Per-feature licensing.** A single license key can now unlock any subset of
+  the four modules — **Integration**, **Terminal**, **CDD Audit**, and **TRFS** —
+  instead of granting everything. The enabled modules are stored in a new
+  `features` field inside the signed payload, so they cannot be tampered with.
+  - `license_manager.py`: new `ALL_FEATURES`, `get_enabled_features(payload)`
+    and `has_feature(payload, feature)` helpers. **Backward compatible** — keys
+    issued before this change (no `features` field) still unlock everything, and
+    `features: "all"`/`"*"` is treated as a full license.
+  - `gui/form_page.py`: the Integration, Terminal, CDD Audit and TRFS buttons
+    are disabled (with an explanatory tooltip) when the active license does not
+    include that feature; the click handlers also guard against it.
+  - **License generator web app**: the single-key form gained per-feature
+    checkboxes, and the bulk template gained an optional **Features** column
+    (accepts `all`, blank, or a list like `integration, audit`). Keys are now
+    signed directly in the web app so the feature list is embedded without
+    touching the private keygen module. Generated Excel/results now show a
+    **Features** column.
+
 ## [1.4.0] — 2026-07-30
 
 ### Added
