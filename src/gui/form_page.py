@@ -491,7 +491,7 @@ class FormPage:
                                 icon=ft.Icons.INTEGRATION_INSTRUCTIONS,
                                 disabled=FEATURE_INTEGRATION not in self._features,
                                 tooltip=(
-                                    None
+                                    "Start the node integration workflow"
                                     if FEATURE_INTEGRATION in self._features
                                     else self._feature_locked_tooltip("Integration")
                                 ),
@@ -536,10 +536,8 @@ class FormPage:
                                 icon=ft.Icons.PLAY_CIRCLE_FILL_ROUNDED,
                                 disabled=True,
                                 tooltip=(
-                                    "TRFS Launch is disabled in this build. "
-                                    "Re-enable by removing 'disabled=True' "
-                                    "in form_page.py and re-installing "
-                                    "Playwright + Chromium."
+                                    "TRFS Automation is Not Activated, "
+                                    "Contact Me To activate"
                                 ),
                                 style=ft.ButtonStyle(
                                     bgcolor=PANEL_RAISED,

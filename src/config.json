@@ -33,6 +33,11 @@
         "N":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt"
     },
 
+    "_comment_relation_journal": "Resumable Relation execution. Each .txt runs separately and is atomically journaled after a completion sentinel + per-file log parse. Interrupted files stay AMBIGUOUS and require operator confirmation before that file alone is retried.",
+    "relation_journal_enabled": true,
+    "relation_file_timeout_s": 3600,
+    "relation_file_quiet_s": 3.0,
+
     "_comment_external_alarm": "Pre-define External Alarm — moshell template that creates the 8 AlarmPort MOs on the primary BB. LTE primary only.",
     "external_alarm_template": "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
 
@@ -90,10 +95,36 @@
             "error_patterns": ["ERROR", "Unable to", "not found", "No MOs", "Syntax error", "failed"]
         },
 
-        "_comment_prestate": "Snapshot cell state BEFORE anything is sent. This is what makes rollback safe: a cell already unlocked when the run starts may be carrying live customers, so it is neither unlocked nor re-locked by this app.",
+        "_comment_preparation": "Runs automatically when the Cut Over page opens, before cell discovery can become READY. All enabled steps are hard gates. prehc.script_path is the absolute path visible from the Moshell/ENM session; command_template can be adjusted if the local Moshell uses a different script command. Step logs/checkpoint/manifest use a unique run folder under LOG/<site>/PRE_CUTOVER/, while Cut Over modump ZIPs go directly to LOG/<site>/PRE_CUTOVER/DUMP/. Integration dump storage is unchanged.",
+        "preparation": {
+            "enabled": true,
+            "stop_on_failure": true,
+            "create_cv": {
+                "enabled": true,
+                "name_template": "PreCutover_{node}_{timestamp}"
+            },
+            "modump": {
+                "enabled": true
+            },
+            "prehc": {
+                "enabled": true,
+                "script_path": "",
+                "command_template": "run {script_path}",
+                "timeout_s": 900,
+                "error_patterns": ["ERROR", "Unknown command", "Syntax error", "command not found"]
+            }
+        },
+
+        "_comment_prestate": "Required hard gate. Every discovered cell must match a live pre-state row before READY. A failed or partial read blocks Cut Over so rollback ownership is never guessed.",
         "prestate": {
             "enabled": true,
+            "required": true,
             "skip_already_in_service": true
+        },
+
+        "persistence": {
+            "enabled": true,
+            "checkpoint_interval_s": 0.5
         },
 
         "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",

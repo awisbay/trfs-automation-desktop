@@ -21,7 +21,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -96,6 +96,8 @@ STATUS_ICON_STATE = {
 
 class RunPhase(str, Enum):
     IDLE = "idle"
+    PREPARING = "preparing"
+    RECOVERING = "recovering"
     DISCOVERING = "discovering"
     READY = "ready"
     UNLOCKING = "unlocking"
@@ -159,6 +161,9 @@ class CutoverCell:
     #: rollback, because it may be carrying live customers.
     was_unlocked_before: bool = False
     already_in_service: bool = False
+    #: Set immediately before this run sends an unlock command. Persisted in
+    #: the recovery checkpoint so a restarted app never blindly replays it.
+    was_unlocked_by_run: bool = False
 
     # ── diagnosis ────────────────────────────────────────────────
     cell_barred: Optional[bool] = None   # None = unknown, never assumed False
@@ -199,7 +204,11 @@ class CutoverCell:
     def is_unlockable(self) -> bool:
         """UNMAPPED cells are never unlocked by any button, and a cell that
         was already in service before we started is not ours to touch."""
-        return self.group != UNMAPPED and not self.already_in_service
+        return (
+            self.group != UNMAPPED
+            and not self.already_in_service
+            and not self.was_unlocked_by_run
+        )
 
     @property
     def is_relockable(self) -> bool:
@@ -210,10 +219,10 @@ class CutoverCell:
         a live cell carrying customers out of service.
         """
         return (
-            not self.was_unlocked_before
+            self.was_unlocked_by_run
+            and not self.was_unlocked_before
             and not self.already_in_service
-            and self.status not in (CellStatus.PENDING, CellStatus.SKIPPED,
-                                    CellStatus.RELOCKED)
+            and self.status not in (CellStatus.SKIPPED, CellStatus.RELOCKED)
         )
 
     def short_label(self) -> str:
@@ -334,6 +343,9 @@ class CutoverRun:
     #: node -> raw `alt` output captured before the first unlock, so the
     #: evidence can show alarms this cut over actually caused.
     alarm_baseline: dict = field(default_factory=dict)
+    #: Paths only; raw outputs stay in separate files so the structured
+    #: checkpoint and final manifest remain compact.
+    artifacts: dict = field(default_factory=dict)
 
     # ── concurrency ──────────────────────────────────────────────
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -341,6 +353,9 @@ class CutoverRun:
     version: int = 0
     dirty_cells: set = field(default_factory=set)
     dirty_meta: bool = False
+    on_change: Optional[Callable[[], None]] = field(
+        default=None, repr=False, compare=False,
+    )
 
     # ── mutation helpers — always call under self.lock ────────────
     def touch(self, cell: Optional[CutoverCell] = None) -> None:
@@ -350,6 +365,11 @@ class CutoverRun:
             self.dirty_cells.add(cell.key)
         else:
             self.dirty_meta = True
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                pass
 
     def set_cell(self, cell: CutoverCell, status: Optional[CellStatus] = None,
                  **fields) -> None:

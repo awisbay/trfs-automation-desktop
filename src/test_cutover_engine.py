@@ -9,7 +9,9 @@ now polls for both cell state and traffic.
     python3 src/test_cutover_engine.py
 """
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 
@@ -170,6 +172,11 @@ def build_engine(tmpdir, fake, **over):
     cfg["traffic"]["timeout_s"] = 4
     cfg["unlock"]["inter_command_delay_s"] = 0
     cfg["diagnosis"]["command_timeout_s"] = 5
+    cfg["persistence"]["enabled"] = False
+    # Most engine smoke tests exercise discovery/unlock. The preparation
+    # pipeline has its own focused check below and uses production defaults in
+    # the real config.
+    cfg["preparation"]["enabled"] = False
     cfg["require_confirmation"] = False
     for k, v in over.items():
         section, _, key = k.partition("__")
@@ -423,6 +430,185 @@ check("phase DONE", eng12.run.phase == RunPhase.DONE, str(eng12.run.phase))
 check("configured steps ran",
       all(s.status in ("pass", "fail") for s in eng12.run.final_steps),
       str([(s.key, s.status) for s in eng12.run.final_steps]))
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[13] pre-state failure is a hard gate")
+fake13 = FakeSSH(no_cell_table=True)
+eng13 = build_engine(tmpdir, fake13)
+eng13.start_discovery(); wait_idle(eng13)
+check("missing pre-state table blocks READY",
+      eng13.run.phase == RunPhase.FAILED, str(eng13.run.phase))
+eng13.unlock_group("LB"); wait_idle(eng13)
+check("no unlock command after pre-state failure",
+      not any(s.startswith("ldeb") for s in fake13.sent), str(fake13.sent))
+
+
+class PartialPrestateSSH(FakeSSH):
+    def _stzrc(self):
+        original = list(self.all_cells)
+        self.all_cells = [c for c in original if c != "SITEA-12"]
+        try:
+            return super()._stzrc()
+        finally:
+            self.all_cells = original
+
+
+fake13b = PartialPrestateSSH()
+eng13b = build_engine(tmpdir, fake13b)
+eng13b.start_discovery(); wait_idle(eng13b)
+check("partial pre-state blocks READY",
+      eng13b.run.phase == RunPhase.FAILED, str(eng13b.run.phase))
+check("partial pre-state does not mutate ownership flags",
+      not any(c.was_unlocked_before for c in eng13b.run.cells))
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[14] pre-Cut Over preparation runs CV, modump, preHC in order")
+fake14 = FakeSSH()
+eng14 = build_engine(tmpdir, fake14)
+eng14.cfg["preparation"]["enabled"] = True
+eng14.cfg["preparation"]["prehc"]["script_path"] = "/enm/preHC.mos"
+prep_calls = []
+orig_cv = cutover_runner.run_cutover_create_cv
+orig_dump = cutover_runner.run_cutover_modump
+orig_hc = cutover_runner.run_cutover_prehc
+try:
+    cutover_runner.run_cutover_create_cv = (
+        lambda *a, **k: (prep_calls.append("CV") or True, "cv output")
+    )
+    cutover_runner.run_cutover_modump = (
+        lambda *a, **k: (prep_calls.append("MODUMP") or True, "dump output")
+    )
+    cutover_runner.run_cutover_prehc = (
+        lambda *a, **k: (prep_calls.append("PREHC") or True, "prehc output")
+    )
+    eng14.start_discovery(); wait_idle(eng14)
+finally:
+    cutover_runner.run_cutover_create_cv = orig_cv
+    cutover_runner.run_cutover_modump = orig_dump
+    cutover_runner.run_cutover_prehc = orig_hc
+check("preparation order", prep_calls == ["CV", "MODUMP", "PREHC"],
+      str(prep_calls))
+check("preparation permits READY only after all pass",
+      eng14.run.phase == RunPhase.READY, str(eng14.run.phase))
+prep_root = os.path.join(tmpdir, "PRE_CUTOVER", eng14._preparation_started_at)
+check("preparation logs persisted",
+      all(os.path.exists(os.path.join(prep_root, f"NODEA_{step}.log"))
+          for step in ("CREATE_CV", "MODUMP", "PREHC")), prep_root)
+
+fake14b = FakeSSH()
+eng14b = build_engine(tmpdir, fake14b)
+eng14b.cfg["preparation"]["enabled"] = True
+failed_calls = []
+try:
+    cutover_runner.run_cutover_create_cv = (
+        lambda *a, **k: (failed_calls.append("CV") and True, "cv failed")
+    )
+    cutover_runner.run_cutover_modump = (
+        lambda *a, **k: (failed_calls.append("MODUMP") or True, "dump output")
+    )
+    cutover_runner.run_cutover_prehc = (
+        lambda *a, **k: (failed_calls.append("PREHC") or True, "prehc output")
+    )
+    eng14b.start_discovery(); wait_idle(eng14b)
+finally:
+    cutover_runner.run_cutover_create_cv = orig_cv
+    cutover_runner.run_cutover_modump = orig_dump
+    cutover_runner.run_cutover_prehc = orig_hc
+check("failed preparation blocks Cut Over",
+      eng14b.run.phase == RunPhase.FAILED, str(eng14b.run.phase))
+check("stop_on_failure prevents later preparation steps",
+      failed_calls == ["CV"], str(failed_calls))
+check("discovery did not run after preparation failure",
+      not any(s.startswith("hgetc") for s in fake14b.sent), str(fake14b.sent))
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[15] restart recovery reconciles without replaying unlock")
+recovery_dir = tempfile.mkdtemp(prefix="cutover-recovery-test-")
+try:
+    fake15 = FakeSSH(traffic_after=0)
+    eng15a = build_engine(
+        recovery_dir, fake15, persistence__enabled=True,
+    )
+    eng15a.start_discovery(); wait_idle(eng15a)
+    recovered_cell = eng15a.run.cells_of("LB")[0]
+    fake15.unlocked.add(recovered_cell.cell_dn)
+    eng15a.run.set_cell(
+        recovered_cell, CellStatus.UNLOCK_SENT,
+        was_unlocked_by_run=True,
+        unlock_command=f"ldeb {recovered_cell.mo_ref}",
+        status_detail="command sent before simulated restart",
+    )
+    checkpoint15 = eng15a._persist_checkpoint()
+    check("checkpoint created", os.path.isfile(checkpoint15), checkpoint15)
+    ldeb_before_recovery = sum(1 for c in fake15.sent if c.startswith("ldeb"))
+    eng15a.shutdown()
+
+    eng15b = build_engine(
+        recovery_dir, fake15, persistence__enabled=True,
+    )
+    check("unfinished run detected",
+          eng15b.recovery_checkpoint == checkpoint15,
+          str(eng15b.recovery_checkpoint))
+    eng15b.recover("resume"); wait_idle(eng15b)
+    check("recovery returns READY", eng15b.run.phase == RunPhase.READY,
+          str(eng15b.run.phase))
+    check("recovery never replays ldeb",
+          sum(1 for c in fake15.sent if c.startswith("ldeb"))
+          == ldeb_before_recovery, str(fake15.sent))
+    restored = eng15b.run.by_key[recovered_cell.key]
+    check("recovered cell remains owned by original run",
+          restored.was_unlocked_by_run and not restored.is_unlockable)
+    check("untouched sibling remains resumable",
+          len(eng15b.run.unlockable_cells_of("LB")) == 1,
+          str([c.cell_dn for c in eng15b.run.unlockable_cells_of("LB")]))
+
+    eng15b.run_final_verification(); wait_idle(eng15b)
+    manifest15 = os.path.join(
+        os.path.dirname(checkpoint15), "manifest.json",
+    )
+    check("immutable manifest created", os.path.isfile(manifest15), manifest15)
+    check("manifest checksum created",
+          os.path.isfile(manifest15 + ".sha256"))
+    check("checkpoint retired after finalization",
+          not os.path.exists(checkpoint15))
+    check("manifest stays compact",
+          os.path.getsize(manifest15) < 200_000,
+          str(os.path.getsize(manifest15)))
+    eng15b.shutdown()
+finally:
+    shutil.rmtree(recovery_dir, ignore_errors=True)
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[16] recovery rollback reconciles then locks only run-owned cells")
+rollback_dir = tempfile.mkdtemp(prefix="cutover-rollback-test-")
+try:
+    fake16 = FakeSSH()
+    eng16a = build_engine(rollback_dir, fake16, persistence__enabled=True)
+    eng16a.start_discovery(); wait_idle(eng16a)
+    owned16 = eng16a.run.cells_of("LB")[0]
+    fake16.unlocked.add(owned16.cell_dn)
+    eng16a.run.set_cell(
+        owned16, CellStatus.UNLOCK_SENT,
+        was_unlocked_by_run=True,
+        unlock_command=f"ldeb {owned16.mo_ref}",
+    )
+    checkpoint16 = eng16a._persist_checkpoint()
+    eng16a.shutdown()
+
+    eng16b = build_engine(rollback_dir, fake16, persistence__enabled=True)
+    eng16b.recover("rollback"); wait_idle(eng16b)
+    bl16 = [c for c in fake16.sent if c.startswith("bl ")]
+    check("rollback sent one lock for the owned cell",
+          len(bl16) == 1 and owned16.cell_dn in bl16[0], str(bl16))
+    check("rollback never locks untouched sibling",
+          not any("SITEA-12" in c for c in bl16), str(bl16))
+    check("rollback recovery finalized",
+          eng16b.run.phase == RunPhase.DONE, str(eng16b.run.phase))
+    manifest16 = os.path.join(os.path.dirname(checkpoint16), "manifest.json")
+    check("rollback manifest created", os.path.isfile(manifest16), manifest16)
+    eng16b.shutdown()
+finally:
+    shutil.rmtree(rollback_dir, ignore_errors=True)
 
 # ──────────────────────────────────────────────────────────────────
 print()

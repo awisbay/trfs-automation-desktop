@@ -394,8 +394,20 @@ class AuditPage:
             found = list(dumps)
             if not is_batch and (lte or nr or lld):
                 dump_dir = os.path.join(get_app_dir(), "LOG", safe, "DUMP")
-                auto = (sorted(glob.glob(os.path.join(dump_dir, "*_cmdump.zip")))
-                        + sorted(glob.glob(os.path.join(dump_dir, "*_modump.zip"))))
+                root_cmdumps = sorted(
+                    glob.glob(os.path.join(dump_dir, "*_cmdump.zip")),
+                    key=os.path.getmtime, reverse=True,
+                )
+                root_modumps = glob.glob(os.path.join(dump_dir, "*_modump.zip"))
+                cutover_modumps = glob.glob(os.path.join(
+                    get_app_dir(), "LOG", safe, "PRE_CUTOVER", "DUMP",
+                    "*_modump_*.zip",
+                ))
+                modumps = sorted(
+                    root_modumps + cutover_modumps,
+                    key=os.path.getmtime, reverse=True,
+                )
+                auto = root_cmdumps + modumps
                 if not auto and not dumps:
                     self._log(f"⚠ No dumps in {dump_dir} and none browsed — "
                               "LTE/NR audit will find nothing.")
@@ -405,7 +417,10 @@ class AuditPage:
                     self._log(f"  ✗ dump not found: {path}")
                     continue
                 base = os.path.basename(path)
-                node = re.sub(r"_(cm|mo)dump\.(zip|gz|log|xml)$", "", base)
+                node = re.sub(
+                    r"_(cm|mo)dump(?:_\d{8}_\d{6})?\.(zip|gz|log|xml)$",
+                    "", base,
+                )
                 node = re.sub(r"\.(zip|gz|log|xml)$", "", node)
                 # Scope to the entered Site ID — a browsed dump left over from a
                 # previous site (the field isn't cleared when Site ID changes)

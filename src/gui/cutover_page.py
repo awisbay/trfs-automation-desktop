@@ -402,11 +402,75 @@ class CutOverPage:
             ),
         )
 
-        self.engine.start_discovery()
+        if self.engine.recovery_checkpoint:
+            self.status_text.value = "Unfinished Cut Over found — action required"
+            self.page.run_task(self._show_recovery_prompt)
+        else:
+            self.engine.start_discovery()
         self.page.run_task(self._flush_loop)
 
         return ft.View(route="/cutover", padding=0, spacing=0, bgcolor=BG_TOP,
                        controls=[body])
+
+    async def _show_recovery_prompt(self):
+        """Offer only reconciled recovery actions; never silently resume."""
+        await asyncio.sleep(0.2)
+        info = self.engine.recovery_info()
+        cells = info.get("cells", [])
+        attempted = sum(1 for c in cells if c.get("was_unlocked_by_run"))
+
+        def _choose(mode: str):
+            self._close_dialog(dlg)
+            if mode == "close":
+                try:
+                    path = self.engine.close_recovery_as_incomplete()
+                    self.status_text.value = "Previous run closed as INCOMPLETE"
+                    self.engine.log(f"Previous run manifest saved: {path}")
+                    self.engine.start_discovery()
+                except Exception as exc:
+                    self._alert("Recovery", f"Could not close checkpoint: {exc}")
+                return
+            self.engine.recover(mode)
+            self._refresh_chrome()
+            self.page.update()
+
+        body = ft.Column(
+            [
+                ft.Text(
+                    "An unfinished Cut Over exists for this site. The tool "
+                    "will reconnect and read back every saved cell before any "
+                    "resume or rollback action.",
+                    size=13, color=TEXT,
+                ),
+                ft.Text(
+                    f"Run: {info.get('run_id', '?')}\n"
+                    f"Last phase: {info.get('phase', '?')}\n"
+                    f"Cells: {len(cells)} · attempted by run: {attempted}",
+                    size=11, color=TEXT_MUTED, selectable=True,
+                ),
+            ],
+            spacing=10, tight=True, width=560,
+        )
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Recover unfinished Cut Over", color=ACCENT_WARM),
+            content=body,
+            actions=[
+                ft.TextButton(
+                    "Close incomplete & start new",
+                    on_click=lambda e: _choose("close"),
+                ),
+                ft.OutlinedButton(
+                    "Reconcile & Roll Back",
+                    on_click=lambda e: _choose("rollback"),
+                ),
+                ft.ElevatedButton(
+                    "Reconcile & Resume",
+                    on_click=lambda e: _choose("resume"),
+                ),
+            ],
+        )
+        self._show_dialog(dlg)
 
     # ── the single repainter ─────────────────────────────────────
     async def _flush_loop(self):
@@ -506,13 +570,20 @@ class CutOverPage:
                 len(run.unlockable_cells_of(name)),
                 len(run.relockable_cells_of(name)),
             )
+            if run.phase != RunPhase.READY:
+                section.button.disabled = True
+                section.button.tooltip = (
+                    "Cut Over preparation and pre-state must be READY first"
+                )
 
         discovered = bool(run.cells)
         any_unlockable = any(run.unlockable_cells_of(g)
                              for g in self.cfg["group_order"])
         any_relockable = sum(len(run.relockable_cells_of(g))
                              for g in self.cfg["group_order"])
-        self.unlock_all_btn.disabled = busy or not any_unlockable
+        self.unlock_all_btn.disabled = (
+            busy or run.phase != RunPhase.READY or not any_unlockable
+        )
         self.verify_btn.disabled = busy or not discovered
         self.relock_all_btn.visible = any_relockable > 0
         self.relock_all_btn.disabled = busy or not any_relockable
@@ -524,6 +595,8 @@ class CutOverPage:
 
         phase_text = {
             RunPhase.IDLE: "Idle",
+            RunPhase.PREPARING: "Preparing Cut Over — CV, modump, and preHC…",
+            RunPhase.RECOVERING: "Recovering — reconciling live node state…",
             RunPhase.DISCOVERING: "Discovering cells…",
             RunPhase.READY: "Ready — pick a band group to unlock",
             RunPhase.UNLOCKING: f"Unlocking {run.active_group}…",
