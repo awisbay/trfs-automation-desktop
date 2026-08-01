@@ -12,6 +12,7 @@ import uuid
 from typing import Callable, Optional
 
 import paramiko
+import relation_journal
 
 logger = logging.getLogger(__name__)
 
@@ -2875,8 +2876,9 @@ def run_relation(
         )
     else:
         return _run_relation_zip(
-            ssh, node_name, shortcode, remote_dir, filename, log_dir, log_cb,
-            all_output, wait_for_user, ui_cb=ui_cb,
+            ssh, node_name, shortcode, remote_dir, filename,
+            relation_local_path, log_dir, log_cb, all_output,
+            wait_for_user, ui_cb=ui_cb,
         )
 
 
@@ -2948,6 +2950,7 @@ def _run_relation_zip(
     shortcode: str,
     remote_dir: str,
     zip_filename: str,
+    relation_local_path: str,
     log_dir: str,
     log_cb: Callable[[str], None],
     all_output: str,
@@ -3054,6 +3057,17 @@ def _run_relation_zip(
         return False, all_output
 
     log_cb(f"Found {len(txt_files)} relation file(s) to run.")
+
+    # Production path: execute and confirm one file at a time, persisting a
+    # small journal after every file. The legacy single-batch implementation
+    # remains below as an emergency config fallback.
+    if _CFG.get("relation_journal_enabled", True):
+        return _run_relation_files_resumable(
+            ssh, node_name, shortcode, relation_local_path=relation_local_path,
+            remote_dir=remote_dir, txt_files=txt_files, log_dir=log_dir,
+            log_cb=log_cb, all_output=all_output,
+            wait_for_user=wait_for_user, ui_cb=ui_cb,
+        )
 
     # ── 5. Generate moshell batch script via bash, then `run` it once ──
     # Produces one `l+ <file>.log / run <file> / l-` block per .txt file.
@@ -3384,6 +3398,302 @@ def _run_relation_zip(
         )
 
     # Relation completes even with errors — user reviews logs later
+    return True, all_output
+
+
+def _relation_sentinel_complete(output: str) -> bool:
+    """The blocking runner only declares completion after this bare nonce."""
+    return bool(re.search(
+        r"(?m)^\s*__TRFS_DONE_[0-9a-fA-F]{8}__\s*$", output or "",
+    ))
+
+
+def _relation_remote_log(
+    ssh: IntegrationSSH,
+    remote_path: str,
+    local_path: str,
+    fallback: str,
+    log_cb: Callable[[str], None],
+) -> tuple[str, str]:
+    """Download one l+/l- log; use only its own session output as fallback."""
+    try:
+        ssh.sftp_download(remote_path, local_path)
+        with open(local_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(), "server l+ log"
+    except Exception as exc:
+        log_cb(f"  ! Could not download {remote_path}: {exc}; using this "
+               f"file's live session output.")
+        with open(local_path, "w", encoding="utf-8") as fh:
+            fh.write(fallback or "")
+        return fallback or "", "per-file session fallback"
+
+
+def _append_relation_log_summary(local_path: str, txt_name: str,
+                                 remote_path: str, parsed: dict) -> None:
+    with open(local_path, "a", encoding="utf-8") as fh:
+        fh.write("\n\n" + "=" * 72 + "\nSUMMARY\n" + "=" * 72 + "\n")
+        fh.write(f"File: {txt_name}\nPath: {remote_path}\n")
+        fh.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.write(f"{parsed['summary_line']}\n")
+        fh.write("\nStatus: " + (
+            "NEEDS REVIEW\n" if parsed["has_issues"] else "OK\n"
+        ))
+        if parsed["has_issues"] and parsed.get("error_lines"):
+            fh.write("\nErrors found:\n" + "-" * 40 + "\n")
+            for line in parsed["error_lines"]:
+                fh.write(f"  {line}\n")
+
+
+def _run_relation_files_resumable(
+    ssh: IntegrationSSH,
+    node_name: str,
+    shortcode: str,
+    relation_local_path: str,
+    remote_dir: str,
+    txt_files: list[str],
+    log_dir: str,
+    log_cb: Callable[[str], None],
+    all_output: str,
+    wait_for_user: Optional[Callable[[str], bool]] = None,
+    ui_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[bool, str]:
+    """Run relation files sequentially with durable per-file completion.
+
+    A local atomic journal is authoritative for already verified files. A
+    remote marker closes the small crash window between Moshell completion and
+    the local journal write. A file that has neither proof is AMBIGUOUS and is
+    never silently skipped or blindly replayed.
+    """
+    if ui_cb is None:
+        ui_cb = log_cb
+    sorted_files = sorted(txt_files)
+    journal_path, journal, resumed = relation_journal.open_or_create(
+        log_dir, node_name, shortcode, relation_local_path,
+        sorted_files, remote_dir,
+    )
+    progress_path = journal["remote_progress_path"]
+    if resumed:
+        done_count = sum(
+            1 for item in journal["items"]
+            if item["status"] in ("VERIFIED_OK", "VERIFIED_WITH_ISSUES")
+        )
+        msg = (f"Relation recovery journal found: {done_count}/"
+               f"{len(sorted_files)} file(s) already verified.")
+        log_cb(msg)
+        ui_cb(msg)
+    else:
+        ssh.run_amos_command_safe(
+            f'!rm -f "{progress_path}" && touch "{progress_path}"',
+            node_name, timeout=15,
+        )
+        log_cb(f"Relation journal created: {journal_path}")
+
+    try:
+        progress_out = ssh.run_amos_command_safe(
+            f'!cat "{progress_path}" 2>/dev/null', node_name, timeout=15,
+        )
+    except Exception:
+        progress_out = ""
+    remote_done = set(re.findall(
+        r"(?m)^DONE\s+([0-9a-f]{16})\s*$", progress_out,
+    ))
+    ssh.register_remote_log(progress_path, subfolder="RELATION")
+
+    full_session_path = os.path.join(
+        log_dir, f"RELATION_{node_name}_FULL_SESSION.txt",
+    )
+    file_summaries = []
+    errors_summary = []
+
+    for item in journal["items"]:
+        index = int(item["index"])
+        txt_name = item["file"]
+        txt_path = item["remote_path"]
+        marker = item["marker"]
+        remote_log = f"{txt_path}.log"
+        local_name = f"RELATION_{node_name}_{txt_name[:-4]}.txt"
+        local_path = os.path.join(log_dir, local_name)
+        ssh.register_remote_log(remote_log, subfolder="RELATION")
+
+        if item["status"] in ("VERIFIED_OK", "VERIFIED_WITH_ISSUES"):
+            ui_cb(f"skipping verified script [{index}/{len(sorted_files)}] "
+                  f"{txt_name}")
+            summary = item.get("summary", "previously verified")
+            file_summaries.append(f"{txt_name[:-4]}  {summary}")
+            if item["status"] == "VERIFIED_WITH_ISSUES":
+                errors_summary.append(f"{txt_name[:-4]}  {summary}")
+            continue
+
+        # The remote marker proves the file returned to Moshell before a prior
+        # process died. Rebuild the local result from its isolated server log.
+        if marker in remote_done:
+            file_output, source = _relation_remote_log(
+                ssh, remote_log, local_path, "", log_cb,
+            )
+            if file_output:
+                parsed = _parse_relation_output(file_output, txt_name)
+                try:
+                    _append_relation_log_summary(
+                        local_path, txt_name, txt_path, parsed,
+                    )
+                except Exception as exc:
+                    log_cb(f"  ! Could not append relation summary: {exc}")
+                item["status"] = (
+                    "VERIFIED_WITH_ISSUES" if parsed["has_issues"]
+                    else "VERIFIED_OK"
+                )
+                item["summary"] = parsed["summary_line"]
+                item["local_log"] = local_path
+                item["completed_at"] = relation_journal.now_iso()
+                relation_journal.save(journal_path, journal)
+                ui_cb(f"reconciled script [{index}/{len(sorted_files)}] "
+                      f"{txt_name} from {source}")
+                summary = f"{txt_name[:-4]}  {parsed['summary_line']}"
+                file_summaries.append(summary)
+                if parsed["has_issues"]:
+                    errors_summary.append(summary)
+                continue
+
+        if item["status"] in ("RUNNING", "AMBIGUOUS"):
+            item["status"] = "AMBIGUOUS"
+            relation_journal.save(journal_path, journal)
+            msg = (
+                f"Relation file {index}/{len(sorted_files)} {txt_name} was "
+                "interrupted and has no durable completion marker. Re-run "
+                "this file only?"
+            )
+            log_cb(f"⚠ {msg}")
+            if not wait_for_user or not wait_for_user(msg):
+                journal["status"] = "INTERRUPTED"
+                relation_journal.save(journal_path, journal)
+                return False, all_output
+
+        while True:
+            item["status"] = "RUNNING"
+            item["attempts"] = int(item.get("attempts", 0)) + 1
+            item["started_at"] = relation_journal.now_iso()
+            item["completed_at"] = ""
+            relation_journal.save(journal_path, journal)
+            ui_cb(f"running script [{index}/{len(sorted_files)}] {txt_name}")
+            log_cb(f"[{index}/{len(sorted_files)}] Running {txt_path}")
+
+            try:
+                ssh.run_amos_command_safe(
+                    f'!rm -f "{remote_log}"', node_name, timeout=15,
+                )
+                ssh.run_amos_command_safe(
+                    f"l+ {remote_log}", node_name, timeout=30,
+                )
+                file_output = ssh.run_amos_blocking_with_sentinel(
+                    f"run {txt_path}", node_name,
+                    timeout=int(_CFG.get("relation_file_timeout_s", 3600)),
+                    quiet_after=float(_CFG.get("relation_file_quiet_s", 3.0)),
+                )
+            except Exception as exc:
+                file_output = f"[RUNNER ERROR] {type(exc).__name__}: {exc}\n"
+            finally:
+                try:
+                    ssh.run_amos_command_safe("l-", node_name, timeout=30)
+                except Exception:
+                    pass
+
+            all_output += f"\n--- {txt_name} ---\n{file_output}"
+            try:
+                with open(full_session_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n\n--- {txt_name} attempt {item['attempts']} ---\n")
+                    fh.write(file_output)
+            except Exception as exc:
+                log_cb(f"Could not append full relation session log: {exc}")
+
+            if not _relation_sentinel_complete(file_output):
+                item["status"] = "AMBIGUOUS"
+                item["summary"] = "completion sentinel not observed"
+                relation_journal.save(journal_path, journal)
+                msg = (
+                    f"{txt_name} did not produce a completion sentinel. Its "
+                    "state is AMBIGUOUS; retry this file only?"
+                )
+                log_cb(f"⚠ {msg}")
+                if wait_for_user and wait_for_user(msg):
+                    continue
+                journal["status"] = "INTERRUPTED"
+                relation_journal.save(journal_path, journal)
+                return False, all_output
+
+            # Persist a gateway-side completion marker before updating the
+            # local journal. If the desktop dies in between, the next run can
+            # still reconcile this exact file from its l+ log.
+            marker_out = ssh.run_amos_command_safe(
+                f'!printf "DONE {marker}\\n" >> "{progress_path}"',
+                node_name, timeout=15,
+            )
+            all_output += marker_out
+            remote_done.add(marker)
+
+            parsed_source, source = _relation_remote_log(
+                ssh, remote_log, local_path, file_output, log_cb,
+            )
+            parsed = _parse_relation_output(parsed_source, txt_name)
+            execution_error = bool(re.search(
+                r"No such file|cannot open|failed to open|Unknown command",
+                file_output, re.IGNORECASE,
+            ))
+            if execution_error and not parsed["has_issues"]:
+                parsed["has_issues"] = True
+                parsed["summary_line"] += "  EXECUTION ERROR"
+            try:
+                _append_relation_log_summary(
+                    local_path, txt_name, txt_path, parsed,
+                )
+            except Exception as exc:
+                log_cb(f"  ! Could not append relation summary: {exc}")
+
+            item["status"] = (
+                "VERIFIED_WITH_ISSUES" if parsed["has_issues"]
+                else "VERIFIED_OK"
+            )
+            item["summary"] = parsed["summary_line"]
+            item["local_log"] = local_path
+            item["completed_at"] = relation_journal.now_iso()
+            relation_journal.save(journal_path, journal)
+            summary = f"{txt_name[:-4]}  {parsed['summary_line']}"
+            file_summaries.append(summary)
+            if parsed["has_issues"]:
+                errors_summary.append(summary)
+            log_cb(f"  → {parsed['summary_line']} [{source}]")
+            break
+
+    journal["status"] = "COMPLETED"
+    journal["completed_at"] = relation_journal.now_iso()
+    relation_journal.save(journal_path, journal)
+
+    summary_log_path = os.path.join(log_dir, f"RELATION_{node_name}_SUMMARY.txt")
+    try:
+        with open(summary_log_path, "w", encoding="utf-8") as fh:
+            fh.write(f"Relation Summary — {node_name}\n")
+            fh.write(f"Run ID: {journal['run_id']}\n")
+            fh.write(f"Input SHA-256: {journal['input_sha256']}\n")
+            fh.write(f"Total files: {len(sorted_files)}\n")
+            fh.write("=" * 90 + "\n\n")
+            for summary in file_summaries:
+                fh.write(summary + "\n")
+            if errors_summary:
+                fh.write("\nFILES WITH ISSUES:\n")
+                for summary in errors_summary:
+                    fh.write("  " + summary + "\n")
+            else:
+                fh.write("\nAll files OK — no errors detected.\n")
+    except Exception as exc:
+        log_cb(f"Failed to save relation summary: {exc}")
+
+    ui_cb(f"Relation finished — {len(sorted_files)}/{len(sorted_files)} "
+          f"file(s) verified; journal complete.")
+    if errors_summary:
+        log_cb(f"⚠ Relation completed with {len(errors_summary)} file(s) "
+               "requiring log review.")
+    else:
+        log_cb(f"✓ All {len(sorted_files)} relation file(s) executed OK for "
+               f"{node_name}.")
     return True, all_output
 
 
@@ -3930,10 +4240,17 @@ def run_backup_cv(
     node_name: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    backup_name: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """Create a pre-integration SHM backup and wait until it succeeds."""
+    """Create an SHM backup and wait until it succeeds.
+
+    ``backup_name`` is optional so the integration workflow keeps its existing
+    ``PreIntegration_*`` naming while other workflows (for example Cut Over)
+    can create an explicitly labelled pre-change CV through the same proven
+    SHM job/polling implementation.
+    """
     all_output = ""
-    backup_name = f"PreIntegration_{time.strftime('%Y%m%d_%H%M')}"
+    backup_name = backup_name or f"PreIntegration_{time.strftime('%Y%m%d_%H%M')}"
     backup_cmd = (
         f'!python {CLI_PY} "shm backup --nodes {node_name} '
         f'--backupname {backup_name} --upload"'
@@ -3973,7 +4290,10 @@ def run_backup_cv(
                 f"{msg}\n\nCheck the backup command output and retry if needed."
             )
             if retry:
-                return run_backup_cv(ssh, node_name, log_cb, wait_for_user)
+                return run_backup_cv(
+                    ssh, node_name, log_cb, wait_for_user,
+                    backup_name=backup_name,
+                )
         return False, all_output
 
     log_cb(f"✓ Backup job started: {job_name}")
@@ -4006,7 +4326,10 @@ def run_backup_cv(
                     f"{msg}\n\nCheck the backup job and retry if needed."
                 )
                 if retry:
-                    return run_backup_cv(ssh, node_name, log_cb, wait_for_user)
+                    return run_backup_cv(
+                        ssh, node_name, log_cb, wait_for_user,
+                        backup_name=backup_name,
+                    )
             return False, all_output
 
         if attempt < max_attempts:
@@ -4044,6 +4367,7 @@ def run_take_dump(
     local_dump_dir: str,
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
+    local_filename: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run ``dcgk`` in AMOS, find the zip in the output path, download it locally.
 
@@ -4139,7 +4463,7 @@ def run_take_dump(
     # ── 4. Download zip to local DUMP folder ────────────────────
     local_dir = os.path.join(local_dump_dir, "DUMP")
     os.makedirs(local_dir, exist_ok=True)
-    local_filename = f"{node_name}_modump.zip"
+    local_filename = local_filename or f"{node_name}_modump.zip"
     local_path = os.path.join(local_dir, local_filename)
 
     log_cb(f"Downloading {os.path.basename(zip_file)} → {local_path}...")

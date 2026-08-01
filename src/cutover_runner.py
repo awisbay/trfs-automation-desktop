@@ -40,6 +40,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -71,6 +72,7 @@ from cutover_parsers import (
     strip_ansi,
     ue_for_cell,
 )
+import cutover_persistence
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +122,29 @@ _DEFAULTS = {
     },
     "prestate": {
         "enabled": True,
+        "required": True,
         "skip_already_in_service": True,
+    },
+    "preparation": {
+        "enabled": True,
+        "stop_on_failure": True,
+        "create_cv": {
+            "enabled": True,
+            "name_template": "PreCutover_{node}_{timestamp}",
+        },
+        "modump": {
+            "enabled": True,
+        },
+        "prehc": {
+            "enabled": True,
+            "script_path": "",
+            "command_template": "run {script_path}",
+            "timeout_s": 900,
+        },
+    },
+    "persistence": {
+        "enabled": True,
+        "checkpoint_interval_s": 0.5,
     },
     "diagnosis": {
         "enabled": True,
@@ -410,21 +434,41 @@ def run_cutover_prestate(ssh, node_name: str, cells: list,
     """
     ok, out, rows = run_cutover_st_cell(ssh, node_name, log_cb, cfg)
     if not ok:
-        log_cb(f"[{node_name}] could not read pre-state — every cell will be "
-               f"treated as not-previously-unlocked.")
+        log_cb(f"[{node_name}] ✗ could not read pre-state — Cut Over is "
+               f"blocked because rollback ownership cannot be proven.")
         return False, out
 
     mode = cfg["enable_poll"].get("match_mode", "suffix")
-    already = 0
+    node_cells = [c for c in cells if c.node_name == node_name]
+    staged: dict = {}
+    matched_keys: set = set()
     for row in rows:
-        cell = match_row(cells, node_name, row, mode=mode)
+        cell = match_row(node_cells, node_name, row, mode=mode)
         if cell is None:
             continue
-        cell.admin_state = row.admin_state
-        cell.op_state = row.op_state
-        if row.admin_state.upper() == "UNLOCKED":
+        matched_keys.add(cell.key)
+        staged[cell.key] = (row.admin_state, row.op_state)
+
+    missing = [c for c in node_cells if c.key not in matched_keys]
+    if missing:
+        preview = ", ".join(c.mo_ref for c in missing[:8])
+        if len(missing) > 8:
+            preview += f", … (+{len(missing) - 8} more)"
+        log_cb(
+            f"[{node_name}] ✗ pre-state is incomplete: matched "
+            f"{len(matched_keys)}/{len(node_cells)} discovered cell(s). "
+            f"Missing: {preview}. Cut Over is blocked."
+        )
+        return False, out
+
+    already = 0
+    for cell in node_cells:
+        admin_state, op_state = staged[cell.key]
+        cell.admin_state = admin_state
+        cell.op_state = op_state
+        if admin_state.upper() == "UNLOCKED":
             cell.was_unlocked_before = True
-            if row.op_state.upper() == "ENABLED":
+            if op_state.upper() == "ENABLED":
                 cell.already_in_service = True
                 already += 1
 
@@ -432,6 +476,82 @@ def run_cutover_prestate(ssh, node_name: str, cells: list,
         log_cb(f"[{node_name}] {already} cell(s) were already in service before "
                f"this run — they will not be unlocked, and rollback will not "
                f"touch them.")
+    return True, out
+
+
+def run_cutover_create_cv(ssh, node_name: str, log_cb: Callable[[str], None],
+                          cfg: dict, wait_for_user=None) -> tuple:
+    """Create the pre-Cut Over CV using the existing SHM backup workflow."""
+    from integration_runner import run_backup_cv
+
+    step_cfg = cfg["preparation"]["create_cv"]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = step_cfg.get(
+        "name_template", "PreCutover_{node}_{timestamp}"
+    ).format(node=node_name, timestamp=timestamp)
+    return run_backup_cv(
+        ssh, node_name, log_cb, wait_for_user, backup_name=backup_name,
+    )
+
+
+def run_cutover_modump(ssh, node_name: str, shortcode: str, log_dir: str,
+                       log_cb: Callable[[str], None], cfg: dict,
+                       wait_for_user=None) -> tuple:
+    """Capture and download the pre-Cut Over modump."""
+    from integration_runner import run_take_dump
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return run_take_dump(
+        ssh, node_name, shortcode, log_dir, log_cb, wait_for_user,
+        local_filename=f"{node_name}_modump_{timestamp}.zip",
+    )
+
+
+def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
+                      cfg: dict, wait_for_user=None) -> tuple:
+    """Run the configured preHC Moshell script and return its raw output."""
+    step_cfg = cfg["preparation"]["prehc"]
+    script_path = str(step_cfg.get("script_path", "")).strip()
+    if not script_path:
+        msg = (f"[{node_name}] preHC script_path is empty. Set "
+               f"cutover.preparation.prehc.script_path in config.json.")
+        log_cb(f"✗ {msg}")
+        return False, msg
+    if "\n" in script_path or "\r" in script_path:
+        msg = f"[{node_name}] preHC script_path contains a newline."
+        log_cb(f"✗ {msg}")
+        return False, msg
+
+    command = str(step_cfg.get(
+        "command_template", "run {script_path}"
+    )).format(
+        script_path=script_path,
+        node=node_name,
+    )
+    log_cb(f"[{node_name}] running preHC script: {script_path}")
+    try:
+        out = ssh.run_amos_command_safe(
+            command, node_name,
+            timeout=int(step_cfg.get("timeout_s", 900)),
+        )
+    except Exception as exc:
+        msg = f"preHC failed: {type(exc).__name__}: {exc}"
+        log_cb(f"[{node_name}] ✗ {msg}")
+        return False, msg
+
+    error_patterns = step_cfg.get(
+        "error_patterns",
+        ["ERROR", "Unknown command", "Syntax error", "command not found"],
+    )
+    matched = next(
+        (pattern for pattern in error_patterns
+         if re.search(pattern, out or "", re.IGNORECASE)),
+        "",
+    )
+    if matched:
+        log_cb(f"[{node_name}] ✗ preHC output matched error pattern: {matched}")
+        return False, out
+    log_cb(f"[{node_name}] ✓ preHC completed.")
     return True, out
 
 
@@ -648,6 +768,30 @@ class CutoverEngine:
             ))
 
         self.log_dir = log_dir or self._default_log_dir()
+        self._created_at = cutover_persistence.now_iso()
+        self._preparation_started_at = (
+            datetime.now().strftime("%Y%m%d_%H%M%S")
+            + "_" + uuid.uuid4().hex[:6]
+        )
+        self._precutover_root = os.path.join(self.log_dir, "PRE_CUTOVER")
+        self._run_dir = os.path.join(
+            self._precutover_root, self._preparation_started_at,
+        )
+        self._checkpoint_path = os.path.join(self._run_dir, "checkpoint.json")
+        self._persistence_enabled = bool(
+            self.cfg.get("persistence", {}).get("enabled", True)
+        )
+        self.recovery_checkpoint = (
+            cutover_persistence.find_unfinished(
+                self._precutover_root, self.run.shortcode, self.run.node_names,
+            ) if self._persistence_enabled else None
+        )
+        self._checkpoint_event = threading.Event()
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_thread = None
+        self._persistence_started = False
+        self._manifest_finalized = False
+        self._persistence_lock = threading.RLock()
         self._action_lock = threading.Lock()
         self._threads: list = []
         # Set when a manual traffic gate is waiting on the operator.
@@ -686,7 +830,36 @@ class CutoverEngine:
         return self._action_lock.locked()
 
     def start_discovery(self) -> None:
+        self._ensure_persistence_started()
         self._spawn(self._discovery_worker, "cutover-discovery")
+
+    def recover(self, mode: str = "resume") -> None:
+        """Reconnect and reconcile an unfinished run before resume/rollback."""
+        if mode not in ("resume", "rollback"):
+            raise ValueError(f"Unsupported recovery mode: {mode}")
+        checkpoint = self.recovery_checkpoint
+        if not checkpoint:
+            self.log("No unfinished Cut Over checkpoint was found.")
+            return
+        self._spawn(lambda: self._recovery_worker(checkpoint, mode),
+                    f"cutover-recovery-{mode}")
+
+    def recovery_info(self) -> dict:
+        if not self.recovery_checkpoint:
+            return {}
+        try:
+            return cutover_persistence.load(self.recovery_checkpoint)
+        except Exception:
+            return {}
+
+    def close_recovery_as_incomplete(self) -> str:
+        checkpoint = self.recovery_checkpoint
+        if not checkpoint:
+            return ""
+        data = cutover_persistence.load(checkpoint)
+        path = cutover_persistence.finalize(checkpoint, data, "INCOMPLETE")
+        self.recovery_checkpoint = None
+        return path
 
     def unlock_group(self, group: str) -> None:
         self._spawn(lambda: self._grouped_action([group]), f"cutover-{group}")
@@ -724,6 +897,9 @@ class CutoverEngine:
         self._force_disconnect()
 
     def shutdown(self) -> None:
+        self._persist_checkpoint()
+        self._checkpoint_stop.set()
+        self._checkpoint_event.set()
         self.run.cancel_event.set()
         for gate in self._traffic_gate.values():
             gate["ok"] = False
@@ -740,6 +916,79 @@ class CutoverEngine:
                 pass
             sess.connected = False
         self.run.sessions.clear()
+
+    # ── checkpoint + manifest ───────────────────────────────────
+    def _ensure_persistence_started(self) -> None:
+        if not self._persistence_enabled or self._persistence_started:
+            return
+        self._persistence_started = True
+        self.run.on_change = self._checkpoint_event.set
+
+        def _checkpoint_loop():
+            interval = float(self.cfg.get("persistence", {}).get(
+                "checkpoint_interval_s", 0.5
+            ))
+            while not self._checkpoint_stop.is_set():
+                self._checkpoint_event.wait()
+                if self._checkpoint_stop.is_set():
+                    break
+                # Debounce bursts of cell/status mutations into one small
+                # atomic write, so polling does not create disk churn.
+                self._checkpoint_stop.wait(max(0.1, interval))
+                self._checkpoint_event.clear()
+                if self._checkpoint_stop.is_set():
+                    break
+                self._persist_checkpoint()
+
+        self._checkpoint_thread = threading.Thread(
+            target=_checkpoint_loop,
+            name="cutover-checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
+        self._checkpoint_event.set()
+
+    def _persist_checkpoint(self) -> str:
+        if (not self._persistence_enabled or not self._persistence_started
+                or self._manifest_finalized):
+            return ""
+        with self._persistence_lock:
+            # A checkpoint writer may have passed the fast check just before
+            # finalization acquired this lock. Re-check here so it cannot
+            # recreate checkpoint.json after the manifest retires it.
+            if self._manifest_finalized:
+                return ""
+            try:
+                with self.run.lock:
+                    data = cutover_persistence.snapshot(
+                        self.run, self._preparation_started_at,
+                        self._created_at, self.cfg,
+                    )
+                cutover_persistence.write_json_atomic(self._checkpoint_path, data)
+                return self._checkpoint_path
+            except Exception as exc:
+                logger.warning("Could not persist Cut Over checkpoint: %s", exc)
+                return ""
+
+    def _finalize_manifest(self, verdict: str) -> str:
+        if not self._persistence_enabled or self._manifest_finalized:
+            return ""
+        with self._persistence_lock:
+            with self.run.lock:
+                data = cutover_persistence.snapshot(
+                    self.run, self._preparation_started_at,
+                    self._created_at, self.cfg,
+                )
+            cutover_persistence.write_json_atomic(self._checkpoint_path, data)
+            path = cutover_persistence.finalize(
+                self._checkpoint_path, data, verdict,
+            )
+            self._manifest_finalized = True
+        self._checkpoint_stop.set()
+        self._checkpoint_event.set()
+        self.run.on_change = None
+        self.log(f"Immutable run manifest saved: {path}")
+        return path
 
     # ── internals ────────────────────────────────────────────────
     def _spawn(self, target, name: str) -> bool:
@@ -783,6 +1032,298 @@ class CutoverEngine:
         """Interruptible sleep. Returns True if cancelled."""
         return self.run.cancel_event.wait(max(0.0, seconds))
 
+    def _save_preparation_log(self, node_name: str, step: str,
+                              output: str) -> str:
+        """Persist one pre-Cut Over step output under a unique run folder."""
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", node_name) or "NODE"
+        safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", step) or "STEP"
+        folder = self._run_dir
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{safe_node}_{safe_step}.log")
+        with open(path, "w", encoding="utf-8", errors="replace") as handle:
+            handle.write(output or "")
+            if output and not output.endswith("\n"):
+                handle.write("\n")
+        with self.run.lock:
+            self.run.artifacts[f"{node_name}:{step}"] = path
+            self.run.touch()
+        self.log(f"[{node_name}] {step} log saved: {path}")
+        return path
+
+    def _run_preparation_for_node(self, node_name: str,
+                                  sess: NodeSession) -> bool:
+        """Run CV, modump and preHC in order; all enabled steps must pass."""
+        prep = self.cfg.get("preparation", {})
+        if not prep.get("enabled", True):
+            self.log(f"[{node_name}] pre-Cut Over preparation is disabled.")
+            return True
+
+        steps = [
+            (
+                "CREATE_CV",
+                prep.get("create_cv", {}).get("enabled", True),
+                lambda: run_cutover_create_cv(
+                    sess.ssh, node_name, self.log, self.cfg,
+                    self._wait_for_user,
+                ),
+            ),
+            (
+                "MODUMP",
+                prep.get("modump", {}).get("enabled", True),
+                lambda: run_cutover_modump(
+                    sess.ssh, node_name, self.run.shortcode,
+                    self._precutover_root,
+                    self.log, self.cfg, self._wait_for_user,
+                ),
+            ),
+            (
+                "PREHC",
+                prep.get("prehc", {}).get("enabled", True),
+                lambda: run_cutover_prehc(
+                    sess.ssh, node_name, self.log, self.cfg,
+                    self._wait_for_user,
+                ),
+            ),
+        ]
+
+        all_ok = True
+        for label, enabled, action in steps:
+            if not enabled:
+                self.log(f"[{node_name}] {label} skipped by config.")
+                continue
+            if self.run.is_cancelled():
+                return False
+            self.log(f"[{node_name}] ── Pre-Cut Over: {label} ──")
+            try:
+                ok, output = action()
+            except Exception as exc:
+                ok = False
+                output = f"{type(exc).__name__}: {exc}\n"
+                self.log(f"[{node_name}] ✗ {label} crashed: {output.strip()}")
+            try:
+                self._save_preparation_log(node_name, label, output)
+            except Exception as exc:
+                ok = False
+                self.log(f"[{node_name}] ✗ could not save {label} log: {exc}")
+            if label == "MODUMP" and ok:
+                match = re.search(r"\[SFTP\]\s+Downloaded\s+→\s+(.+)", output or "")
+                if match:
+                    with self.run.lock:
+                        self.run.artifacts[f"{node_name}:MODUMP_ZIP"] = (
+                            match.group(1).strip()
+                        )
+                        self.run.touch()
+            if ok:
+                self.log(f"[{node_name}] ✓ {label} passed.")
+            else:
+                all_ok = False
+                self.log(f"[{node_name}] ✗ {label} failed.")
+                if prep.get("stop_on_failure", True):
+                    break
+        return all_ok
+
+    # ── recovery ─────────────────────────────────────────────────
+    def _recovery_worker(self, checkpoint: str, mode: str) -> None:
+        run = self.run
+        try:
+            data = cutover_persistence.load(checkpoint)
+        except Exception as exc:
+            run.error = f"Cannot read recovery checkpoint: {exc}"
+            run.set_phase(RunPhase.FAILED)
+            self.log(f"✗ {run.error}")
+            return
+
+        expected_hash = str(data.get("config_sha256", ""))
+        current_hash = cutover_persistence.config_hash(self.cfg)
+        if expected_hash and expected_hash != current_hash:
+            run.error = (
+                "Recovery blocked: config.json differs from the unfinished "
+                "run. Restore the same Cut Over config before resuming."
+            )
+            run.set_phase(RunPhase.FAILED)
+            self.log(f"✗ {run.error}")
+            return
+
+        self._preparation_started_at = str(data.get(
+            "run_id", os.path.basename(os.path.dirname(checkpoint))
+        ))
+        self._created_at = str(data.get("created_at", self._created_at))
+        self._run_dir = os.path.dirname(checkpoint)
+        self._precutover_root = os.path.dirname(self._run_dir)
+        self._checkpoint_path = checkpoint
+        cutover_persistence.restore(run, data)
+        for name in list(self.cfg["group_order"]) + [UNMAPPED]:
+            run.groups.setdefault(name, GroupState(name=name))
+        self._ensure_persistence_started()
+        run.set_phase(RunPhase.RECOVERING, active_group="")
+        self.log(
+            f"Recovering unfinished Cut Over {self._preparation_started_at} "
+            f"in {mode} mode. No write will be replayed before live readback."
+        )
+
+        for node_name in run.node_names:
+            sess = self._connect_node(node_name)
+            if sess is not None:
+                run.sessions[node_name] = sess
+        missing_sessions = [n for n in run.node_names if n not in run.sessions]
+        if missing_sessions:
+            run.error = "Recovery connection failed: " + ", ".join(missing_sessions)
+            run.set_phase(RunPhase.FAILED)
+            self.log(f"✗ {run.error}")
+            return
+
+        for key, path in run.artifacts.items():
+            if not key.endswith(":ALARM_BASELINE") or not os.path.isfile(path):
+                continue
+            node_name = key.split(":", 1)[0]
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    run.alarm_baseline[node_name] = fh.read()
+            except Exception:
+                pass
+
+        if not self._reconcile_recovered_cells():
+            return
+
+        if mode == "rollback":
+            run.set_phase(RunPhase.READY, active_group="")
+            self._relock_action(list(reversed(list(self.cfg["group_order"]))))
+            remaining = sum(
+                len(run.relockable_cells_of(g)) for g in self.cfg["group_order"]
+            )
+            if remaining:
+                self.log(
+                    f"Recovery rollback incomplete: {remaining} cell(s) still "
+                    "require operator action."
+                )
+                run.set_phase(RunPhase.READY, active_group="")
+            else:
+                run.set_phase(RunPhase.DONE, active_group="")
+                self._finalize_manifest("ROLLED_BACK")
+            return
+
+        self._assure_recovered_cells()
+        run.error = ""
+        run.set_phase(RunPhase.READY, active_group="")
+        self.log(
+            "✓ Recovery reconciliation complete. Previously attempted cells "
+            "were not replayed; remaining untouched cells may be continued."
+        )
+
+    def _reconcile_recovered_cells(self) -> bool:
+        """Read every saved cell and classify it without replaying a write."""
+        run = self.run
+        mode = self.cfg["enable_poll"].get("match_mode", "suffix")
+        for node_name, sess in run.sessions.items():
+            try:
+                ok, _out, rows = run_cutover_st_cell(
+                    sess.ssh, node_name, self.log, self.cfg,
+                )
+            except Exception as exc:
+                ok, rows = False, []
+                self.log(f"[{node_name}] recovery readback failed: {exc}")
+            node_cells = [c for c in run.cells if c.node_name == node_name]
+            staged = {}
+            if ok:
+                for row in rows:
+                    cell = match_row(node_cells, node_name, row, mode=mode)
+                    if cell is not None:
+                        staged[cell.key] = row
+            missing = [c.mo_ref for c in node_cells if c.key not in staged]
+            if missing:
+                run.error = (
+                    f"Recovery blocked: live state matched "
+                    f"{len(staged)}/{len(node_cells)} cells on {node_name}."
+                )
+                run.set_phase(RunPhase.FAILED)
+                self.log(f"✗ {run.error} Missing: {', '.join(missing[:8])}")
+                return False
+
+            for cell in node_cells:
+                row = staged[cell.key]
+                admin = (row.admin_state or "").upper()
+                op = (row.op_state or "").upper()
+                common = {
+                    "admin_state": row.admin_state,
+                    "op_state": row.op_state,
+                    "avail_status": row.avail_status,
+                    "ue_count": None,
+                    "traffic_samples": 0,
+                }
+                if cell.was_unlocked_before or cell.already_in_service:
+                    run.set_cell(
+                        cell, CellStatus.ALREADY_IN_SERVICE,
+                        status_detail="pre-existing service — never touched",
+                        **common,
+                    )
+                elif cell.was_unlocked_by_run:
+                    if admin == "LOCKED":
+                        run.set_cell(
+                            cell, CellStatus.RELOCKED,
+                            status_detail="live readback: locked", **common,
+                        )
+                    elif admin == "UNLOCKED" and op == "ENABLED":
+                        run.set_cell(
+                            cell, CellStatus.ENABLED,
+                            status_detail="recovered: enabled; traffic recheck pending",
+                            **common,
+                        )
+                    elif admin == "UNLOCKED":
+                        run.set_cell(
+                            cell, CellStatus.UNLOCK_SENT,
+                            status_detail="recovered: unlocked; enable recheck pending",
+                            **common,
+                        )
+                    else:
+                        run.set_cell(
+                            cell, CellStatus.ERROR,
+                            status_detail=f"ambiguous live state: {admin}/{op}",
+                            **common,
+                        )
+                elif admin == "UNLOCKED":
+                    # The checkpoint proves this run never attempted the cell;
+                    # another actor changed it, so neither resume nor rollback
+                    # may claim ownership.
+                    run.set_cell(
+                        cell, CellStatus.ALREADY_IN_SERVICE,
+                        status_detail="changed outside this run — never touched",
+                        already_in_service=True, **common,
+                    )
+                else:
+                    run.set_cell(
+                        cell, CellStatus.PENDING,
+                        status_detail="reconciled: untouched", **common,
+                    )
+        self._persist_checkpoint()
+        return True
+
+    def _assure_recovered_cells(self) -> None:
+        """Re-run read-only enable/traffic assurance for attempted live cells."""
+        run = self.run
+        for group in self.cfg["group_order"]:
+            cells = [
+                c for c in run.cells_of(group)
+                if c.was_unlocked_by_run
+                and c.status in (CellStatus.UNLOCK_SENT, CellStatus.ENABLED)
+            ]
+            if not cells:
+                continue
+            by_node = {}
+            for cell in cells:
+                by_node.setdefault(cell.node_name, []).append(cell)
+            run.set_phase(RunPhase.RECOVERING, active_group=group)
+            if any(c.status == CellStatus.UNLOCK_SENT for c in cells):
+                self._wait_enable_phase(group, by_node)
+            self._wait_traffic_phase(group, by_node)
+            pending = len(run.unlockable_cells_of(group))
+            if pending:
+                run.set_group(
+                    group, GroupStatus.PENDING,
+                    message=f"recovered; {pending} untouched cell(s) remain",
+                )
+            else:
+                self._finish_group(group)
+
     # ── discovery ────────────────────────────────────────────────
     def _connect_node(self, node_name: str) -> Optional[NodeSession]:
         from integration_runner import IntegrationSSH
@@ -815,12 +1356,13 @@ class CutoverEngine:
     def _discovery_worker(self) -> None:
         run = self.run
         run.cancel_event.clear()
-        run.set_phase(RunPhase.DISCOVERING)
+        run.set_phase(RunPhase.PREPARING)
         self.log(f"Cut Over starting for {', '.join(run.node_names) or '(no nodes)'}")
         if self.cfg.get("dry_run"):
             self.log("DRY RUN is enabled — no unlock command will be sent.")
 
-        all_cells: list = []
+        # Connect first because every intended node must complete the three
+        # pre-Cut Over safeguards before discovery can become READY.
         for node_name in run.node_names:
             if run.is_cancelled():
                 break
@@ -828,6 +1370,41 @@ class CutoverEngine:
             if sess is None:
                 continue
             run.sessions[node_name] = sess
+
+        missing_sessions = [
+            node for node in run.node_names if node not in run.sessions
+        ]
+        if missing_sessions:
+            run.error = (
+                "Pre-Cut Over blocked: could not connect to "
+                + ", ".join(missing_sessions)
+            )
+            self.log(f"✗ {run.error}")
+            run.set_phase(RunPhase.FAILED)
+            self.emit(CutoverEvent(kind="discovery_done", message=run.error))
+            return
+
+        preparation_failed = []
+        for node_name, sess in run.sessions.items():
+            if not self._run_preparation_for_node(node_name, sess):
+                preparation_failed.append(node_name)
+        if preparation_failed:
+            run.error = (
+                "Pre-Cut Over blocked: preparation failed for "
+                + ", ".join(preparation_failed)
+            )
+            self.log(f"✗ {run.error}")
+            run.set_phase(RunPhase.FAILED)
+            self.emit(CutoverEvent(kind="discovery_done", message=run.error))
+            return
+
+        self.log("✓ Pre-Cut Over preparation completed on every node.")
+        run.set_phase(RunPhase.DISCOVERING)
+
+        all_cells: list = []
+        for node_name, sess in run.sessions.items():
+            if run.is_cancelled():
+                break
             try:
                 ok, _out, cells = run_cutover_discovery(
                     sess.ssh, node_name, self.log, self.cfg)
@@ -864,16 +1441,47 @@ class CutoverEngine:
         # Pre-state, BEFORE anything is sent. This is what lets rollback be
         # safe later: cells already in service are not ours to unlock, and
         # above all not ours to re-lock.
-        if self.cfg.get("prestate", {}).get("enabled", True):
+        prestate_cfg = self.cfg.get("prestate", {})
+        prestate_required = prestate_cfg.get("required", True)
+        if not prestate_cfg.get("enabled", True) and prestate_required:
+            run.error = (
+                "Pre-state is required but disabled in config.json. "
+                "Cut Over is blocked."
+            )
+            self.log(f"✗ {run.error}")
+            run.set_phase(RunPhase.FAILED)
+            self.emit(CutoverEvent(kind="discovery_done", message=run.error))
+            return
+
+        prestate_failed = []
+        if prestate_cfg.get("enabled", True):
             for node_name, sess in run.sessions.items():
                 if run.is_cancelled():
                     break
                 try:
-                    run_cutover_prestate(sess.ssh, node_name, run.cells,
-                                         self.log, self.cfg)
+                    ok, _out = run_cutover_prestate(
+                        sess.ssh, node_name, run.cells, self.log, self.cfg,
+                    )
+                    if not ok:
+                        prestate_failed.append(node_name)
                 except Exception as exc:
                     self.log(f"[{node_name}] pre-state check failed: "
                              f"{type(exc).__name__}: {exc}")
+                    prestate_failed.append(node_name)
+
+            if prestate_failed and prestate_required:
+                run.error = (
+                    "Pre-state incomplete for "
+                    + ", ".join(sorted(set(prestate_failed)))
+                    + ". Cut Over is blocked."
+                )
+                self.log(f"✗ {run.error}")
+                run.set_phase(RunPhase.FAILED)
+                self.emit(CutoverEvent(
+                    kind="discovery_done", message=run.error,
+                ))
+                return
+
             with run.lock:
                 for c in run.cells:
                     if c.already_in_service:
@@ -891,6 +1499,9 @@ class CutoverEngine:
                     _ok, out, total = run_cutover_alarms(
                         sess.ssh, node_name, self.log, self.cfg)
                     run.alarm_baseline[node_name] = out
+                    self._save_preparation_log(
+                        node_name, "ALARM_BASELINE", out,
+                    )
                     self.log(f"[{node_name}] alarm baseline: {total} active "
                              f"before cut over.")
                 except Exception as exc:
@@ -912,8 +1523,10 @@ class CutoverEngine:
     # ── group orchestration ──────────────────────────────────────
     def _grouped_action(self, groups: list) -> None:
         run = self.run
-        if run.phase in (RunPhase.IDLE, RunPhase.DISCOVERING):
-            self.log("Discovery has not finished yet.")
+        if run.phase != RunPhase.READY:
+            self.log(
+                f"Unlock blocked: Cut Over is not READY (phase={run.phase.value})."
+            )
             return
         run.cancel_event.clear()
 
@@ -1189,6 +1802,12 @@ class CutoverEngine:
                 c.unlock_command = self.cfg["unlock"]["command_template"].format(
                     mo_type=c.mo_type, cell_dn=c.cell_dn,
                     mo_ref=c.mo_ref, node=node_name)
+                c.was_unlocked_by_run = True
+                run.touch(c)
+            # The ownership marker must reach disk before the first write. If
+            # the process dies after sending but before receiving output,
+            # recovery still knows that blind replay is forbidden.
+            self._persist_checkpoint()
             try:
                 ok, _out = run_cutover_unlock(
                     sess.ssh, node_name, cells, self.log, self.cfg,
@@ -1229,8 +1848,14 @@ class CutoverEngine:
         poll = self.cfg["enable_poll"]
         grp = run.groups[group]
 
-        targets = [c for c in run.unlockable_cells_of(group)
-                   if c.status == CellStatus.UNLOCK_SENT]
+        # Use the explicit action set, not ``is_unlockable``: during recovery
+        # these cells are deliberately marked as already attempted so the
+        # write cannot be replayed, but their read-only enable assurance still
+        # has to continue.
+        targets = [
+            c for node_cells in by_node.values() for c in node_cells
+            if c.status == CellStatus.UNLOCK_SENT
+        ]
         for c in targets:
             run.set_cell(c, CellStatus.WAITING_ENABLE, status_detail="waiting…")
         if not targets:
@@ -1720,6 +2345,7 @@ class CutoverEngine:
             self.log("No post-cutover verification steps are configured "
                      "(cutover.final_verification.steps is empty).")
             run.set_phase(RunPhase.DONE)
+            self._finalize_manifest("COMPLETED_NO_FINAL_CHECKS")
             self.emit(CutoverEvent(kind="run_done",
                                    message="No verification configured."))
             return
@@ -1775,4 +2401,7 @@ class CutoverEngine:
                f"{failed} failed.")
         self.log(msg)
         run.set_phase(RunPhase.DONE)
+        self._finalize_manifest(
+            "COMPLETED" if failed == 0 else "COMPLETED_WITH_FAILURES"
+        )
         self.emit(CutoverEvent(kind="run_done", message=msg))
