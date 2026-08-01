@@ -4,6 +4,7 @@ Pillow>=10.0.0
 PyYAML>=6.0
 pyautogui>=0.9.54
 flet>=0.84.0
+flet-desktop>=0.84.0
 
 # Playwright was removed from this build to shrink the distribution.
 # TRFS Launch (which needs Playwright + Chromium to capture ENM web

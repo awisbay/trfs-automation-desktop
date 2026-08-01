@@ -14,6 +14,8 @@ PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
   restricted networks. The release workflow now fetches the exact
   `flet-windows.zip` for the installed flet version before building, so the CI
   artifact is offline and self-contained, identical to the local build.
+  `flet-desktop` is now a declared dependency (it was only present locally, so
+  CI silently built without the desktop package too).
 
 ## [1.7.0] — 2026-08-01
 
