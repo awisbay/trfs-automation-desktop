@@ -2,6 +2,8 @@ name: Build and publish release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
 
@@ -19,7 +21,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Check out tagged source
+      - name: Check out source
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -28,15 +30,15 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Verify tag matches application version
+      - name: Read application version
         shell: pwsh
         run: |
           $version = python -c "import sys; sys.path.insert(0, 'src'); import version; print(version.__version__)"
           $expectedTag = "v$version"
-          if ("${{ github.ref_name }}" -ne $expectedTag) {
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne $expectedTag) {
             throw "Tag '${{ github.ref_name }}' does not match src/version.py ('$expectedTag')."
           }
-          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) {
+          if ("${{ github.ref_type }}" -eq "tag" -and -not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) {
             throw "CHANGELOG.md has no top-level entry for version $version."
           }
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -86,7 +88,16 @@ jobs:
           }
           Move-Item -Path $source -Destination $target
 
+      - name: Upload workflow artifact
+        if: github.ref_type == 'branch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NodeCraft-${{ env.APP_VERSION }}-${{ github.sha }}-windows
+          path: dist/NodeCraft-${{ env.APP_VERSION }}-windows.exe
+          if-no-files-found: error
+
       - name: Publish canonical GitHub Release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
