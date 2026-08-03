@@ -1005,12 +1005,42 @@ def _format_set_value(value, norm: str = "", actual: str = "") -> str:
     return s
 
 
+def _enm_prefix(fdn_prefix: str = "") -> str:
+    """Normalize the ENM SubNetwork prefix.
+
+    The main form stores the short subnetwork value (for example ``T7``), while
+    ENM set commands need the full ONRM-rooted FDN prefix. Already-expanded
+    prefixes are preserved for callers/tests that pass a full FDN prefix.
+    """
+    prefix = (fdn_prefix or "").strip().strip(",")
+    if not prefix:
+        return ""
+    if "=" in prefix:
+        return prefix.rstrip(",")
+    return f"SubNetwork=ONRM_ROOT_MO_R,SubNetwork={prefix}"
+
+
+def _mo_below_managed_element(mo: str) -> str:
+    """Return the FDN path below ManagedElement, even if ``mo`` is rooted."""
+    parts = [p.strip() for p in (mo or "").strip().strip(",").split(",")
+             if p.strip()]
+    for i in range(len(parts) - 1, -1, -1):
+        name = parts[i].split("=", 1)[0].strip().lower()
+        if name == "managedelement":
+            return ",".join(parts[i + 1:])
+    return ",".join(parts)
+
+
 def _enm_fdn(node: str, mo: str, fdn_prefix: str = "") -> str:
     """Full ENM FDN for a ``cmedit`` target:
-    ``[<prefix>,]MeContext=<node>,ManagedElement=<node>,<mo>`` (``mo`` is the
-    FDN below ManagedElement, exactly as stored on the AuditResult)."""
-    base = f"MeContext={node},ManagedElement={node},{mo}"
-    prefix = (fdn_prefix or "").strip().rstrip(",")
+    ``[<prefix>,]MeContext=<node>,ManagedElement=<node>[,<mo>]``. ``mo`` is
+    normally below ManagedElement, but rooted values from parsed references are
+    tolerated and normalized before the final FDN is assembled."""
+    rel_mo = _mo_below_managed_element(mo)
+    base = f"MeContext={node},ManagedElement={node}"
+    if rel_mo:
+        base = f"{base},{rel_mo}"
+    prefix = _enm_prefix(fdn_prefix)
     return f"{prefix},{base}" if prefix else base
 
 

@@ -457,34 +457,6 @@ class IntegrationPage:
             ),
             on_click=self._on_run,
         )
-        self.preflight_button = ft.OutlinedButton(
-            "Pre-flight Check",
-            icon=ft.Icons.FACT_CHECK_OUTLINED,
-            tooltip="Verify config script paths exist on the gateway and the "
-                    "BSC broker is reachable, before launching",
-            style=ft.ButtonStyle(
-                padding=ft.Padding.symmetric(horizontal=20, vertical=16),
-                shape=ft.RoundedRectangleBorder(radius=14),
-            ),
-            on_click=self._on_preflight,
-        )
-        self.queue_add_btn = ft.OutlinedButton(
-            "Add to Queue", icon=ft.Icons.PLAYLIST_ADD,
-            tooltip="Save this site (form + ticked steps) to the multi-site "
-                    "queue to run later, unattended",
-            style=ft.ButtonStyle(
-                padding=ft.Padding.symmetric(horizontal=18, vertical=16),
-                shape=ft.RoundedRectangleBorder(radius=14)),
-            on_click=self._add_to_queue,
-        )
-        self.queue_view_btn = ft.OutlinedButton(
-            self._queue_btn_label(), icon=ft.Icons.QUEUE_MUSIC,
-            tooltip="View the multi-site queue and run it",
-            style=ft.ButtonStyle(
-                padding=ft.Padding.symmetric(horizontal=18, vertical=16),
-                shape=ft.RoundedRectangleBorder(radius=14)),
-            on_click=self._open_queue,
-        )
         back_button = ft.ElevatedButton(
             "Back",
             icon=ft.Icons.ARROW_BACK,
@@ -538,8 +510,7 @@ class IntegrationPage:
                     ft.Container(height=8),
                     ft.Row(
                         [back_button, ft.Container(expand=True),
-                         self.queue_add_btn, self.queue_view_btn,
-                         self.preflight_button, self.run_button],
+                         self.run_button],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ],
