@@ -368,6 +368,66 @@ def compare(items: List[AuditItem],
     return results
 
 
+_CELL_MO_INV = re.compile(
+    r"(?:^|,)(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|GeranCell)=([^,]+)",
+    re.IGNORECASE)
+
+
+def cell_inventory_check(items: List[AuditItem],
+                         records: Dict[str, Dict[str, str]]) -> List[AuditResult]:
+    """Compare the SET of cells the CDD defines against the cells actually on
+    the node(s), per cell MO class: the count and the exact names. Produces a
+    'Cell count' row plus, when they differ, a 'Missing on node' / 'Extra on
+    node' row so the operator sees which cell names don't line up."""
+    import collections
+    cdd = collections.defaultdict(set)      # class_lower -> {id_lower}
+    actual = collections.defaultdict(set)
+    disp: Dict[str, str] = {}               # id_lower -> original casing
+
+    for it in items:
+        if it.category != "cell":
+            continue
+        m = _CELL_MO_INV.search("," + it.mo_local)
+        if not m:
+            continue
+        cls, cid = m.group(1).lower(), m.group(2)
+        cdd[cls].add(cid.lower())
+        disp[cid.lower()] = cid
+    for ldn in records:
+        m = _CELL_MO_INV.search(ldn)
+        if not m:
+            continue
+        cls, cid = m.group(1).lower(), m.group(2)
+        actual[cls].add(cid.lower())
+        disp.setdefault(cid.lower(), cid)
+
+    _CANON = {"eutrancellfdd": "EUtranCellFDD", "eutrancelltdd": "EUtranCellTDD",
+              "nrcelldu": "NRCellDU", "nrcellcu": "NRCellCU",
+              "gerancell": "GeranCell"}
+    out: List[AuditResult] = []
+    for cls in sorted(cdd):                  # only classes the CDD defines
+        exp, act = cdd[cls], actual.get(cls, set())
+        name = _CANON.get(cls, cls)
+        missing = sorted(disp.get(x, x) for x in (exp - act))
+        extra = sorted(disp.get(x, x) for x in (act - exp))
+        ok = (len(exp) == len(act) and not missing and not extra)
+        out.append(AuditResult(
+            "cell-count", name, name, "cell count",
+            str(len(exp)), str(len(act)),
+            "Match" if ok else "Mismatch", "CDD vs node cells"))
+        if missing:
+            out.append(AuditResult(
+                "cell-count", name, name, "missing on node",
+                ", ".join(missing), "(not found)", "Mismatch",
+                "in CDD, absent on node"))
+        if extra:
+            out.append(AuditResult(
+                "cell-count", name, name, "extra on node",
+                "(not in CDD)", ", ".join(extra), "Mismatch",
+                "on node, absent from CDD"))
+    return out
+
+
 def _col_attrs(col: dict) -> List[str]:
     out = []
     if col.get("attr"):
@@ -1050,6 +1110,24 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
             fh.write("\n".join(lines) + "\n")
         written.append(path)
     return written
+
+
+def build_cmedit_commands(results: List[AuditResult], site: str,
+                          statuses=("Mismatch",), fdn_prefix: str = "",
+                          gsm_fdn_prefix: str = "",
+                          gsm_child_map: Optional[Dict[str, str]] = None
+                          ) -> List[tuple]:
+    """The exact ``cmedit set <FDN> <param>=<value>`` commands for the rows to
+    align — same FDN/value logic as the CMEdit file export, but returned as
+    ``(node, command)`` tuples so the app can apply them live over SSH."""
+    cmds: List[tuple] = []
+    for node, rows in _collect_set_rows(results, statuses, site).items():
+        for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
+            fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
+                             gsm_child_map)
+            cmds.append(
+                (node, f"cmedit set {fdn} {param}={_format_set_value(val, norm, actual)}"))
+    return cmds
 
 
 def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,

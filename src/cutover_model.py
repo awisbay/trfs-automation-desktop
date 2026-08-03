@@ -138,6 +138,7 @@ class CutoverCell:
     rat: str = "LTE"             # LTE | NR
     prefix_letter: str = ""      # "F" from ...DDNF-1 (cross-check only)
     cell_id: str = ""            # trailing id after the last '-'
+    sector: str = ""             # sector token, e.g. "1" from cell_id "121"
 
     # ── band / grouping ──────────────────────────────────────────
     band_number: int = -1        # Ericsson band number (-1 = unparsed)
@@ -401,18 +402,30 @@ class CutoverRun:
             self.touch()
 
     # ── queries ──────────────────────────────────────────────────
-    def cells_of(self, group: str) -> list:
+    def cells_of(self, group: str, sector: Optional[str] = None) -> list:
         grp = self.groups.get(group)
         if not grp:
             return []
-        return [self.by_key[k] for k in grp.cell_keys if k in self.by_key]
+        cells = [self.by_key[k] for k in grp.cell_keys if k in self.by_key]
+        if sector:
+            cells = [c for c in cells if c.sector == sector]
+        return cells
 
-    def unlockable_cells_of(self, group: str) -> list:
-        return [c for c in self.cells_of(group) if c.is_unlockable]
+    def unlockable_cells_of(self, group: str,
+                            sector: Optional[str] = None) -> list:
+        return [c for c in self.cells_of(group, sector) if c.is_unlockable]
 
-    def relockable_cells_of(self, group: str) -> list:
+    def relockable_cells_of(self, group: str,
+                            sector: Optional[str] = None) -> list:
         """Only cells this session unlocked — see :attr:`CutoverCell.is_relockable`."""
-        return [c for c in self.cells_of(group) if c.is_relockable]
+        return [c for c in self.cells_of(group, sector) if c.is_relockable]
+
+    def sectors_of(self, group: str) -> list:
+        """Sorted, de-duplicated sector tokens present in a group's cells —
+        drives the per-(band group × sector) unlock buttons. Only sectors that
+        actually have a cell appear, so the UI auto-adapts to each site."""
+        seen = {c.sector for c in self.cells_of(group) if c.sector}
+        return sorted(seen, key=lambda s: (len(s), s))
 
     def group_counts(self, group: str) -> dict:
         """Counts used by the group header: total / enabled / traffic / failed."""

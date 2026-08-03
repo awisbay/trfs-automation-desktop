@@ -457,6 +457,34 @@ class IntegrationPage:
             ),
             on_click=self._on_run,
         )
+        self.preflight_button = ft.OutlinedButton(
+            "Pre-flight Check",
+            icon=ft.Icons.FACT_CHECK_OUTLINED,
+            tooltip="Verify config script paths exist on the gateway and the "
+                    "BSC broker is reachable, before launching",
+            style=ft.ButtonStyle(
+                padding=ft.Padding.symmetric(horizontal=20, vertical=16),
+                shape=ft.RoundedRectangleBorder(radius=14),
+            ),
+            on_click=self._on_preflight,
+        )
+        self.queue_add_btn = ft.OutlinedButton(
+            "Add to Queue", icon=ft.Icons.PLAYLIST_ADD,
+            tooltip="Save this site (form + ticked steps) to the multi-site "
+                    "queue to run later, unattended",
+            style=ft.ButtonStyle(
+                padding=ft.Padding.symmetric(horizontal=18, vertical=16),
+                shape=ft.RoundedRectangleBorder(radius=14)),
+            on_click=self._add_to_queue,
+        )
+        self.queue_view_btn = ft.OutlinedButton(
+            self._queue_btn_label(), icon=ft.Icons.QUEUE_MUSIC,
+            tooltip="View the multi-site queue and run it",
+            style=ft.ButtonStyle(
+                padding=ft.Padding.symmetric(horizontal=18, vertical=16),
+                shape=ft.RoundedRectangleBorder(radius=14)),
+            on_click=self._open_queue,
+        )
         back_button = ft.ElevatedButton(
             "Back",
             icon=ft.Icons.ARROW_BACK,
@@ -509,7 +537,9 @@ class IntegrationPage:
                     ),
                     ft.Container(height=8),
                     ft.Row(
-                        [back_button, ft.Container(expand=True), self.run_button],
+                        [back_button, ft.Container(expand=True),
+                         self.queue_add_btn, self.queue_view_btn,
+                         self.preflight_button, self.run_button],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ],
@@ -562,15 +592,146 @@ class IntegrationPage:
         self._update_counter()
 
     # ── Navigation ──────────────────────────────────────────────
-    def _on_run(self, e):
-        # Build per-node selection: which step keys did the operator
-        # tick for each node column?
+    def _on_preflight(self, e):
+        """Read-only pre-run validation: config script paths on the gateway +
+        BSC broker reachability. Runs off-thread so the UI stays responsive."""
+        host = self.form.get("host", "")
+        user = self.form.get("username", "")
+        pwd = self.form.get("password", "")
+        if not (host and user and pwd):
+            self._alert_simple("Pre-flight Check",
+                               "Enter SSH host / username / password on the "
+                               "form first.")
+            return
+        self.preflight_button.disabled = True
+        self.preflight_button.text = "Checking…"
+        self.page.update()
+        threading.Thread(target=self._preflight_worker, daemon=True).start()
+
+    def _preflight_worker(self):
+        import config_validator
+        from integration_runner import IntegrationSSH, _CFG
+        _log = lambda m: print(f"[preflight] {m}")
+        results, err = [], ""
+        ssh = None
+        try:
+            port = int(self.form.get("port", 5023) or 5023)
+        except (ValueError, TypeError):
+            port = 5023
+        try:
+            ssh = IntegrationSSH(
+                host=self.form.get("host", ""), port=port,
+                username=self.form.get("username", ""),
+                password=self.form.get("password", ""),
+                log_callback=_log)
+            ssh.connect(timeout=30)
+            results = config_validator.run_preflight(
+                ssh, _CFG, self.form.get("bsc_name", ""), _log)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        finally:
+            if ssh is not None:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+        self.preflight_button.disabled = False
+        self.preflight_button.text = "Pre-flight Check"
+        try:
+            if err:
+                self._alert_simple("Pre-flight Check failed", err)
+            else:
+                self._show_preflight_dialog(results)
+        except Exception:
+            pass
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _show_dialog_safe(self, dlg) -> None:
+        try:
+            if hasattr(self.page, "show_dialog"):
+                self.page.show_dialog(dlg)
+                return
+        except Exception:
+            pass
+        try:
+            self.page.overlay.append(dlg)
+            dlg.open = True
+            self.page.update()
+        except Exception:
+            pass
+
+    def _close_dialog_safe(self, dlg) -> None:
+        try:
+            if hasattr(self.page, "pop_dialog"):
+                self.page.pop_dialog()
+                return
+        except Exception:
+            pass
+        try:
+            dlg.open = False
+            if dlg in (self.page.overlay or []):
+                self.page.overlay.remove(dlg)
+            self.page.update()
+        except Exception:
+            pass
+
+    def _alert_simple(self, title: str, message: str) -> None:
+        dlg = ft.AlertDialog(
+            modal=True, title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton(
+                "OK", on_click=lambda e: self._close_dialog_safe(dlg))],
+        )
+        self._show_dialog_safe(dlg)
+
+    def _show_preflight_dialog(self, results: list) -> None:
+        colour = {"pass": SUCCESS, "warn": ACCENT_WARM,
+                  "fail": DANGER, "skip": TEXT_MUTED}
+        icon = {"pass": ft.Icons.CHECK_CIRCLE, "warn": ft.Icons.WARNING_AMBER,
+                "fail": ft.Icons.CANCEL, "skip": ft.Icons.REMOVE_CIRCLE_OUTLINE}
+        fails = sum(1 for r in results if r.status == "fail")
+        warns = sum(1 for r in results if r.status == "warn")
+        rows = []
+        for r in results:
+            c = colour.get(r.status, TEXT_MUTED)
+            rows.append(ft.Row([
+                ft.Icon(icon.get(r.status, ft.Icons.HELP), color=c, size=18),
+                ft.Text(r.name, width=170, color=TEXT,
+                        weight=ft.FontWeight.W_600),
+                ft.Text(r.detail, expand=True, color=TEXT_MUTED, size=12,
+                        selectable=True),
+            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+        head = (f"{fails} blocker(s), {warns} warning(s)" if fails or warns
+                else "All checks passed ✓")
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Pre-flight Check — {head}",
+                          color=(DANGER if fails else
+                                 ACCENT_WARM if warns else SUCCESS),
+                          weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=760,
+                content=ft.Column(rows, spacing=6, scroll=ft.ScrollMode.AUTO,
+                                  tight=True)),
+            actions=[ft.TextButton(
+                "Close", on_click=lambda e: self._close_dialog_safe(dlg))],
+        )
+        self._show_dialog_safe(dlg)
+
+    def _collect_selection(self) -> dict:
+        """{node_tag: set(step_key)} the operator has ticked right now."""
         selected_per_node: dict[str, set[str]] = {}
         for step_key, per_node in self.checkboxes.items():
             for ntag, cb in per_node.items():
                 if cb.value:
                     selected_per_node.setdefault(ntag, set()).add(step_key)
+        return selected_per_node
 
+    def _on_run(self, e):
+        selected_per_node = self._collect_selection()
         if not any(selected_per_node.values()):
             return
 
@@ -587,6 +748,123 @@ class IntegrationPage:
 
     def _go_back(self, e):
         self.page.go("/form")
+
+    # ── Multi-site queue ─────────────────────────────────────────
+    def _get_queue(self):
+        from integration_queue import IntegrationQueue
+        from app_path import get_app_dir
+        if getattr(self, "_queue", None) is None:
+            self._queue = IntegrationQueue(get_app_dir())
+        return self._queue
+
+    def _queue_btn_label(self) -> str:
+        try:
+            n = len([j for j in self._get_queue().jobs
+                     if j.status in ("pending", "running")])
+        except Exception:
+            n = 0
+        return f"Queue ({n})"
+
+    def _add_to_queue(self, e):
+        selected = self._collect_selection()
+        if not any(selected.values()):
+            self._alert_simple("Add to Queue",
+                               "Tick at least one step first.")
+            return
+        form = dict(getattr(self.page, "integration_form", {}) or {})
+        shortcode = form.get("shortcode", "") or "UNKNOWN"
+        self._get_queue().add(
+            shortcode, form,
+            {k: sorted(v) for k, v in selected.items()})
+        self.queue_view_btn.text = self._queue_btn_label()
+        self._alert_simple("Added to Queue",
+                           f"{shortcode} queued. Open Queue to run all sites "
+                           f"back-to-back.")
+
+    def _open_queue(self, e):
+        q = self._get_queue()
+        _icon = {"pending": (ft.Icons.SCHEDULE, TEXT_MUTED),
+                 "running": (ft.Icons.AUTORENEW, ACCENT),
+                 "done": (ft.Icons.CHECK_CIRCLE, SUCCESS),
+                 "failed": (ft.Icons.CANCEL, DANGER),
+                 "skipped": (ft.Icons.REMOVE_CIRCLE_OUTLINE, TEXT_MUTED)}
+        list_col = ft.Column([], spacing=6, scroll=ft.ScrollMode.AUTO,
+                             height=340)
+
+        def _rebuild():
+            list_col.controls = []
+            for job in q.jobs:
+                ic, col = _icon.get(job.status, (ft.Icons.HELP, TEXT_MUTED))
+                list_col.controls.append(ft.Row([
+                    ft.Icon(ic, color=col, size=18),
+                    ft.Text(job.label(), expand=True, color=TEXT, size=13),
+                    ft.Text(job.status, color=col, size=11),
+                    ft.IconButton(ft.Icons.ARROW_UPWARD, icon_size=16,
+                                  tooltip="Move up",
+                                  on_click=lambda e, i=job.id: (
+                                      q.move(i, -1), _rebuild(),
+                                      self.page.update())),
+                    ft.IconButton(ft.Icons.ARROW_DOWNWARD, icon_size=16,
+                                  tooltip="Move down",
+                                  on_click=lambda e, i=job.id: (
+                                      q.move(i, 1), _rebuild(),
+                                      self.page.update())),
+                    ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_size=16,
+                                  tooltip="Remove",
+                                  on_click=lambda e, i=job.id: (
+                                      q.remove(i), _rebuild(),
+                                      self.page.update())),
+                ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            if not q.jobs:
+                list_col.controls.append(
+                    ft.Text("Queue is empty — use 'Add to Queue' on a site.",
+                            color=TEXT_MUTED, size=12))
+
+        _rebuild()
+        c = q.counts()
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Integration Queue — {c['pending']} pending, "
+                          f"{c['done']} done, {c['failed']} failed",
+                          weight=ft.FontWeight.BOLD),
+            content=ft.Container(width=780, content=list_col),
+            actions=[
+                ft.TextButton("Clear finished",
+                              on_click=lambda e: (q.clear_finished(), _rebuild(),
+                                                  self.page.update())),
+                ft.TextButton("Close",
+                              on_click=lambda e: self._close_dialog_safe(dlg)),
+                ft.ElevatedButton(
+                    "Run Queue", icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                    disabled=(c["pending"] == 0),
+                    on_click=lambda e: (self._close_dialog_safe(dlg),
+                                        self._run_queue())),
+            ],
+        )
+        self._show_dialog_safe(dlg)
+
+    def _run_queue(self):
+        """Start the queue: run pending jobs one at a time. Each site's run
+        auto-advances to the next on completion (see IntegrationRunPage)."""
+        q = self._get_queue()
+        q.reset_running_to_pending()
+        job = q.next_pending()
+        if job is None:
+            self._alert_simple("Run Queue", "No pending jobs.")
+            return
+        self.page.queue_active = True
+        self._launch_queue_job(job)
+
+    def _launch_queue_job(self, job) -> None:
+        q = self._get_queue()
+        q.set_status(job.id, "running")
+        self.page.queue_current_job_id = job.id
+        self.page.integration_form = dict(job.form)
+        self.page.integration_selected_steps_per_node = {
+            k: set(v) for k, v in (job.selected_per_node or {}).items()}
+        self.page.integration_selected_steps = {
+            s for v in (job.selected_per_node or {}).values() for s in v}
+        self.page.go("/integration_run")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -1645,6 +1923,56 @@ class IntegrationRunPage:
             self.page.update()
         except Exception:
             pass
+        # Multi-site queue: this site is done — advance to the next one.
+        if getattr(self.page, "queue_active", False):
+            try:
+                self.page.run_task(self._advance_queue_task, any_resumable)
+            except Exception:
+                pass
+
+    async def _advance_queue_task(self, failed: bool):
+        """After a queued site finishes, mark it and launch the next pending
+        one. A short pause lets the summary Excel save and the operator glimpse
+        the result before the view swaps to the next site."""
+        import asyncio
+        await asyncio.sleep(2.5)
+        try:
+            from integration_queue import IntegrationQueue
+            from app_path import get_app_dir
+            q = IntegrationQueue(get_app_dir())
+            jid = getattr(self.page, "queue_current_job_id", "")
+            if jid:
+                q.set_status(jid, "failed" if failed else "done")
+            nxt = q.next_pending()
+            if nxt is None:
+                self.page.queue_active = False
+                self.page.queue_current_job_id = ""
+                self._ui_log("✓ Queue finished — all sites processed.")
+                return
+            q.set_status(nxt.id, "running")
+            self.page.queue_current_job_id = nxt.id
+            self.page.integration_form = dict(nxt.form)
+            self.page.integration_selected_steps_per_node = {
+                k: set(v) for k, v in (nxt.selected_per_node or {}).items()}
+            self.page.integration_selected_steps = {
+                s for v in (nxt.selected_per_node or {}).values() for s in v}
+            self._ui_log(f"▶ Queue: starting next site {nxt.shortcode}…")
+            # We're already on /integration_run. A same-route go() is a
+            # no-op — both the Flutter client router and our server-side
+            # duplicate-route guard drop it — so the next site would never
+            # get a fresh view. Bounce through /form first (a real route
+            # change the client acts on), wait for that view to actually
+            # mount, then launch the next site's run. /form doesn't touch
+            # page.integration_form, so the handoff above survives.
+            self.page.go("/form")
+            for _ in range(30):
+                await asyncio.sleep(0.1)
+                top = self.page.views[-1] if self.page.views else None
+                if top is not None and getattr(top, "route", None) == "/form":
+                    break
+            self.page.go("/integration_run")
+        except Exception as exc:
+            print(f"[queue] advance failed: {exc}")
 
     # ── Per-node resume ──────────────────────────────────────────
     def _update_resume_button(self, node_tag: str):
@@ -1849,7 +2177,7 @@ class IntegrationRunPage:
         return ft.Column(rows, spacing=0, tight=True)
 
     def _build_summary_grid_data(
-        self, node_order: list, node_labels: dict,
+        self, node_order: list, node_labels: dict, full: bool = False,
     ) -> list[list[str]]:
         """Return the summary table as a list of rows (each row = list
         of plain strings). Reused by both the clipboard-copy helper
@@ -1867,8 +2195,11 @@ class IntegrationRunPage:
         rows.append(header)
 
         for key, label, applies_to, _ in INTEGRATION_STEPS:
-            # Visibility filter — same rule as the on-screen table
-            if key not in REMARK_STEPS and key not in SUMMARY_NA_STEPS:
+            # Visibility filter — same rule as the on-screen table. In ``full``
+            # mode (the Excel export) every step is kept even if it wasn't run
+            # this time, so the saved summary is always complete; the un-run
+            # steps just read "pending".
+            if not full and key not in REMARK_STEPS and key not in SUMMARY_NA_STEPS:
                 if not any(
                     self.is_step_selected(key, nt) for nt in node_order
                 ):
@@ -2067,24 +2398,13 @@ class IntegrationRunPage:
         except Exception as exc:
             self._ui_log(f"✗ Save failed: {exc}")
 
-    def _write_summary_xlsx(
-        self, path: str, node_order: list, node_labels: dict,
-    ) -> None:
-        """openpyxl-based writer that mirrors the on-screen style:
-        yellow bold row labels, white data cells, green ``Yes`` / red
-        ``No`` / black ``N/A`` / ``pending``, thin black borders."""
-        from openpyxl import Workbook
-        from openpyxl.styles import (
-            Font, PatternFill, Alignment, Border, Side,
-        )
+    def _style_summary_sheet(self, ws, rows: list) -> None:
+        """Paint ``rows`` onto ``ws`` with the exact on-screen palette:
+        gray header, light-blue bold labels, green ``Yes`` / red ``No`` /
+        bright-yellow ``N/A`` / muted-yellow ``pending``, thin black borders."""
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
 
-        rows = self._build_summary_grid_data(node_order, node_labels)
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Pre Integration Check List"
-
-        # Palette — matches the on-screen Flet table exactly.
         thin = Side(border_style="thin", color="000000")
         cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
         header_fill = PatternFill("solid", fgColor="D9D9D9")   # light gray
@@ -2100,17 +2420,14 @@ class IntegrationRunPage:
                 cell = ws.cell(row=r_idx, column=c_idx, value=value)
                 cell.border = cell_border
                 if r_idx == 1:
-                    # Header row — bold black on light gray, centered
                     cell.font = Font(bold=True, color="000000")
                     cell.fill = header_fill
                     cell.alignment = center
                 elif c_idx == 1:
-                    # Label column — bold black on light blue, centered
                     cell.font = Font(bold=True, color="000000")
                     cell.fill = label_fill
                     cell.alignment = center
                 else:
-                    # Data cell — bg + text colour depend on value
                     if value == "Yes":
                         cell.font = Font(bold=True, color="006100")
                         cell.fill = yes_fill
@@ -2127,29 +2444,76 @@ class IntegrationRunPage:
                         cell.font = Font(color="000000")
                     cell.alignment = center
 
-        # Column widths
         ws.column_dimensions["A"].width = 40
         for c in range(2, len(rows[0]) + 1):
             ws.column_dimensions[get_column_letter(c)].width = 26
-
-        # Row heights (subtle — keep table compact)
         for r in range(1, len(rows) + 1):
             ws.row_dimensions[r].height = 20
 
+    def _write_summary_xlsx(
+        self, path: str, node_order: list, node_labels: dict,
+    ) -> None:
+        """Manual 'Save as Excel' — one styled sheet (the on-screen view)."""
+        from openpyxl import Workbook
+        rows = self._build_summary_grid_data(node_order, node_labels)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Pre Integration Check List"
+        self._style_summary_sheet(ws, rows)
         wb.save(path)
+
+    def _autosave_summary_xlsx(
+        self, node_order: list, node_labels: dict,
+    ) -> None:
+        """Auto-save every run's summary into one workbook per site,
+        ``LOG/<siteid>/<siteid>_Integration_Summary.xlsx`` — each run appends a
+        new timestamped sheet. The saved table is always the FULL check list
+        (un-run steps read 'pending'), styled exactly like the on-screen view."""
+        try:
+            from openpyxl import Workbook, load_workbook
+            from app_path import get_app_dir
+
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", self.shortcode or "UNKNOWN")
+            out_dir = os.path.join(get_app_dir(), "LOG", safe)
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"{safe}_Integration_Summary.xlsx")
+
+            rows = self._build_summary_grid_data(
+                node_order, node_labels, full=True)
+
+            if os.path.isfile(path):
+                wb = load_workbook(path)
+            else:
+                wb = Workbook()
+                wb.remove(wb.active)   # start clean; every run is a named sheet
+
+            base = time.strftime("Run_%Y%m%d_%H%M%S")
+            name, i = base, 1
+            while name in wb.sheetnames:      # avoid a same-second collision
+                name = f"{base}_{i}"[:31]
+                i += 1
+            self._style_summary_sheet(wb.create_sheet(title=name), rows)
+            wb.save(path)
+            self._ui_log(f"✓ Summary auto-saved → {path} (sheet {name})")
+        except PermissionError:
+            self._ui_log("⚠ Summary auto-save skipped — the Excel file is open. "
+                         "Close it to let the next run append.")
+        except Exception as exc:
+            self._ui_log(f"⚠ Summary auto-save failed: {exc}")
 
     async def _reshow_summary_task(self):
         """Re-open the Integration Summary after returning from CDD Audit —
         the view has just rebuilt, so wait a beat for it to mount, then show
-        the popup from the restored (not re-run) results."""
+        the popup from the restored (not re-run) results. No auto-save here —
+        re-showing an existing summary must not append a duplicate sheet."""
         import asyncio
         await asyncio.sleep(0.4)
         try:
-            self._show_summary_popup()
+            self._show_summary_popup(save_excel=False)
         except Exception as exc:
             print(f"[summary] re-show failed: {exc}")
 
-    def _show_summary_popup(self):
+    def _show_summary_popup(self, save_excel: bool = True):
         # Persist just enough state on the page object so this summary can be
         # re-shown after a trip to the CDD Audit page (which rebuilds this view
         # from scratch) WITHOUT re-running the integration.
@@ -2168,6 +2532,11 @@ class IntegrationRunPage:
         if self.has_gsm:
             node_order.append("gsm")
             node_labels["gsm"] = self.gsm_name or "GSM"
+
+        # Auto-save this run's summary into the per-site workbook (a new sheet
+        # each run). Skipped on a re-show so it never appends a duplicate.
+        if save_excel:
+            self._autosave_summary_xlsx(node_order, node_labels)
 
         # Build a prettytable with columns: Check List | Node1 | Node2 | ...
         try:

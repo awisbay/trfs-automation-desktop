@@ -1104,6 +1104,10 @@
         {
           "cdd": "arfcnMax",
           "attr": "arfcnMax"
+        },
+        {
+          "cdd": "TRX COUNT",
+          "attr": "__count__"
         }
       ]
     }

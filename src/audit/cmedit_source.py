@@ -52,8 +52,12 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
         mo_class = prof.get("cmedit_mo") or _leaf_class(prof.get("mo_fdn", ""))
         # de-dup attrs (multi-instance MOs like ChannelGroup repeat an attr
         # across per-index CDD columns).
-        attrs = list(dict.fromkeys(c["attr"] for c in prof.get("columns", [])
-                                   if c.get("attr")))
+        # Synthetic attrs (``__count__`` etc.) are computed at parse time, not
+        # real MO attributes — never send them to cmedit (one bad attr fails the
+        # whole query).
+        attrs = list(dict.fromkeys(
+            c["attr"] for c in prof.get("columns", [])
+            if c.get("attr") and not c["attr"].startswith("__")))
         if not mo_class or not attrs:
             continue
         key_fdn = prof.get("key_fdn", "")
@@ -212,6 +216,10 @@ def _parse_cmedit_table(out: str, wanted: List[str],
                 continue
             key = f"{leaf_class}={leaf_val}" if leaf_class else leaf_val
         rec = records.setdefault(key, {})
+        # Count how many raw rows map to this key — for multi-instance MOs
+        # (e.g. Trx under a GsmSector) this is the instance count, exposed as
+        # ``__count__`` so a profile can audit "how many TRX per sector".
+        rec["__count__"] = str(int(rec.get("__count__", "0")) + 1)
         for attr, pos in attr_pos.items():
             if pos < len(toks):
                 rec[attr] = toks[pos]

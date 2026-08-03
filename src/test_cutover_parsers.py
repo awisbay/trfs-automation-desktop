@@ -25,6 +25,7 @@ from cutover_parsers import (
     parse_barred_state,
     parse_cells_from_hgetc,
     parse_radio_status,
+    sector_of,
     parse_st_cell_rows,
     parse_stzrc,
     parse_ue_counts,
@@ -90,6 +91,12 @@ check("unknown band 5 -> UNMAPPED, not unlockable",
 check("mo_ref built for commands",
       by_dn["TCFGAMANKILAMTAGUMDDNF-21"].mo_ref
       == "EUtranCellFDD=TCFGAMANKILAMTAGUMDDNF-21")
+check("sector uses last digit: 11 -> S1",
+      by_dn["TCFGAMANKILAMTAGUMDDNY-11"].sector == "1")
+check("sector uses last digit: 12 -> S2",
+      by_dn["TCFGAMANKILAMTAGUMDDNL-12"].sector == "2")
+check("sector regex can override the default",
+      sector_of("999", "SITE-SECTOR7-999", r"SECTOR(?P<sector>\d)") == "7")
 
 # ──────────────────────────────────────────────────────────────────
 print("\n[2] parse_cells_from_hgetc — NR, including array continuation lines")
@@ -116,6 +123,8 @@ check("multiband extra band recorded",
       str(nr_by["TCFGAMANKILAMTAGUMDDNN-411"].extra_band_numbers))
 check("bare ';78' form -> NR3500 / HB",
       nr_by["TCFGAMANKILAMTAGUMDDNN-412"].band_key == "NR3500")
+check("NR sector also uses last digit: 412 -> S2",
+      nr_by["TCFGAMANKILAMTAGUMDDNN-412"].sector == "2")
 check("each cell in exactly one group",
       all(c.group in ("LB", "MB", "HB", UNMAPPED) for c in nr))
 

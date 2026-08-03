@@ -28,6 +28,7 @@ import asyncio
 import os
 import sys
 import threading
+from typing import Optional
 
 import flet as ft
 
@@ -119,6 +120,16 @@ class _CellRow:
         self._icon.color = colour
 
         detail = cell.status_detail or cell.status.value.replace("_", " ")
+        # A cell we unlocked that never came up: make the admin/op state
+        # explicit — "UNLOCKED/DISABLED" — so the operator immediately sees the
+        # cell is deblocked but the node is holding it down (a real problem to
+        # chase, e.g. a locked radio), instead of a generic "enable timeout".
+        admin = (getattr(cell, "admin_state", "") or "").upper()
+        op = (getattr(cell, "op_state", "") or "").upper()
+        if (cell.status in (CellStatus.ENABLE_TIMEOUT,
+                            CellStatus.BLOCKED_BY_DEPENDENCY)
+                and admin == "UNLOCKED" and op and op != "ENABLED"):
+            detail = f"{admin}/{op} — {detail}"
         self._state.value = detail
         self._state.color = (
             SUCCESS if icon_state == "done" else
@@ -140,15 +151,18 @@ class _CellRow:
 class _GroupSection:
     """A band group: coloured header with counts, Unlock and Re-lock buttons."""
 
-    def __init__(self, name: str, on_unlock, on_relock=None):
+    def __init__(self, name: str, on_unlock, on_relock=None, on_evidence=None):
         self.name = name
+        self._on_unlock = on_unlock      # (group, sector=None)
+        self._on_relock = on_relock      # (group, sector=None)
+        self._sector_buttons: dict = {}  # sector -> ElevatedButton
         accent = GROUP_ACCENT.get(name, ACCENT)
 
         self.title = ft.Text(name, size=15, weight=ft.FontWeight.BOLD, color=accent)
         self.counts = ft.Text("no cells", size=11, color=TEXT_MUTED)
         self.status_chip = ft.Container(visible=False)
         self.button = ft.ElevatedButton(
-            f"Unlock {name}",
+            f"Unlock All {name}",
             icon=ft.Icons.LOCK_OPEN_ROUNDED,
             disabled=True,
             style=ft.ButtonStyle(
@@ -176,7 +190,29 @@ class _GroupSection:
             ),
             on_click=(lambda e, g=name: on_relock(g)) if on_relock else None,
         )
+        # Evidence → WhatsApp. Appears once the group has cells up, so the
+        # operator can share the traffic + alarm screenshot to the group chat
+        # at any time (the non-blocking flow no longer does it automatically).
+        self.evidence_button = ft.OutlinedButton(
+            "Evidence",
+            icon=ft.Icons.CHAT_ROUNDED,
+            visible=False,
+            tooltip="Build the traffic + alarm screenshot and share it to "
+                    "WhatsApp",
+            style=ft.ButtonStyle(
+                color=SUCCESS,
+                side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, SUCCESS)),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=12, vertical=12),
+            ),
+            on_click=(lambda e, g=name: on_evidence(g)) if on_evidence else None,
+        )
         self.rows_column = ft.Column([], spacing=2)
+        # Per-(band group × sector) unlock buttons — one per sector that
+        # actually has a cell in this group, built on demand from discovery.
+        self._sector_accent = accent
+        self.sector_row = ft.Row([], spacing=6, wrap=True, run_spacing=6,
+                                 visible=False)
         #: When set, the counts line keeps this text instead of live counts.
         self.static_note = ""
 
@@ -190,7 +226,9 @@ class _GroupSection:
                     self.title,
                     self.counts,
                     self.status_chip,
+                    self.sector_row,
                     ft.Container(expand=True),
+                    self.evidence_button,
                     self.relock_button,
                     self.button,
                 ],
@@ -199,6 +237,42 @@ class _GroupSection:
             ),
         )
         self.control = ft.Column([header, self.rows_column], spacing=4)
+
+    def set_sectors(self, sectors: list, unlockable_by_sector: dict,
+                    busy: bool, ready: bool) -> None:
+        """Show one small unlock button per sector present in this group
+        (``S1``/``S2``/…). Only sectors with a cell appear, so the row adapts
+        to each site. Sector buttons sit to the left of ``Unlock All``."""
+        if not sectors:
+            self.sector_row.visible = False
+            return
+        if set(sectors) != set(self._sector_buttons):
+            self._sector_buttons = {}
+            controls = []
+            for s in sectors:
+                btn = ft.OutlinedButton(
+                    f"Unlock S{s}",
+                    icon=ft.Icons.LOCK_OPEN_ROUNDED,
+                    style=ft.ButtonStyle(
+                        color=self._sector_accent,
+                        side=ft.BorderSide(
+                            1, ft.Colors.with_opacity(0.5, self._sector_accent)),
+                        shape=ft.RoundedRectangleBorder(radius=10),
+                        padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                    ),
+                    on_click=(lambda e, g=self.name, sec=s:
+                              self._on_unlock(g, sec)),
+                )
+                self._sector_buttons[s] = btn
+                controls.append(btn)
+            self.sector_row.controls = controls
+        self.sector_row.visible = True
+        for s, btn in self._sector_buttons.items():
+            cnt = int(unlockable_by_sector.get(s, 0))
+            btn.disabled = busy or not ready or cnt == 0
+            btn.tooltip = (
+                f"Unlock the {cnt} S{s} {self.name} cell(s)" if cnt
+                else f"No unlockable S{s} cell in {self.name}")
 
     def set_counts(self, counts: dict, status: GroupStatus, busy: bool,
                    unlockable: int, relockable: int = 0) -> None:
@@ -248,6 +322,14 @@ class _GroupSection:
             f"unlocked. Cells that were already in service are not touched."
         )
 
+        up = counts["enabled"] + counts["traffic_ok"]
+        self.evidence_button.visible = up > 0
+        self.evidence_button.disabled = busy
+        self.evidence_button.tooltip = (
+            f"Build the traffic + alarm screenshot for {self.name} "
+            f"({up} cell(s) up) and share it to WhatsApp"
+        )
+
 
 class CutOverPage:
     def __init__(self, page: ft.Page):
@@ -274,7 +356,35 @@ class CutOverPage:
     def build(self) -> ft.View:
         self.page.title = f"NodeCraft — {self.shortcode or 'Cut Over'} (Cut Over)"
 
-        self.status_text = ft.Text("Connecting…", size=13, color=ACCENT)
+        self.status_text = ft.Text(
+            "Ready — click Start HC to create CV, take modump, and run preHC",
+            size=13, color=ACCENT,
+        )
+        self.start_hc_btn = ft.ElevatedButton(
+            "Start HC",
+            icon=ft.Icons.HEALTH_AND_SAFETY_OUTLINED,
+            tooltip="Create CV, take modump, run preHC, then discover cells",
+            style=ft.ButtonStyle(
+                bgcolor=ACCENT,
+                color="#06242A",
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=18, vertical=12),
+            ),
+            on_click=self._on_start_hc,
+        )
+        self.start_unlock_btn = ft.OutlinedButton(
+            "Start Unlock",
+            icon=ft.Icons.LOCK_OPEN_ROUNDED,
+            tooltip="Skip preparation (CV, modump, preHC) — go straight to "
+                    "discovering cells and their status so you can unlock now",
+            style=ft.ButtonStyle(
+                color=ACCENT,
+                side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=18, vertical=12),
+            ),
+            on_click=self._on_start_unlock,
+        )
         self.cancel_btn = ft.OutlinedButton(
             "Cancel", icon=ft.Icons.STOP_CIRCLE_OUTLINED,
             style=ft.ButtonStyle(color=DANGER,
@@ -302,6 +412,8 @@ class CutOverPage:
                     spacing=2,
                 ),
                 ft.Container(expand=True),
+                self.start_hc_btn,
+                self.start_unlock_btn,
                 self.cancel_btn,
                 back_btn,
             ],
@@ -326,7 +438,8 @@ class CutOverPage:
 
         for name in list(self.cfg["group_order"]) + [UNMAPPED]:
             self._sections[name] = _GroupSection(
-                name, self._on_unlock_group, self._on_relock_group)
+                name, self._on_unlock_group, self._on_relock_group,
+                self._on_share_evidence)
         # The unmapped bucket has no button by design — these cells are
         # deliberately unreachable from any unlock action. Say why, so an
         # operator who expected to see them in a group isn't left guessing.
@@ -404,9 +517,11 @@ class CutOverPage:
 
         if self.engine.recovery_checkpoint:
             self.status_text.value = "Unfinished Cut Over found — action required"
+            self.start_hc_btn.disabled = True
+            self.start_unlock_btn.disabled = True
             self.page.run_task(self._show_recovery_prompt)
         else:
-            self.engine.start_discovery()
+            self._refresh_chrome()
         self.page.run_task(self._flush_loop)
 
         return ft.View(route="/cutover", padding=0, spacing=0, bgcolor=BG_TOP,
@@ -424,9 +539,12 @@ class CutOverPage:
             if mode == "close":
                 try:
                     path = self.engine.close_recovery_as_incomplete()
-                    self.status_text.value = "Previous run closed as INCOMPLETE"
+                    self.status_text.value = (
+                        "Previous run closed — click Start HC for a new run"
+                    )
                     self.engine.log(f"Previous run manifest saved: {path}")
-                    self.engine.start_discovery()
+                    self._refresh_chrome()
+                    self.page.update()
                 except Exception as exc:
                     self._alert("Recovery", f"Could not close checkpoint: {exc}")
                 return
@@ -570,6 +688,15 @@ class CutOverPage:
                 len(run.unlockable_cells_of(name)),
                 len(run.relockable_cells_of(name)),
             )
+            if name != UNMAPPED:
+                sectors = run.sectors_of(name)
+                unlockable_by_sector = {
+                    s: len(run.unlockable_cells_of(name, s)) for s in sectors
+                }
+                section.set_sectors(
+                    sectors, unlockable_by_sector, busy,
+                    run.phase == RunPhase.READY,
+                )
             if run.phase != RunPhase.READY:
                 section.button.disabled = True
                 section.button.tooltip = (
@@ -592,9 +719,16 @@ class CutOverPage:
             f"Cells already in service before this run are not touched."
         )
         self.cancel_btn.disabled = not busy
+        self.start_hc_btn.disabled = (
+            busy or run.phase != RunPhase.IDLE
+            or bool(self.engine.recovery_checkpoint)
+        )
+        self.start_unlock_btn.disabled = self.start_hc_btn.disabled
 
         phase_text = {
-            RunPhase.IDLE: "Idle",
+            RunPhase.IDLE: (
+                "Ready — click Start HC to create CV, take modump, and run preHC"
+            ),
             RunPhase.PREPARING: "Preparing Cut Over — CV, modump, and preHC…",
             RunPhase.RECOVERING: "Recovering — reconciling live node state…",
             RunPhase.DISCOVERING: "Discovering cells…",
@@ -828,13 +962,31 @@ class CutOverPage:
         self._show_dialog(dlg)
 
     # ── button handlers ──────────────────────────────────────────
-    def _on_unlock_group(self, group: str) -> None:
-        self.engine.unlock_group(group)
+    def _on_start_hc(self, e) -> None:
+        """Explicit operator gate for all pre-Cut Over network activity."""
+        self.engine.start_discovery()
         self._refresh_chrome()
         self.page.update()
 
-    def _on_relock_group(self, group: str) -> None:
-        self.engine.relock_group(group)
+    def _on_start_unlock(self, e) -> None:
+        """Skip preparation (CV / modump / preHC) and go straight to cell
+        discovery + status, so the operator can unlock right away."""
+        self.engine.start_discovery(skip_preparation=True)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_unlock_group(self, group: str, sector: Optional[str] = None) -> None:
+        self.engine.unlock_group(group, sector)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_relock_group(self, group: str, sector: Optional[str] = None) -> None:
+        self.engine.relock_group(group, sector)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_share_evidence(self, group: str) -> None:
+        self.engine.share_evidence(group)
         self._refresh_chrome()
         self.page.update()
 

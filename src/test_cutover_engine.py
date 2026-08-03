@@ -168,6 +168,10 @@ def build_engine(tmpdir, fake, **over):
     cfg["enable_poll"]["interval_s"] = 0.02
     cfg["enable_poll"]["timeout_s"] = 4
     cfg["enable_poll"]["backoff_after_s"] = 999
+    # These checks exercise the synchronous guided flow (unlock → wait-enable →
+    # wait-traffic → group DONE). The background monitor is a separate mode with
+    # its own coverage, so force the blocking path here.
+    cfg["enable_poll"]["background_monitor"] = False
     cfg["traffic"]["interval_s"] = 0.02
     cfg["traffic"]["timeout_s"] = 4
     cfg["unlock"]["inter_command_delay_s"] = 0
@@ -230,6 +234,22 @@ check("pre-state ran before any unlock",
       not any(s.startswith("ldeb") for s in fake.sent))
 check("nothing wrongly flagged already-in-service",
       not any(c.already_in_service for c in run.cells))
+
+# Per-sector action is intentionally tested on a separate run so the full-group
+# happy path below still verifies both LB cells together.
+fake_sector = FakeSSH()
+eng_sector = build_engine(tmpdir, fake_sector)
+eng_sector.start_discovery(); wait_idle(eng_sector)
+check("LB sectors come from the last cell-id digit",
+      eng_sector.run.sectors_of("LB") == ["1", "2"],
+      str(eng_sector.run.sectors_of("LB")))
+eng_sector.unlock_group("LB", "2"); wait_idle(eng_sector)
+sector_unlocks = [s for s in fake_sector.sent if s.startswith("ldeb")]
+check("Unlock S2 sends only the S2 LB cell",
+      len(sector_unlocks) == 1 and "SITEA-12" in sector_unlocks[0],
+      str(sector_unlocks))
+check("Unlock S2 leaves the S1 LB cell untouched",
+      eng_sector.run.cells_of("LB", "1")[0].status == CellStatus.PENDING)
 
 # ──────────────────────────────────────────────────────────────────
 print("\n[2] unlock LB — happy path via stzrc")

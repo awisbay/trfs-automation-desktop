@@ -90,6 +90,9 @@ class AuditPage:
         self.runscript_btn = ft.ElevatedButton(
             "Run Scripts", icon=ft.Icons.PLAY_ARROW, visible=False,
             style=secondary_button_style(), on_click=self._open_run_scripts)
+        self.apply_btn = ft.ElevatedButton(
+            "Apply (cmedit)", icon=ft.Icons.BOLT, visible=False,
+            style=secondary_button_style(), on_click=self._apply_cmedit)
         self.editmap_btn = ft.OutlinedButton(
             "Edit Map", icon=ft.Icons.EDIT_NOTE, on_click=self._open_map_editor)
 
@@ -146,7 +149,7 @@ class AuditPage:
                     ft.Text(creds_line, size=11,
                             color=(TEXT_MUTED if creds_ok else ACCENT_WARM)),
                     ft.Row([self.run_btn, self.open_btn, self.gen_btn,
-                            self.runscript_btn,
+                            self.runscript_btn, self.apply_btn,
                             self.timer_text, self.status_text],
                            spacing=14, wrap=True,
                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
@@ -540,6 +543,18 @@ class AuditPage:
             from collections import Counter
             results = audit_core.compare(items, records)
 
+            # Cell inventory: CDD-defined cells vs the cells actually on the
+            # node(s) — count + exact names (missing / extra).
+            try:
+                inv = audit_core.cell_inventory_check(items, records)
+                if inv:
+                    results += inv
+                    ic = Counter(r.status for r in inv)
+                    self._log(f"Cell inventory: {ic.get('Match',0)} class(es) "
+                              f"match, {ic.get('Mismatch',0)} differ.")
+            except Exception as exc:
+                self._log(f"cell inventory check failed: {exc}")
+
             # Reverse pass: nodes present in the data but with NO CDD rows (e.g.
             # a batch node the CDD doesn't cover) — surface their ACTUAL audited
             # params with the CDD column blank and status "CDD missing", instead
@@ -624,6 +639,7 @@ class AuditPage:
             self.status_text.color = SUCCESS if clean else ACCENT_WARM
             self.open_btn.visible = True
             self.gen_btn.visible = c["Mismatch"] > 0
+            self.apply_btn.visible = c["Mismatch"] > 0
         except Exception as exc:
             self._fail(f"Audit failed: {exc}")
         finally:
@@ -715,6 +731,119 @@ class AuditPage:
         except Exception as exc:
             self._log(f"✗ Script generation failed: {exc}")
             self._set_status("Script generation failed.", DANGER)
+
+    # ── Apply mismatches via cmedit (close the loop) ─────────────
+    def _apply_cmedit(self, e):
+        if not self._results:
+            self._log("Run an audit first."); return
+        from audit import audit_core, cdd_reader
+        fdn_prefix = (self._form.get("subnetwork") or "").strip()
+        gsm_fdn_prefix, gsm_child_map = "", {}
+        try:
+            amap = cdd_reader.load_map()
+            bsc = (self._form.get("bsc_name") or "").strip() or "<BSC>"
+            gsm_fdn_prefix = amap.get("gsm_fdn_prefix", "").replace("{bsc}", bsc)
+            gsm_child_map = audit_core.build_gsm_child_map(amap)
+        except Exception:
+            pass
+        site = (self._gen_ctx or {}).get("site") or self.site_field.value.strip()
+        cmds = audit_core.build_cmedit_commands(
+            self._results, site, fdn_prefix=fdn_prefix,
+            gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+        if not cmds:
+            self._set_status("No mismatch commands to apply.", ACCENT_WARM); return
+        if not (self._form.get("host") and self._form.get("username")
+                and self._form.get("password")):
+            self._set_status("SSH creds from the main form are required to "
+                             "apply.", DANGER); return
+
+        dry = ft.Checkbox(label="Dry run — log the commands, don't send",
+                          value=True)
+        preview = "\n".join(c for _n, c in cmds[:250])
+        if len(cmds) > 250:
+            preview += f"\n… (+{len(cmds) - 250} more)"
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Apply {len(cmds)} cmedit set command(s)?",
+                          weight=ft.FontWeight.BOLD, color=ACCENT_WARM),
+            content=ft.Container(width=860, content=ft.Column([
+                ft.Text("Each runs via cli.py over SSH and CHANGES the node. "
+                        "Review carefully — leave 'Dry run' on for a safe "
+                        "preview first.", color=TEXT_MUTED, size=12),
+                dry,
+                ft.Container(
+                    height=360, bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+                    border_radius=8, padding=10,
+                    content=ft.Column([ft.Text(
+                        preview, size=11, selectable=True,
+                        font_family="Consolas", color=TEXT)],
+                        scroll=ft.ScrollMode.AUTO)),
+            ], tight=True, spacing=10)),
+            actions=[
+                ft.TextButton("Cancel",
+                              on_click=lambda e2: self._close_dialog(dlg)),
+                ft.ElevatedButton(
+                    "Apply", icon=ft.Icons.BOLT,
+                    style=primary_button_style(),
+                    on_click=lambda e2: (self._close_dialog(dlg),
+                                         threading.Thread(
+                        target=self._apply_cmedit_worker,
+                        args=(cmds, dry.value), daemon=True).start())),
+            ],
+        )
+        self._show_dialog(dlg)
+
+    def _apply_cmedit_worker(self, cmds, dry):
+        from integration_runner import IntegrationSSH, CLI_PY
+        ssh = None
+        ok = fail = 0
+        self.run_btn.disabled = True
+        self._start_timer()
+        try:
+            host = self._form.get("host", "")
+            user = self._form.get("username", "")
+            pwd = self._form.get("password", "")
+            try:
+                port = int(self._form.get("port", 5023) or 5023)
+            except (ValueError, TypeError):
+                port = 5023
+            if not dry:
+                ssh = IntegrationSSH(host=host, port=port, username=user,
+                                     password=pwd, log_callback=self._log)
+                ssh.connect(timeout=30)
+            self._log(f"{'DRY RUN — ' if dry else ''}Applying "
+                      f"{len(cmds)} cmedit command(s)...")
+            _ERR = re.compile(r"\berror\b|exception|invalid|not found|"
+                              r"no instances|fail(ed|ure)?", re.IGNORECASE)
+            for i, (node, cmd) in enumerate(cmds, 1):
+                if dry:
+                    self._log(f"  [{i}/{len(cmds)}] (dry) {cmd}")
+                    continue
+                out = ssh.run_command(f'python {CLI_PY} "{cmd}"', timeout=120)
+                if _ERR.search(out or ""):
+                    fail += 1
+                    self._log(f"  ✗ [{i}/{len(cmds)}] {cmd}\n"
+                              f"     → {(out or '').strip()[-200:]}")
+                else:
+                    ok += 1
+                    self._log(f"  ✓ [{i}/{len(cmds)}] {cmd}")
+            if dry:
+                self._set_status(f"Dry run: {len(cmds)} command(s) shown "
+                                 "(nothing sent).", ACCENT)
+            else:
+                self._set_status(f"Applied: {ok} ok, {fail} failed of "
+                                 f"{len(cmds)}.",
+                                 SUCCESS if fail == 0 else ACCENT_WARM)
+        except Exception as exc:
+            self._fail(f"Apply failed: {exc}")
+        finally:
+            self._stop_timer()
+            self.run_btn.disabled = False
+            if ssh is not None:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
 
     # ── Dialog helpers (Flet 0.84 managed dialog stack) ──────────
     def _show_dialog(self, dlg):

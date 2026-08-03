@@ -98,6 +98,7 @@ _DEFAULTS = {
         "mo_types": ["EUtranCellFDD", "EUtranCellTDD", "NRCellDU"],
         "nr_multiband_policy": "first",
         "include_unmapped_bands": True,
+        "sector_regex": "",
     },
     "band_groups": {
         "LB": ["L700", "L800", "L900", "NR700"],
@@ -137,7 +138,7 @@ _DEFAULTS = {
         },
         "prehc": {
             "enabled": True,
-            "script_path": "",
+            "script_path": "/home/shared/common/INTEGRATION_TEAM/script/PreHC.txt",
             "command_template": "run {script_path}",
             "timeout_s": 900,
         },
@@ -284,6 +285,7 @@ def run_cutover_discovery(ssh, node_name: str, log_cb: Callable[[str], None],
         mo_types=tuple(disc["mo_types"]),
         nr_multiband_policy=disc["nr_multiband_policy"],
         include_unmapped=disc["include_unmapped_bands"],
+        sector_regex=str(disc.get("sector_regex", "")),
     )
     if not cells:
         log_cb(f"[{node_name}] no cells found in the band listing.")
@@ -513,10 +515,13 @@ def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
     step_cfg = cfg["preparation"]["prehc"]
     script_path = str(step_cfg.get("script_path", "")).strip()
     if not script_path:
-        msg = (f"[{node_name}] preHC script_path is empty. Set "
-               f"cutover.preparation.prehc.script_path in config.json.")
-        log_cb(f"✗ {msg}")
-        return False, msg
+        # No preHC script configured → INFO only, never a blocker. Cut Over
+        # should still discover and show current cell status.
+        msg = (f"[{node_name}] preHC has no script_path configured — skipped "
+               f"(info only, not blocking). Set "
+               f"cutover.preparation.prehc.script_path to enable it.")
+        log_cb(f"ℹ {msg}")
+        return True, msg
     if "\n" in script_path or "\r" in script_path:
         msg = f"[{node_name}] preHC script_path contains a newline."
         log_cb(f"✗ {msg}")
@@ -549,8 +554,18 @@ def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
         "",
     )
     if matched:
-        log_cb(f"[{node_name}] ✗ preHC output matched error pattern: {matched}")
-        return False, out
+        # preHC is a health check, not a gate. Its output legitimately contains
+        # the word "ERROR" (real alarms AND benign internal moshell noise like
+        # "ERROR: mv .../pmxgLog... FAILED"), so a substring match must NOT block
+        # the whole cut over. Flag it for review and continue, unless the
+        # operator explicitly opts into blocking via preparation.prehc.blocking.
+        if bool(step_cfg.get("blocking", False)):
+            log_cb(f"[{node_name}] ✗ preHC output matched error pattern: {matched}")
+            return False, out
+        log_cb(f"[{node_name}] ⚠ preHC output matched '{matched}' — health check "
+               f"flagged something (info only, not blocking). Review the PREHC "
+               f"log; cell status will still be shown.")
+        return True, out
     log_cb(f"[{node_name}] ✓ preHC completed.")
     return True, out
 
@@ -796,6 +811,12 @@ class CutoverEngine:
         self._threads: list = []
         # Set when a manual traffic gate is waiting on the operator.
         self._traffic_gate: dict = {}
+        # Background status monitor: after a non-blocking unlock the enable wait
+        # runs here (NOT under _action_lock) so the operator can keep unlocking
+        # other groups/sectors while cells are polled every few seconds.
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop = threading.Event()
+        self._monitor_lock = threading.Lock()
 
     # ── logging ──────────────────────────────────────────────────
     def _default_log_dir(self) -> str:
@@ -829,7 +850,11 @@ class CutoverEngine:
     def is_busy(self) -> bool:
         return self._action_lock.locked()
 
-    def start_discovery(self) -> None:
+    def start_discovery(self, skip_preparation: bool = False) -> None:
+        # skip_preparation=True → the "Start Unlock" path: skip CV backup,
+        # modump and preHC, and go straight to identifying cells + their live
+        # status so the operator can unlock directly.
+        self._skip_preparation = bool(skip_preparation)
         self._ensure_persistence_started()
         self._spawn(self._discovery_worker, "cutover-discovery")
 
@@ -861,16 +886,21 @@ class CutoverEngine:
         self.recovery_checkpoint = None
         return path
 
-    def unlock_group(self, group: str) -> None:
-        self._spawn(lambda: self._grouped_action([group]), f"cutover-{group}")
+    def unlock_group(self, group: str, sector: Optional[str] = None) -> None:
+        # sector=None → the whole band group; sector="1" → only that sector's
+        # cells in the group (per-(band group × sector) unlock).
+        tag = f"cutover-{group}" + (f"-S{sector}" if sector else "")
+        self._spawn(lambda: self._grouped_action([group], sector), tag)
 
     def unlock_all(self) -> None:
         self._spawn(lambda: self._grouped_action(list(self.cfg["group_order"])),
                     "cutover-all")
 
-    def relock_group(self, group: str) -> None:
-        """Roll back one group — only cells this session unlocked."""
-        self._spawn(lambda: self._relock_action([group]), f"cutover-relock-{group}")
+    def relock_group(self, group: str, sector: Optional[str] = None) -> None:
+        """Roll back one group (optionally one sector) — only cells this
+        session unlocked."""
+        tag = f"cutover-relock-{group}" + (f"-S{sector}" if sector else "")
+        self._spawn(lambda: self._relock_action([group], sector), tag)
 
     def relock_all(self) -> None:
         """Roll back everything this session unlocked, highest band first."""
@@ -879,6 +909,25 @@ class CutoverEngine:
 
     def run_final_verification(self) -> None:
         self._spawn(self._final_verify_worker, "cutover-verify")
+
+    def share_evidence(self, group: str) -> None:
+        """Build the traffic + alarm screenshot for a group on demand and hand
+        it off to WhatsApp — the manual counterpart to the old auto-report, so
+        evidence still works with the non-blocking unlock flow."""
+        self._spawn(lambda: self._report_worker(group),
+                    f"cutover-evidence-{group}")
+
+    def _report_worker(self, group: str) -> None:
+        run = self.run
+        cells = run.cells_of(group)
+        by_node: dict = {}
+        for c in cells:
+            by_node.setdefault(c.node_name, []).append(c)
+        if not by_node:
+            self.log(f"{group}: no cells to build evidence for.")
+            return
+        self.log(f"{group}: building WhatsApp evidence (traffic + alarms)…")
+        self._report_phase(group, by_node)
 
     def confirm_traffic(self, group: str, ok: bool) -> None:
         """Resolve a manual traffic gate raised by an unparseable UE column."""
@@ -889,6 +938,7 @@ class CutoverEngine:
 
     def cancel(self) -> None:
         self.run.cancel_event.set()
+        self._stop_monitor()
         self.log("Cancel requested. Cells already unlocked stay unlocked — "
                  "cut over does not roll back.")
         for gate in self._traffic_gate.values():
@@ -898,6 +948,7 @@ class CutoverEngine:
 
     def shutdown(self) -> None:
         self._persist_checkpoint()
+        self._stop_monitor()
         self._checkpoint_stop.set()
         self._checkpoint_event.set()
         self.run.cancel_event.set()
@@ -1058,6 +1109,16 @@ class CutoverEngine:
             self.log(f"[{node_name}] pre-Cut Over preparation is disabled.")
             return True
 
+        # preHC is a health check, not a gate: when no script is configured it
+        # is skipped (info) rather than run — so a missing reference file never
+        # blocks discovery / showing the current cell status.
+        prehc_cfg = prep.get("prehc", {})
+        prehc_enabled = bool(prehc_cfg.get("enabled", True))
+        if prehc_enabled and not str(prehc_cfg.get("script_path", "")).strip():
+            self.log(f"[{node_name}] ℹ preHC has no script_path — skipped "
+                     f"(info only, not blocking).")
+            prehc_enabled = False
+
         steps = [
             (
                 "CREATE_CV",
@@ -1078,7 +1139,7 @@ class CutoverEngine:
             ),
             (
                 "PREHC",
-                prep.get("prehc", {}).get("enabled", True),
+                prehc_enabled,
                 lambda: run_cutover_prehc(
                     sess.ssh, node_name, self.log, self.cfg,
                     self._wait_for_user,
@@ -1384,21 +1445,24 @@ class CutoverEngine:
             self.emit(CutoverEvent(kind="discovery_done", message=run.error))
             return
 
-        preparation_failed = []
-        for node_name, sess in run.sessions.items():
-            if not self._run_preparation_for_node(node_name, sess):
-                preparation_failed.append(node_name)
-        if preparation_failed:
-            run.error = (
-                "Pre-Cut Over blocked: preparation failed for "
-                + ", ".join(preparation_failed)
-            )
-            self.log(f"✗ {run.error}")
-            run.set_phase(RunPhase.FAILED)
-            self.emit(CutoverEvent(kind="discovery_done", message=run.error))
-            return
-
-        self.log("✓ Pre-Cut Over preparation completed on every node.")
+        if getattr(self, "_skip_preparation", False):
+            self.log("⏩ Start Unlock: skipping preparation (CV backup, modump "
+                     "and preHC) — going straight to cell discovery.")
+        else:
+            preparation_failed = []
+            for node_name, sess in run.sessions.items():
+                if not self._run_preparation_for_node(node_name, sess):
+                    preparation_failed.append(node_name)
+            if preparation_failed:
+                run.error = (
+                    "Pre-Cut Over blocked: preparation failed for "
+                    + ", ".join(preparation_failed)
+                )
+                self.log(f"✗ {run.error}")
+                run.set_phase(RunPhase.FAILED)
+                self.emit(CutoverEvent(kind="discovery_done", message=run.error))
+                return
+            self.log("✓ Pre-Cut Over preparation completed on every node.")
         run.set_phase(RunPhase.DISCOVERING)
 
         all_cells: list = []
@@ -1521,7 +1585,8 @@ class CutoverEngine:
         self.emit(CutoverEvent(kind="discovery_done", message=msg))
 
     # ── group orchestration ──────────────────────────────────────
-    def _grouped_action(self, groups: list) -> None:
+    def _grouped_action(self, groups: list,
+                        sector: Optional[str] = None) -> None:
         run = self.run
         if run.phase != RunPhase.READY:
             self.log(
@@ -1530,18 +1595,19 @@ class CutoverEngine:
             return
         run.cancel_event.clear()
 
-        targets = [g for g in groups if run.unlockable_cells_of(g)]
+        targets = [g for g in groups if run.unlockable_cells_of(g, sector)]
         if not targets:
-            self.log("No unlockable cells in the selected group(s).")
+            where = f" (sector S{sector})" if sector else ""
+            self.log(f"No unlockable cells in the selected group(s){where}.")
             return
 
-        self._check_endc_anchor(targets)
+        self._check_endc_anchor(targets, sector)
 
         # One confirmation covering everything this click will do.
         if self.cfg.get("require_confirmation") and self._confirm_cb:
             lines = []
             for g in targets:
-                for c in run.unlockable_cells_of(g):
+                for c in run.unlockable_cells_of(g, sector):
                     lines.append(
                         self.cfg["unlock"]["command_template"].format(
                             mo_type=c.mo_type, cell_dn=c.cell_dn,
@@ -1558,7 +1624,7 @@ class CutoverEngine:
         for group in targets:
             if run.is_cancelled():
                 break
-            self._run_group(group)
+            self._run_group(group, sector)
             grp = run.groups[group]
             if (grp.status in (GroupStatus.FAILED,)
                     and self.cfg.get("stop_on_group_failure")):
@@ -1568,7 +1634,8 @@ class CutoverEngine:
         run.set_phase(RunPhase.CANCELLED if run.is_cancelled() else RunPhase.READY,
                       active_group="")
 
-    def _check_endc_anchor(self, groups: list) -> None:
+    def _check_endc_anchor(self, groups: list,
+                           sector: Optional[str] = None) -> None:
         """Warn when NR cells are about to be unlocked with no LTE anchor up.
 
         NR needs its LTE anchor in service. LB/MB/HB cuts across RAT — an
@@ -1581,7 +1648,8 @@ class CutoverEngine:
             return
         run = self.run
 
-        nr_pending = [c for g in groups for c in run.unlockable_cells_of(g)
+        nr_pending = [c for g in groups
+                      for c in run.unlockable_cells_of(g, sector)
                       if c.rat == "NR"]
         if not nr_pending:
             return
@@ -1606,11 +1674,12 @@ class CutoverEngine:
                      f"LTE anchor, so these cells will probably report 0 UEs. "
                      f"Consider unlocking the LTE band group first.")))
 
-    def _relock_action(self, groups: list) -> None:
+    def _relock_action(self, groups: list,
+                       sector: Optional[str] = None) -> None:
         run = self.run
         run.cancel_event.clear()
 
-        targets = [(g, run.relockable_cells_of(g)) for g in groups]
+        targets = [(g, run.relockable_cells_of(g, sector)) for g in groups]
         targets = [(g, cells) for g, cells in targets if cells]
         if not targets:
             self.log("Nothing to roll back — no cell in these group(s) was "
@@ -1678,14 +1747,15 @@ class CutoverEngine:
         self.emit(CutoverEvent(kind="group_done",
                                message=f"Rolled back {len(all_cells)} cell(s)."))
 
-    def _run_group(self, group: str) -> None:
+    def _run_group(self, group: str, sector: Optional[str] = None) -> None:
         run = self.run
         grp = run.groups[group]
-        cells = run.unlockable_cells_of(group)
+        cells = run.unlockable_cells_of(group, sector)
         run.set_group(group, GroupStatus.RUNNING, started_at=time.monotonic(),
                       message="")
         run.set_phase(RunPhase.UNLOCKING, active_group=group)
-        self.log(f"── {group}: unlocking {len(cells)} cell(s) ──")
+        where = f" S{sector}" if sector else ""
+        self.log(f"── {group}{where}: unlocking {len(cells)} cell(s) ──")
 
         by_node: dict = {}
         for c in cells:
@@ -1698,10 +1768,32 @@ class CutoverEngine:
                 node_cells.sort(key=lambda c: 0 if c.rat == "LTE" else 1)
 
         self._start_group_logs(group, by_node.keys())
+        bg = self.cfg["enable_poll"].get("background_monitor", True)
         try:
             unlocked_any = self._unlock_phase(group, by_node)
             if not unlocked_any or run.is_cancelled():
                 self._finish_group(group)
+                return
+
+            if bg:
+                # Non-blocking enable wait: hand the polling to the background
+                # monitor and return immediately so the operator can unlock
+                # other groups/sectors. The monitor flips each cell to ENABLED
+                # when it comes up, and flags a cell that stays UNLOCKED/DISABLED
+                # past ``stuck_after_s`` so a real problem is obvious.
+                now = time.monotonic()
+                for node_cells in by_node.values():
+                    for c in node_cells:
+                        if c.status == CellStatus.UNLOCK_SENT:
+                            run.set_cell(
+                                c, CellStatus.WAITING_ENABLE,
+                                status_detail="unlocked — waiting for enable",
+                                t_unlock_sent=c.t_unlock_sent or now)
+                run.set_group(group, GroupStatus.RUNNING,
+                              message="unlocked — monitoring in background")
+                self.log(f"{group}: unlocked — monitoring status in the "
+                         f"background; you can unlock other groups now.")
+                self._ensure_monitor()
                 return
 
             run.set_phase(RunPhase.WAIT_ENABLE, active_group=group)
@@ -1717,7 +1809,8 @@ class CutoverEngine:
             self._report_phase(group, by_node)
         finally:
             self._stop_group_logs(by_node.keys())
-            self._finish_group(group)
+            if not bg:
+                self._finish_group(group)
 
     def _start_group_logs(self, group: str, node_names) -> None:
         """Tee every byte of this group to a file — the audit trail that
@@ -1969,6 +2062,79 @@ class CutoverEngine:
                 self._mark_remaining(targets, CellStatus.CANCELLED, "cancelled")
                 return False
 
+    # ── background status monitor (non-blocking enable wait) ─────
+    def _ensure_monitor(self) -> None:
+        """Start the background status monitor if it isn't already running."""
+        with self._monitor_lock:
+            if self._monitor_thread and self._monitor_thread.is_alive():
+                return
+            self._monitor_stop.clear()
+            t = threading.Thread(target=self._monitor_loop,
+                                 name="cutover-monitor", daemon=True)
+            self._monitor_thread = t
+            t.start()
+
+    def _stop_monitor(self) -> None:
+        self._monitor_stop.set()
+
+    _MONITOR_WATCH = (
+        CellStatus.UNLOCK_SENT, CellStatus.WAITING_ENABLE,
+        CellStatus.ENABLE_TIMEOUT, CellStatus.BLOCKED_BY_DEPENDENCY,
+    )
+
+    def _monitor_loop(self) -> None:
+        """Poll status for every cell we unlocked but that hasn't come up yet,
+        every ``monitor_interval_s``. Flips cells to ENABLED as they come up
+        (``_apply_st_rows``), and — the point of this loop — marks a cell that
+        is UNLOCKED but still not ENABLED past ``stuck_after_s`` as a problem so
+        the operator sees UNLOCKED/DISABLED instead of a spinner forever. Runs
+        off the action lock, so unlocking other groups stays possible."""
+        run = self.run
+        poll = self.cfg["enable_poll"]
+        interval = float(poll.get("monitor_interval_s", 5))
+        stuck_after = float(poll.get("stuck_after_s", 60))
+        while not self._monitor_stop.is_set():
+            if run.cancel_event.is_set():
+                break
+            watched = [c for c in list(run.cells)
+                       if c.was_unlocked_by_run and c.status in self._MONITOR_WATCH]
+            if not watched:
+                break                       # nothing left to watch — exit
+            # An unlock/relock action holds the action lock and is talking to the
+            # same single SSH channel; poll only when no action is running so two
+            # threads never write the node's PTY at once (that corrupts both).
+            if not self._action_lock.locked():
+                for node_name in {c.node_name for c in watched}:
+                    sess = run.sessions.get(node_name)
+                    if sess is None or sess.degraded:
+                        continue
+                    try:
+                        _ok, _out, rows = run_cutover_st_cell(
+                            sess.ssh, node_name, self.log, self.cfg)
+                        self._apply_st_rows(node_name, rows, poll)
+                    except Exception as exc:
+                        self.log(f"[{node_name}] monitor poll failed: "
+                                 f"{type(exc).__name__}: {exc}")
+            now = time.monotonic()
+            for c in watched:
+                if c.status not in (CellStatus.WAITING_ENABLE,
+                                    CellStatus.UNLOCK_SENT):
+                    continue
+                if not c.t_unlock_sent or (now - c.t_unlock_sent) <= stuck_after:
+                    continue
+                admin = (c.admin_state or "").upper()
+                op = (c.op_state or "").upper()
+                if admin == "UNLOCKED" and op and op != "ENABLED":
+                    run.set_cell(
+                        c, CellStatus.ENABLE_TIMEOUT,
+                        status_detail=(f"unlocked but still {op} after "
+                                       f"{int(now - c.t_unlock_sent)}s — check "
+                                       f"the radio/dependency"))
+            self.emit(CutoverEvent(kind="progress"))
+            self._monitor_stop.wait(interval)
+        with self._monitor_lock:
+            self._monitor_thread = None
+
     def _apply_st_rows(self, node_name: str, rows: list, poll: dict) -> int:
         """Fold status rows into the cells. Returns how many rows matched."""
         run = self.run
@@ -1988,12 +2154,20 @@ class CutoverEngine:
                 "avail_status": row.avail_status,
                 "t_last_seen": time.monotonic(),
             }
+            row_ue = getattr(row, "ue_count", None)
+            if row_ue is not None:
+                fields["ue_count"] = row_ue
             is_up = row.op_state.upper() in good_states
             if need_unlocked and row.admin_state:
                 is_up = is_up and row.admin_state.upper() == "UNLOCKED"
 
+            # ENABLE_TIMEOUT / BLOCKED_BY_DEPENDENCY are recoverable while the
+            # monitor runs: a cell flagged stuck that later comes up flips back
+            # to ENABLED instead of staying red forever.
             if is_up and cell.status in (CellStatus.WAITING_ENABLE,
-                                         CellStatus.UNLOCK_SENT):
+                                         CellStatus.UNLOCK_SENT,
+                                         CellStatus.ENABLE_TIMEOUT,
+                                         CellStatus.BLOCKED_BY_DEPENDENCY):
                 run.set_cell(cell, CellStatus.ENABLED, status_detail="enabled",
                              t_enabled=time.monotonic(), **fields)
             else:

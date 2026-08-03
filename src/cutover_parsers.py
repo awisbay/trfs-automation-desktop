@@ -100,6 +100,32 @@ def _split_prefix_and_id(cell_dn: str) -> tuple:
     return prefix, cell_id
 
 
+_SECTOR_LAST_DIGIT_RE = re.compile(r"(\d)\s*$")
+
+
+def sector_of(cell_id: str, cell_dn: str = "", regex: str = "") -> str:
+    """Sector token for a cell. Default rule (confirmed for this environment):
+    the LAST digit of the trailing cell id — ``121`` → ``1``, ``232`` → ``2``,
+    ``3`` → ``3``. A config ``discovery.sector_regex`` (named group ``sector``
+    or group 1) applied to the full ``cell_dn`` overrides it, so a different
+    naming convention needs no code change."""
+    if regex:
+        try:
+            m = re.search(regex, cell_dn or "")
+        except re.error:
+            m = None
+        if m:
+            try:
+                val = m.groupdict().get("sector")
+            except Exception:
+                val = None
+            if val is None:
+                val = m.group(1) if m.groups() else m.group(0)
+            return (val or "").strip()
+    m = _SECTOR_LAST_DIGIT_RE.search(cell_id or "")
+    return m.group(1) if m else ""
+
+
 def group_for_band(band_key: str, band_groups: dict) -> str:
     """Map a band key (``L1800``) onto a group (``MB``), else ``UNMAPPED``."""
     if not band_key:
@@ -121,6 +147,7 @@ def parse_cells_from_hgetc(
     mo_types: Optional[tuple] = None,
     nr_multiband_policy: str = "first",
     include_unmapped: bool = True,
+    sector_regex: str = "",
 ) -> list:
     """Build one :class:`CutoverCell` per cell from the two ``hgetc`` outputs.
 
@@ -201,6 +228,7 @@ def parse_cells_from_hgetc(
             rat="LTE",
             prefix_letter=prefix,
             cell_id=cell_id,
+            sector=sector_of(cell_id, cell_dn, sector_regex),
             band_number=band_number,
             band_key=band_key,
             group=group_for_band(band_key, band_groups),
@@ -236,6 +264,7 @@ def parse_cells_from_hgetc(
             rat="NR",
             prefix_letter=prefix,
             cell_id=cell_id,
+            sector=sector_of(cell_id, current["cell_dn"], sector_regex),
             band_number=primary,
             band_key=band_key,
             extra_band_numbers=extra,

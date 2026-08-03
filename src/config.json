@@ -1,237 +1,283 @@
 {
-    "_comment_top": "NodeCraft dynamic configuration. Every script path is an absolute Unix path on the gateway. Edit any single line to point at a different location — scripts no longer need to live under one shared 'scripts_path' root. The legacy 'scripts_path' is kept as a fallback for any value that doesn't start with '/'.",
-
-    "scripts_path": "/home/shared/ESETARI/INOC/SCRIPTS",
-
-    "_comment_cli": "ENM CLI helper. Used by almost every step via 'python <cli_py> \"cmedit ...\"'.",
-    "cli_py": "/home/shared/ESETARI/INOC/SCRIPTS/cli.py",
-
-    "_comment_arne_enroll": "Add Node in ENM + enrollment flow scripts.",
-    "create_arne_script":  "/home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne_2.py",
-    "entity_maker_script": "/home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh",
-    "exe_entity_script":   "/home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py",
-    "enrollment_mos":      "/home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos",
-
-    "_comment_sgw": "Verify SGw Reachability — multi-ping moshell script (run on LTE/NR nodes).",
-    "sgw_check_mos": "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos",
-
-    "_comment_lkf": "Install LKF (License File) — import / install / status scripts.",
-    "lkf_import_script":  "/home/shared/ESETARI/INOC/SCRIPTS/lkfimport.py",
-    "lkf_install_script": "/home/shared/ESETARI/INOC/SCRIPTS/lkfinstall.py",
-    "lkf_status_script":  "/home/shared/ESETARI/INOC/SCRIPTS/lkfstatus.py",
-
-    "_comment_lkf_smrs": "Directory ENM SMRS uses to persist per-node license XMLs. Checked for the LKF fast-path (skip import if file already there).",
-    "smrs_licence_dir": "/ericsson/tor/smrs/smrsroot/licence",
-
-    "_comment_baseline": "Load Baseline Scripts — moshell .mos invoked by the framework. Can live anywhere (different folder than the ENM CLI scripts).",
-    "baseline_script_path": "/home/shared/common/INTEGRATION_TEAM/script/Baseline_script.mos",
-
-    "_comment_baseline_files": "Reference list of baseline batch files per RAT (informational, not invoked directly by the framework).",
-    "baseline_files": {
-        "L":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
-        "LN": "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
-        "N":  "Globe_Baseline_Adaptive_Rev17042026_0500.txt"
+  "_comment_top": "NodeCraft dynamic configuration. Every script path is an absolute Unix path on the gateway. Edit any single line to point at a different location \u2014 scripts no longer need to live under one shared 'scripts_path' root. The legacy 'scripts_path' is kept as a fallback for any value that doesn't start with '/'.",
+  "scripts_path": "/home/shared/ESETARI/INOC/SCRIPTS",
+  "_comment_cli": "ENM CLI helper. Used by almost every step via 'python <cli_py> \"cmedit ...\"'.",
+  "cli_py": "/home/shared/ESETARI/INOC/SCRIPTS/cli.py",
+  "_comment_arne_enroll": "Add Node in ENM + enrollment flow scripts.",
+  "create_arne_script": "/home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne_2.py",
+  "entity_maker_script": "/home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh",
+  "exe_entity_script": "/home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py",
+  "enrollment_mos": "/home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos",
+  "_comment_sgw": "Verify SGw Reachability \u2014 multi-ping moshell script (run on LTE/NR nodes).",
+  "sgw_check_mos": "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos",
+  "_comment_lkf": "Install LKF (License File) \u2014 import / install / status scripts.",
+  "lkf_import_script": "/home/shared/ESETARI/INOC/SCRIPTS/lkfimport.py",
+  "lkf_install_script": "/home/shared/ESETARI/INOC/SCRIPTS/lkfinstall.py",
+  "lkf_status_script": "/home/shared/ESETARI/INOC/SCRIPTS/lkfstatus.py",
+  "_comment_lkf_smrs": "Directory ENM SMRS uses to persist per-node license XMLs. Checked for the LKF fast-path (skip import if file already there).",
+  "smrs_licence_dir": "/ericsson/tor/smrs/smrsroot/licence",
+  "_comment_baseline": "Load Baseline Scripts \u2014 moshell .mos invoked by the framework. Can live anywhere (different folder than the ENM CLI scripts).",
+  "baseline_script_path": "/home/shared/common/INTEGRATION_TEAM/script/Baseline_script.mos",
+  "_comment_baseline_files": "Reference list of baseline batch files per RAT (informational, not invoked directly by the framework).",
+  "baseline_files": {
+    "L": "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
+    "LN": "Globe_Baseline_Adaptive_Rev17042026_0500.txt",
+    "N": "Globe_Baseline_Adaptive_Rev17042026_0500.txt"
+  },
+  "_comment_relation_journal": "Resumable Relation execution. Each .txt runs separately and is atomically journaled after a completion sentinel + per-file log parse. Interrupted files stay AMBIGUOUS and require operator confirmation before that file alone is retried.",
+  "relation_journal_enabled": true,
+  "relation_file_timeout_s": 3600,
+  "relation_file_quiet_s": 3.0,
+  "_comment_external_alarm": "Pre-define External Alarm \u2014 moshell template that creates the 8 AlarmPort MOs on the primary BB. LTE primary only.",
+  "external_alarm_template": "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
+  "_comment_bsc": "BSC name -> expected broker IP. Used by the GSM SGW check to verify the node's AbisIp bscBrokerIpAddress points at the RIGHT BSC. Edit here when a BSC is added/changed (no rebuild).",
+  "bsc_broker_map": {
+    "MINBS00": "10.14.194.131",
+    "MINBS01": "10.14.204.3"
+  },
+  "_comment_uri": "URI Reconfig + SW Level Check \u2014 ENM REST endpoints + target UpgradePackage ID. This value is used DIRECTLY (no auto-detect) for both URI Setting and SW Level Check. Edit it to the expected software version.",
+  "uri_setting": {
+    "enm_login_url": "https://lhgenm1.globetel.com/login",
+    "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
+    "upgrade_package_id": "CXP2010174/2-R42J13"
+  },
+  "_comment_cutover": "Cut Over. EVERY command below is operator-editable \u2014 no rebuild and no app restart needed (this block is re-read at the start of each run). WARNING: unlock.command_template is DESTRUCTIVE \u2014 it unlocks live cells on a production network. Validate with dry_run=true first. Placeholders: {mo_type} {cell_dn} {mo_ref} {node}.",
+  "cutover": {
+    "enabled": true,
+    "dry_run": false,
+    "require_confirmation": true,
+    "max_cells_per_unlock": 0,
+    "discovery": {
+      "lte_band_command": "hgetc ^eutrancell[FT]DD= freqBand$",
+      "nr_band_command": "hgetc nrcelldu bandListManual",
+      "command_timeout_s": 120,
+      "amos_timeout_s": 180,
+      "mo_types": [
+        "EUtranCellFDD",
+        "EUtranCellTDD",
+        "NRCellDU"
+      ],
+      "nr_multiband_policy": "first",
+      "include_unmapped_bands": true,
+      "sector_regex": "",
+      "_comment_sector": "Sector detection: blank = last digit of the cell id after the last dash (121->S1, 122->S2, 123->S3). Set a regex on the full cell_dn with a named group (?P<sector>..) to override."
     },
-
-    "_comment_relation_journal": "Resumable Relation execution. Each .txt runs separately and is atomically journaled after a completion sentinel + per-file log parse. Interrupted files stay AMBIGUOUS and require operator confirmation before that file alone is retried.",
-    "relation_journal_enabled": true,
-    "relation_file_timeout_s": 3600,
-    "relation_file_quiet_s": 3.0,
-
-    "_comment_external_alarm": "Pre-define External Alarm — moshell template that creates the 8 AlarmPort MOs on the primary BB. LTE primary only.",
-    "external_alarm_template": "/home/shared/common/INTEGRATION_TEAM/script/External_Alarm_Template.txt",
-
-    "_comment_bsc": "BSC name -> expected broker IP. Used by the GSM SGW check to verify the node's AbisIp bscBrokerIpAddress points at the RIGHT BSC. Edit here when a BSC is added/changed (no rebuild).",
-    "bsc_broker_map": {
-        "MINBS00": "10.14.194.131",
-        "MINBS01": "10.14.204.3"
+    "_comment_band_groups": "band_key -> group. Band keys come from band_detector.LTE_FREQ_BAND_MAP / NR_BAND_LIST_MAP. A band_key not listed here lands in UNMAPPED and is NEVER unlocked by any button.",
+    "band_groups": {
+      "LB": [
+        "L700",
+        "L800",
+        "L900",
+        "NR700"
+      ],
+      "MB": [
+        "L1800",
+        "L1900",
+        "L2100",
+        "NR1800",
+        "NR1900",
+        "NR2100"
+      ],
+      "HB": [
+        "L2300",
+        "L2600",
+        "NR2600",
+        "NR3500"
+      ]
     },
-
-    "_comment_uri": "URI Reconfig + SW Level Check — ENM REST endpoints + target UpgradePackage ID. This value is used DIRECTLY (no auto-detect) for both URI Setting and SW Level Check. Edit it to the expected software version.",
-    "uri_setting": {
-        "enm_login_url":      "https://lhgenm1.globetel.com/login",
-        "enm_uri_update_url": "https://lhgenm1.globetel.com/oss/shm/rest/softwarePackage/updateUpMoFtpServerDetails",
-        "upgrade_package_id": "CXP2010174/2-R42J13"
+    "group_order": [
+      "LB",
+      "MB",
+      "HB"
+    ],
+    "stop_on_group_failure": false,
+    "unlock": {
+      "_comment": "One MO per command \u2014 never a regex that could match a whole node. NOTE: `deb`/`bl` is the standard moshell deblock/block pair; `ldeb` is kept here because that is what was specified for this environment. Correct either here without a rebuild.",
+      "command_template": "ldeb {mo_type}={cell_dn}",
+      "lock_command_template": "bl {mo_type}={cell_dn}",
+      "graceful_lock": false,
+      "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
+      "expects_confirm": true,
+      "confirm_answer": "y",
+      "command_timeout_s": 120,
+      "inter_command_delay_s": 0.5,
+      "parallel_nodes": true,
+      "abort_group_on_first_error": true,
+      "error_patterns": [
+        "ERROR",
+        "Unable to",
+        "not found",
+        "No MOs",
+        "Syntax error",
+        "failed"
+      ]
     },
-
-    "_comment_cutover": "Cut Over. EVERY command below is operator-editable — no rebuild and no app restart needed (this block is re-read at the start of each run). WARNING: unlock.command_template is DESTRUCTIVE — it unlocks live cells on a production network. Validate with dry_run=true first. Placeholders: {mo_type} {cell_dn} {mo_ref} {node}.",
-    "cutover": {
+    "_comment_preparation": "Runs automatically when the Cut Over page opens, before cell discovery can become READY. All enabled steps are hard gates. prehc.script_path is the absolute path visible from the Moshell/ENM session; command_template can be adjusted if the local Moshell uses a different script command. Step logs/checkpoint/manifest use a unique run folder under LOG/<site>/PRE_CUTOVER/, while Cut Over modump ZIPs go directly to LOG/<site>/PRE_CUTOVER/DUMP/. Integration dump storage is unchanged.",
+    "preparation": {
+      "enabled": true,
+      "stop_on_failure": true,
+      "create_cv": {
         "enabled": true,
-        "dry_run": false,
-        "require_confirmation": true,
-        "max_cells_per_unlock": 0,
-
-        "discovery": {
-            "lte_band_command": "hgetc ^eutrancell[FT]DD= freqBand$",
-            "nr_band_command":  "hgetc nrcelldu bandListManual",
-            "command_timeout_s": 120,
-            "amos_timeout_s": 180,
-            "mo_types": ["EUtranCellFDD", "EUtranCellTDD", "NRCellDU"],
-            "nr_multiband_policy": "first",
-            "include_unmapped_bands": true
+        "name_template": "PreCutover_{node}_{timestamp}"
+      },
+      "modump": {
+        "enabled": true
+      },
+      "prehc": {
+        "enabled": true,
+        "script_path": "/home/shared/common/INTEGRATION_TEAM/script/PreHC.txt",
+        "command_template": "run {script_path}",
+        "timeout_s": 900,
+        "error_patterns": [
+          "ERROR",
+          "Unknown command",
+          "Syntax error",
+          "command not found"
+        ]
+      }
+    },
+    "_comment_prestate": "Required hard gate. Every discovered cell must match a live pre-state row before READY. A failed or partial read blocks Cut Over so rollback ownership is never guessed.",
+    "prestate": {
+      "enabled": true,
+      "required": true,
+      "skip_already_in_service": true
+    },
+    "persistence": {
+      "enabled": true,
+      "checkpoint_interval_s": 0.5
+    },
+    "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",
+    "diagnosis": {
+      "enabled": true,
+      "radio_status_template": "st B{band_number}",
+      "barred_command_template": "hget {mo_type}={cell_dn} cellBarred|cellReservedForOperatorUse",
+      "command_timeout_s": 60,
+      "check_barred_before_traffic": true
+    },
+    "_comment_endc": "NR needs its LTE anchor in service. LB/MB/HB cuts across RAT, so unlocking a high group first can leave NR cells at 0 UEs for a reason that is purely ordering.",
+    "endc": {
+      "warn_nr_without_anchor": true,
+      "lte_before_nr": true
+    },
+    "enable_poll": {
+      "_comment": "source=stzrc reuses the traffic command, whose LTECell/NRCell tables carry an S state column \u2014 one command per poll instead of two. Set source=st to use the commands list instead. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
+      "source": "stzrc",
+      "commands": [
+        "st cell"
+      ],
+      "command_timeout_s": 90,
+      "interval_s": 15,
+      "interval_max_s": 60,
+      "backoff_after_s": 120,
+      "timeout_s": 900,
+      "max_polls": 200,
+      "require_admin_unlocked": true,
+      "enabled_op_states": [
+        "ENABLED"
+      ],
+      "row_regex": "",
+      "match_mode": "suffix",
+      "max_unmatched_polls": 3,
+      "min_enabled_ratio": 0.0,
+      "reconnect_credit_threshold_s": 60,
+      "background_monitor": true,
+      "monitor_interval_s": 5,
+      "stuck_after_s": 60
+    },
+    "traffic": {
+      "_comment": "stzrc prints ;-delimited LTECell/NRCell tables carrying both an S state column and a UEs column, and is parsed natively. Traffic = the UEs column going 0 -> non-zero for required_consecutive_samples polls in a row. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
+      "command": "stzrc",
+      "command_timeout_s": 120,
+      "interval_s": 20,
+      "timeout_s": 600,
+      "ue_column_names": [
+        "UE",
+        "UEs",
+        "NoOfUsers",
+        "nrOfRrcConnected",
+        "connectedUsers",
+        "RrcConnected"
+      ],
+      "ue_regex": "",
+      "ue_threshold": 1,
+      "required_consecutive_samples": 2,
+      "use_peak": true,
+      "on_parse_failure": "manual_confirm",
+      "unknown_command_patterns": [
+        "Unknown command",
+        "Syntax error",
+        "command not found",
+        "Invalid command"
+      ]
+    },
+    "_comment_alarm": "baseline_before_unlock captures `alt` before the first unlock so the evidence can separate alarms this cut over caused from ones the site already had.",
+    "alarm": {
+      "command": "alt",
+      "command_timeout_s": 120,
+      "baseline_before_unlock": true,
+      "no_alarm_patterns": [
+        "No Active alarms"
+      ]
+    },
+    "report": {
+      "screenshot_subdir": "CUTOVER",
+      "filename_template": "{shortcode}_CUTOVER_{group}_{timestamp}.png",
+      "title_template": "{shortcode} - Cut Over {group} - {nodes}",
+      "max_width": 1600,
+      "terminal_style": {
+        "bg_color": [
+          12,
+          12,
+          12
+        ],
+        "text_color": [
+          204,
+          204,
+          204
+        ],
+        "header_color": [
+          0,
+          255,
+          0
+        ],
+        "font_size": 13,
+        "font": "Consolas",
+        "padding": 20,
+        "line_spacing": 4
+      },
+      "whatsapp": {
+        "enabled": true,
+        "mode": "semi_auto",
+        "group_link": "",
+        "caption_template": "Cut Over {group} - {shortcode}\nNodes: {nodes}\nCells enabled: {ok}/{total}\nTraffic OK: {traffic_ok}\nAlarms: {alarms}"
+      }
+    },
+    "_comment_final_verification": "PLUGGABLE \u2014 add the real post-cutover checks here later, no rebuild. scope: per_node | once. expect_regex empty = informational only (always passes). fail_regex, when matched, forces a fail.",
+    "final_verification": {
+      "enabled": true,
+      "stop_on_failure": false,
+      "steps": [
+        {
+          "key": "final_alarms",
+          "label": "Final alarm check",
+          "command": "alt",
+          "scope": "per_node",
+          "timeout_s": 120,
+          "expect_regex": "",
+          "fail_regex": "CRITICAL|MAJOR",
+          "screenshot": true
         },
-
-        "_comment_band_groups": "band_key -> group. Band keys come from band_detector.LTE_FREQ_BAND_MAP / NR_BAND_LIST_MAP. A band_key not listed here lands in UNMAPPED and is NEVER unlocked by any button.",
-        "band_groups": {
-            "LB": ["L700", "L800", "L900", "NR700"],
-            "MB": ["L1800", "L1900", "L2100", "NR1800", "NR1900", "NR2100"],
-            "HB": ["L2300", "L2600", "NR2600", "NR3500"]
-        },
-        "group_order": ["LB", "MB", "HB"],
-        "stop_on_group_failure": false,
-
-        "unlock": {
-            "_comment": "One MO per command — never a regex that could match a whole node. NOTE: `deb`/`bl` is the standard moshell deblock/block pair; `ldeb` is kept here because that is what was specified for this environment. Correct either here without a rebuild.",
-            "command_template": "ldeb {mo_type}={cell_dn}",
-            "lock_command_template": "bl {mo_type}={cell_dn}",
-            "graceful_lock": false,
-            "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
-            "expects_confirm": true,
-            "confirm_answer": "y",
-            "command_timeout_s": 120,
-            "inter_command_delay_s": 0.5,
-            "parallel_nodes": true,
-            "abort_group_on_first_error": true,
-            "error_patterns": ["ERROR", "Unable to", "not found", "No MOs", "Syntax error", "failed"]
-        },
-
-        "_comment_preparation": "Runs automatically when the Cut Over page opens, before cell discovery can become READY. All enabled steps are hard gates. prehc.script_path is the absolute path visible from the Moshell/ENM session; command_template can be adjusted if the local Moshell uses a different script command. Step logs/checkpoint/manifest use a unique run folder under LOG/<site>/PRE_CUTOVER/, while Cut Over modump ZIPs go directly to LOG/<site>/PRE_CUTOVER/DUMP/. Integration dump storage is unchanged.",
-        "preparation": {
-            "enabled": true,
-            "stop_on_failure": true,
-            "create_cv": {
-                "enabled": true,
-                "name_template": "PreCutover_{node}_{timestamp}"
-            },
-            "modump": {
-                "enabled": true
-            },
-            "prehc": {
-                "enabled": true,
-                "script_path": "",
-                "command_template": "run {script_path}",
-                "timeout_s": 900,
-                "error_patterns": ["ERROR", "Unknown command", "Syntax error", "command not found"]
-            }
-        },
-
-        "_comment_prestate": "Required hard gate. Every discovered cell must match a live pre-state row before READY. A failed or partial read blocks Cut Over so rollback ownership is never guessed.",
-        "prestate": {
-            "enabled": true,
-            "required": true,
-            "skip_already_in_service": true
-        },
-
-        "persistence": {
-            "enabled": true,
-            "checkpoint_interval_s": 0.5
-        },
-
-        "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",
-        "diagnosis": {
-            "enabled": true,
-            "radio_status_template": "st B{band_number}",
-            "barred_command_template": "hget {mo_type}={cell_dn} cellBarred|cellReservedForOperatorUse",
-            "command_timeout_s": 60,
-            "check_barred_before_traffic": true
-        },
-
-        "_comment_endc": "NR needs its LTE anchor in service. LB/MB/HB cuts across RAT, so unlocking a high group first can leave NR cells at 0 UEs for a reason that is purely ordering.",
-        "endc": {
-            "warn_nr_without_anchor": true,
-            "lte_before_nr": true
-        },
-
-        "enable_poll": {
-            "_comment": "source=stzrc reuses the traffic command, whose LTECell/NRCell tables carry an S state column — one command per poll instead of two. Set source=st to use the commands list instead. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
-            "source": "stzrc",
-            "commands": ["st cell"],
-            "command_timeout_s": 90,
-            "interval_s": 15,
-            "interval_max_s": 60,
-            "backoff_after_s": 120,
-            "timeout_s": 900,
-            "max_polls": 200,
-            "require_admin_unlocked": true,
-            "enabled_op_states": ["ENABLED"],
-            "row_regex": "",
-            "match_mode": "suffix",
-            "max_unmatched_polls": 3,
-            "min_enabled_ratio": 0.0,
-            "reconnect_credit_threshold_s": 60
-        },
-
-        "traffic": {
-            "_comment": "stzrc prints ;-delimited LTECell/NRCell tables carrying both an S state column and a UEs column, and is parsed natively. Traffic = the UEs column going 0 -> non-zero for required_consecutive_samples polls in a row. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
-            "command": "stzrc",
-            "command_timeout_s": 120,
-            "interval_s": 20,
-            "timeout_s": 600,
-            "ue_column_names": ["UE", "UEs", "NoOfUsers", "nrOfRrcConnected", "connectedUsers", "RrcConnected"],
-            "ue_regex": "",
-            "ue_threshold": 1,
-            "required_consecutive_samples": 2,
-            "use_peak": true,
-            "on_parse_failure": "manual_confirm",
-            "unknown_command_patterns": ["Unknown command", "Syntax error", "command not found", "Invalid command"]
-        },
-
-        "_comment_alarm": "baseline_before_unlock captures `alt` before the first unlock so the evidence can separate alarms this cut over caused from ones the site already had.",
-        "alarm": {
-            "command": "alt",
-            "command_timeout_s": 120,
-            "baseline_before_unlock": true,
-            "no_alarm_patterns": ["No Active alarms"]
-        },
-
-        "report": {
-            "screenshot_subdir": "CUTOVER",
-            "filename_template": "{shortcode}_CUTOVER_{group}_{timestamp}.png",
-            "title_template": "{shortcode} - Cut Over {group} - {nodes}",
-            "max_width": 1600,
-            "terminal_style": {
-                "bg_color": [12, 12, 12],
-                "text_color": [204, 204, 204],
-                "header_color": [0, 255, 0],
-                "font_size": 13,
-                "font": "Consolas",
-                "padding": 20,
-                "line_spacing": 4
-            },
-            "whatsapp": {
-                "enabled": true,
-                "mode": "semi_auto",
-                "group_link": "",
-                "caption_template": "Cut Over {group} - {shortcode}\nNodes: {nodes}\nCells enabled: {ok}/{total}\nTraffic OK: {traffic_ok}\nAlarms: {alarms}"
-            }
-        },
-
-        "_comment_final_verification": "PLUGGABLE — add the real post-cutover checks here later, no rebuild. scope: per_node | once. expect_regex empty = informational only (always passes). fail_regex, when matched, forces a fail.",
-        "final_verification": {
-            "enabled": true,
-            "stop_on_failure": false,
-            "steps": [
-                {
-                    "key": "final_alarms",
-                    "label": "Final alarm check",
-                    "command": "alt",
-                    "scope": "per_node",
-                    "timeout_s": 120,
-                    "expect_regex": "",
-                    "fail_regex": "CRITICAL|MAJOR",
-                    "screenshot": true
-                },
-                {
-                    "key": "final_cell_state",
-                    "label": "Final cell state",
-                    "command": "st cell",
-                    "scope": "per_node",
-                    "timeout_s": 120,
-                    "expect_regex": "",
-                    "fail_regex": "DISABLED",
-                    "screenshot": true
-                }
-            ]
+        {
+          "key": "final_cell_state",
+          "label": "Final cell state",
+          "command": "st cell",
+          "scope": "per_node",
+          "timeout_s": 120,
+          "expect_regex": "",
+          "fail_regex": "DISABLED",
+          "screenshot": true
         }
+      ]
     }
+  }
 }
