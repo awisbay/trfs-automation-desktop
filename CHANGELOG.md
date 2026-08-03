@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.3] - 2026-08-03
+
+### Fixed
+- **ENM FDN generation for LTE/NR cmedit and cmbulk scripts.** Short
+  subnetwork values from the form, such as `T7`, now expand to
+  `SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T7`, and rooted MO values are
+  normalized so `ManagedElement` is not duplicated in generated set targets.
+
+### Changed
+- **Integration setup actions simplified.** Removed the Pre-flight Check,
+  Add to Queue, and Queue buttons from the Integration setup page.
+
 ## [1.7.2] — 2026-08-02
 
 ### Fixed
