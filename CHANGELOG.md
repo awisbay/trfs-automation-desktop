@@ -4,6 +4,23 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.7.4] - 2026-08-05
+
+### Fixed
+- **Bundled `audit_map.json` now auto-refreshes on upgrade.** The seeded copy
+  next to the exe was only ever written once and never updated, so improvements
+  to the CDD mapping (e.g. the GSM per-sector TRX-count profile) were silently
+  ignored on machines that already had an older copy — the audit produced no TRX
+  rows. Code-owned assets are now re-seeded when a new build ships a changed
+  default, while a copy the user has hand-edited is preserved.
+
+### Changed
+- **cmedit-sourced params kept out of the runnable `.mos`.** Parameters read
+  from live cmedit (BSC `GeranCell`) can't be set via moshell, so they are now
+  excluded from the generated `.mos` (Run) script. They still appear in the
+  cmedit and cmbulk scripts. Params sourced from modump continue to generate
+  `.mos`, cmedit, and cmbulk as before.
+
 ## [1.7.3] - 2026-08-03
 
 ### Fixed

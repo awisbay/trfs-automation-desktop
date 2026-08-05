@@ -168,6 +168,12 @@ class AuditItem:
     attr_format: str = ""  # build actual from >1 attrs, e.g.
                            #   "{noOfTxAntennas}T{noOfRxAntennas}R" → "4T4R"
     node: str = ""         # node this row belongs to (eNodeBName/gNBName…)
+    attr_fallback: str = ""  # try this attr if ``parameter`` is absent — e.g.
+                           #   EUtranCellFDD uses earfcnDl/Ul, EUtranCellTDD uses
+                           #   a single ``earfcn``
+    from_cmedit: bool = False  # sourced from live cmedit (BSC GeranCell) — such
+                           #   params can't be set via moshell, so they're kept
+                           #   out of the .mos script (cmedit/cmbulk only)
 
 
 @dataclass
@@ -186,6 +192,7 @@ class AuditResult:
     norm: str = ""         # comparator hint carried from the CDD item, so a
                            #   generated set can re-format the value to the
                            #   node's convention (list/latlong/geo/…)
+    from_cmedit: bool = False  # BSC/cmedit-sourced → kept out of the .mos script
 
 
 @dataclass
@@ -303,7 +310,7 @@ def compare(items: List[AuditItem],
             results.append(AuditResult(
                 it.category, it.key, it.mo_local, it.parameter,
                 it.expected, "", "MO_NotFound", it.source, it.node, ref_cell,
-                it.norm))
+                it.norm, it.from_cmedit))
             continue
         # Follow a reference (e.g. sectorCarrierRef → SectorCarrier MO) when the
         # audited attribute lives on the referenced MO. The MO reported becomes
@@ -315,7 +322,7 @@ def compare(items: List[AuditItem],
                 results.append(AuditResult(
                     it.category, it.key, it.mo_local, it.parameter,
                     it.expected, "", "MO_NotFound", it.source, it.node, ref_cell,
-                    it.norm))
+                    it.norm, it.from_cmedit))
                 continue
             lookup = target
             eff_mo = rmo or it.mo_local
@@ -346,12 +353,15 @@ def compare(items: List[AuditItem],
             results.append(AuditResult(
                 it.category, it.key, eff_mo, it.parameter,
                 it.expected, actual_str, status, it.source, it.node, ref_cell,
-                it.norm))
+                it.norm, it.from_cmedit))
             continue
         # Attribute lookup is case-insensitive (dump uses canonical casing).
         actual = lookup.get(it.parameter)
         if actual is None:
             actual = low.get(it.parameter.lower())
+        if actual is None and it.attr_fallback:
+            actual = (lookup.get(it.attr_fallback)
+                      or low.get(it.attr_fallback.lower()))
         if actual is None:
             status = "NotFound"
             actual_str = ""
@@ -364,13 +374,202 @@ def compare(items: List[AuditItem],
         results.append(AuditResult(
             it.category, it.key, eff_mo, it.parameter,
             it.expected, actual_str, status, it.source, it.node, ref_cell,
-            it.norm))
+            it.norm, it.from_cmedit))
     return results
 
 
 _CELL_MO_INV = re.compile(
     r"(?:^|,)(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|GeranCell)=([^,]+)",
     re.IGNORECASE)
+
+
+_SEC_SUFFIX_RE = re.compile(r"-([LR]?)(\d+)\s*$", re.IGNORECASE)
+
+
+def _sector_parts(cellname: str):
+    """('BULUANX-L1') → (layer 'BULUANX', lr 'L', sector '1'); ('BULUAN-1') →
+    ('BULUAN', '', '1'). None if the name has no sector suffix."""
+    m = _SEC_SUFFIX_RE.search(cellname or "")
+    if not m:
+        return None
+    layer = _SEC_SUFFIX_RE.sub("", cellname)
+    return layer, m.group(1).upper(), m.group(2)
+
+
+def _parse_trx_agg(text: str) -> List[str]:
+    """Split a TRX-count formula into one term per sector, respecting parens:
+    ``3+3+2`` → ['3','3','2']; ``(2+2)+2+2`` → ['(2+2)','2','2']."""
+    terms, depth, cur = [], 0, ""
+    for ch in str(text):
+        if ch == "(":
+            depth += 1; cur += ch
+        elif ch == ")":
+            depth -= 1; cur += ch
+        elif ch == "+" and depth == 0:
+            terms.append(cur); cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        terms.append(cur)
+    return [t.replace(" ", "") for t in terms if t.strip()]
+
+
+def trx_count_check(trx_items: List[AuditItem],
+                    records: Dict[str, Dict[str, str]]) -> List[AuditResult]:
+    """Audit TRX count per sector against the CDD's aggregate formula.
+
+    A GsmSector name ends in ``[L|R]?<sector>`` (BULUAN-1, BULUANX-L1). Cells
+    sharing the stripped prefix form a *layer* (BULUAN, BULUANX) whose CDD
+    ``TRX COUNT`` reads e.g. ``3+3+2`` or ``(2+2)+2+2`` — one term per sector,
+    with ``(L+R)`` when the sector is split Left/Right. This counts the node's
+    Trx per sector, rebuilds the same expression, and reports Match/Mismatch
+    per sector so a wrong sector is named exactly."""
+    import collections
+    # node: layer -> sector -> {lr: trx_count}
+    node = collections.defaultdict(lambda: collections.defaultdict(dict))
+    trx_by_sector = collections.defaultdict(int)
+    for ldn in records:
+        if ldn.split(",")[-1].split("=", 1)[0] != "Trx":
+            continue
+        m = re.search(r"GsmSector=([^,]+)", ldn)
+        if m:
+            trx_by_sector[m.group(1)] += 1
+    for sec_name, count in trx_by_sector.items():
+        parts = _sector_parts(sec_name)
+        if not parts:
+            continue
+        layer, lr, sector = parts
+        node[layer][sector][lr or ""] = count
+
+    # cdd: layer -> (expected formula, node label)
+    cdd = {}
+    for it in trx_items:
+        m = re.search(r"GsmSector=([^,]+)", it.mo_local)
+        name = m.group(1) if m else it.key
+        parts = _sector_parts(name)
+        if not parts:
+            continue
+        cdd.setdefault(parts[0], (it.expected, it.node or it.key))
+
+    def _node_term(sec_map: dict) -> str:
+        if "L" in sec_map or "R" in sec_map:
+            return f"({sec_map.get('L', 0)}+{sec_map.get('R', 0)})"
+        return str(sec_map.get("", sum(sec_map.values())))
+
+    out: List[AuditResult] = []
+    for layer, (expected, node_name) in sorted(cdd.items()):
+        exp_terms = _parse_trx_agg(expected)
+        sectors = sorted(node.get(layer, {}))
+        n = max(len(exp_terms), len(sectors))
+        for i in range(n):
+            exp = exp_terms[i] if i < len(exp_terms) else "(none)"
+            act = (_node_term(node[layer][sectors[i]])
+                   if i < len(sectors) else "(none)")
+            status = "Match" if exp.replace(" ", "") == act.replace(" ", "") \
+                else "Mismatch"
+            out.append(AuditResult(
+                "trx-count", node_name, f"GsmSector [{layer}]",
+                f"TRX Sect{i + 1}", exp, act, status,
+                f"CDD TRX COUNT ({expected})", node_name))
+    return out
+
+
+def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
+    """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
+    onto the ``GsmSector`` record so the audit can read them without a live
+    cmedit call: ``arfcnMin`` = the lowest Trx arfcnMin, ``arfcnMax`` = the
+    highest, and ``__count__`` = the number of Trx (= the sector's TRX count).
+    Mutates ``records`` in place; a no-op when the dump carries no Trx."""
+    import collections
+    trx_by_sector: dict = collections.defaultdict(list)
+    for ldn, a in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] != "Trx":
+            continue
+        m = re.search(r"GsmSector=([^,]+)", ldn)
+        if m:
+            trx_by_sector[m.group(1)].append(a)
+    if not trx_by_sector:
+        return
+
+    def _ints(vals):
+        out = []
+        for v in vals:
+            s = str(v).strip()
+            if re.fullmatch(r"-?\d+", s):
+                out.append(int(s))
+        return out
+
+    for ldn, a in records.items():
+        leaf = ldn.split(",")[-1]
+        if leaf.split("=", 1)[0] != "GsmSector":
+            continue
+        trx = trx_by_sector.get(leaf.split("=", 1)[-1])
+        if not trx:
+            continue
+        mins = _ints(t.get("arfcnMin") for t in trx)
+        maxs = _ints(t.get("arfcnMax") for t in trx)
+        if mins:
+            a["arfcnMin"] = str(min(mins))
+        if maxs:
+            a["arfcnMax"] = str(max(maxs))
+        a["__count__"] = str(len(trx))
+
+
+@dataclass
+class CellInvRow:
+    """One cell in the inventory comparison — CDD list vs the node's live MOs."""
+    mo_class: str            # EUtranCellFDD | EUtranCellTDD | NRCellDU | GeranCell
+    cell: str                # the cell name
+    in_cdd: str              # "Yes" | "No"
+    on_node: str             # "Yes" | "No"
+    status: str              # Match | Missing (CDD-only) | Extra (node-only)
+
+
+_CANON_CELL = {"eutrancellfdd": "EUtranCellFDD", "eutrancelltdd": "EUtranCellTDD",
+               "nrcelldu": "NRCellDU", "nrcellcu": "NRCellCU",
+               "gerancell": "GeranCell"}
+
+
+def cell_inventory_rows(items: List[AuditItem],
+                        records: Dict[str, Dict[str, str]]) -> List[CellInvRow]:
+    """Per-cell inventory: for every cell MO class the CDD defines, list each
+    cell name and whether it is in the CDD, on the node, or both — so the
+    operator sees exactly which cells are missing or extra, not just a count."""
+    import collections
+    cdd = collections.defaultdict(set)      # class_lower -> {id_lower}
+    actual = collections.defaultdict(set)
+    disp: Dict[tuple, str] = {}             # (cls, id_lower) -> original name
+
+    for it in items:
+        if it.category != "cell":
+            continue
+        m = _CELL_MO_INV.search("," + it.mo_local)
+        if not m:
+            continue
+        cls, cid = m.group(1).lower(), m.group(2)
+        cdd[cls].add(cid.lower())
+        disp[(cls, cid.lower())] = cid
+    for ldn in records:
+        m = _CELL_MO_INV.search(ldn)
+        if not m:
+            continue
+        cls, cid = m.group(1).lower(), m.group(2)
+        actual[cls].add(cid.lower())
+        disp.setdefault((cls, cid.lower()), cid)
+
+    rows: List[CellInvRow] = []
+    for cls in sorted(cdd):                  # only classes the CDD defines
+        name = _CANON_CELL.get(cls, cls)
+        for cid in sorted(cdd[cls] | actual.get(cls, set())):
+            in_cdd = cid in cdd[cls]
+            on_node = cid in actual.get(cls, set())
+            status = ("Match" if in_cdd and on_node
+                      else "Missing" if in_cdd else "Extra")
+            rows.append(CellInvRow(
+                name, disp.get((cls, cid), cid),
+                "Yes" if in_cdd else "No",
+                "Yes" if on_node else "No", status))
+    return rows
 
 
 def cell_inventory_check(items: List[AuditItem],
@@ -791,8 +990,38 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
         ws.column_dimensions[col].width = wdt
 
 
+_FILL_MISSING = PatternFill("solid", fgColor="FFC7CE")     # red-ish (missing)
+_FILL_EXTRA2 = PatternFill("solid", fgColor="BDD7EE")      # blue (extra)
+
+
+def _write_cell_inventory_sheet(ws, rows: List["CellInvRow"]) -> None:
+    """A dedicated sheet listing every cell — CDD vs node — so it's obvious
+    which cells are missing (in CDD, not on node) or extra (on node, not in
+    CDD), per MO class."""
+    headers = ["MO Class", "Cell", "In CDD", "On Node", "Status"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.fill = _FILL_HEADER
+        c.font = _HEADER_FONT
+        c.alignment = _CENTER
+        c.border = _BORDER
+    fill = {"Match": _FILL_MATCH, "Missing": _FILL_MISSING, "Extra": _FILL_EXTRA2}
+    for r in sorted(rows, key=lambda x: (x.mo_class, x.status != "Match", x.cell)):
+        ws.append([r.mo_class, r.cell, r.in_cdd, r.on_node, r.status])
+        row = ws.max_row
+        f = fill.get(r.status)
+        if f:
+            ws.cell(row, 5).fill = f
+        for c in range(1, 6):
+            ws.cell(row, c).border = _BORDER
+    ws.freeze_panes = "A2"
+    for col, w in (("A", 20), ("B", 34), ("C", 9), ("D", 9), ("E", 12)):
+        ws.column_dimensions[col].width = w
+
+
 def write_excel(results: List[AuditResult], out_path: str, meta: dict,
-                lld_results: Optional[List["LldResult"]] = None) -> str:
+                lld_results: Optional[List["LldResult"]] = None,
+                cell_rows: Optional[List["CellInvRow"]] = None) -> str:
     wb = Workbook()
 
     # Summary sheet
@@ -831,6 +1060,10 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
     # LLD sheet (physical baseband / CPRI) — only when there are LLD checks.
     if lld_results:
         _write_lld_sheet(wb.create_sheet("LLD"), lld_results)
+
+    # Cell inventory sheet — CDD cell list vs the node's live cells.
+    if cell_rows:
+        _write_cell_inventory_sheet(wb.create_sheet("Cell Inventory"), cell_rows)
 
     wb.save(out_path)
     return out_path
@@ -875,6 +1108,10 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
     seen = set()
     for r in results:
         if r.status not in statuses or r.expected == "":
+            continue
+        # cmedit-sourced params (BSC GeranCell) can't be set via moshell — they
+        # only go into the cmedit/cmbulk scripts, never the runnable .mos.
+        if r.from_cmedit:
             continue
         node = r.node or r.key or site
         sig = (node, r.mo, r.parameter)

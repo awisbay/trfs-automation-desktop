@@ -189,6 +189,9 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
     columns = prof["columns"]
     category = prof.get("category", "")
     tech = prof.get("tech", "")
+    # BSC/cmedit-sourced params (GeranCell) can't be set via moshell, so tag
+    # them here to keep them out of the generated .mos script.
+    from_cmedit = prof.get("source") == "cmedit"
     expand = prof.get("cell_expand")   # optional band→cell expansion
 
     col_idx, data = _get_sheet(path, sheet, header_row, sheet_cache, wbcache)
@@ -226,7 +229,12 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
             # it at a segment boundary (MIN2782 → MIN2782_…, not MIN27820…).
             if not (keyval == node_l or node_l.startswith(keyval + "_")):
                 continue
-        elif not (keyval == node_l or keyval.startswith(node_l)):
+        elif not (keyval == node_l
+                  or keyval.startswith(node_l + "_")
+                  or keyval.startswith(node_l + "-")):
+            # Boundary-aware: the audited Site ID / node must be followed by a
+            # separator, so "MIN278" matches "MIN278_BULUAN…" but NOT
+            # "MIN2780_…" / "MIN2781_…" (which is a different site).
             continue
         rowdict = {name: (row[i] if i < len(row) else "")
                    for name, i in col_idx.items()}
@@ -279,6 +287,7 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
                             key=key_val, source=f"{sheet}!{cdd_col}",
                             norm=sp.get("norm", col.get("norm", "")),
                             via_ref=col.get("via_ref", ""),
+                            from_cmedit=from_cmedit,
                             node=node_val))
                     continue
                 items.append(AuditItem(
@@ -289,5 +298,7 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
                     norm=col.get("norm", ""),
                     via_ref=col.get("via_ref", ""),
                     attr_format=col.get("attr_format", ""),
+                    attr_fallback=col.get("attr_fallback", ""),
+                    from_cmedit=from_cmedit,
                     node=node_val))
     return items

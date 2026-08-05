@@ -541,19 +541,39 @@ class AuditPage:
 
             # ── 4. Compare + Excel ─────────────────────────────────
             from collections import Counter
-            results = audit_core.compare(items, records)
-
-            # Cell inventory: CDD-defined cells vs the cells actually on the
-            # node(s) — count + exact names (missing / extra).
+            # Fold Trx (RadioNode) up onto GsmSector so arfcnMin/Max come from
+            # the dump — no live cmedit needed.
             try:
-                inv = audit_core.cell_inventory_check(items, records)
-                if inv:
-                    results += inv
-                    ic = Counter(r.status for r in inv)
-                    self._log(f"Cell inventory: {ic.get('Match',0)} class(es) "
-                              f"match, {ic.get('Mismatch',0)} differ.")
+                audit_core.aggregate_trx(records)
             except Exception as exc:
-                self._log(f"cell inventory check failed: {exc}")
+                self._log(f"trx aggregation failed: {exc}")
+            # TRX COUNT rows use a per-sector aggregate compare, not the normal
+            # per-attribute one — pull them out and audit them separately.
+            trx_items = [it for it in items if it.parameter == "__trxcount__"]
+            items = [it for it in items if it.parameter != "__trxcount__"]
+            results = audit_core.compare(items, records)
+            try:
+                tc = audit_core.trx_count_check(trx_items, records)
+                if tc:
+                    results += tc
+                    tcc = Counter(r.status for r in tc)
+                    self._log(f"TRX count: {tcc.get('Match',0)} sector(s) match, "
+                              f"{tcc.get('Mismatch',0)} mismatch.")
+            except Exception as exc:
+                self._log(f"trx count check failed: {exc}")
+
+            # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
+            # into the parameter Detail.
+            cell_rows = []
+            try:
+                cell_rows = audit_core.cell_inventory_rows(items, records)
+                if cell_rows:
+                    ic = Counter(r.status for r in cell_rows)
+                    self._log(f"Cell inventory: {ic.get('Match',0)} match, "
+                              f"{ic.get('Missing',0)} missing, "
+                              f"{ic.get('Extra',0)} extra.")
+            except Exception as exc:
+                self._log(f"cell inventory failed: {exc}")
 
             # Reverse pass: nodes present in the data but with NO CDD rows (e.g.
             # a batch node the CDD doesn't cover) — surface their ACTUAL audited
@@ -623,7 +643,7 @@ class AuditPage:
                 "LLD": os.path.basename(lld) if lld else "-",
                 "Mode": "Batch / Cluster" if is_batch else "Single site",
                 "Generated": ts,
-            }, lld_results=lld_results)
+            }, lld_results=lld_results, cell_rows=cell_rows)
             self._result_path = out
             self._results = results
             self._gen_ctx = {"site": label, "out_dir": out_dir, "xlsx": out}

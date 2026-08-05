@@ -81,11 +81,13 @@
         },
         {
           "cdd": "DLEARFCN",
-          "attr": "earfcndl"
+          "attr": "earfcndl",
+          "attr_fallback": "earfcn"
         },
         {
           "cdd": "ULEARFCN",
-          "attr": "earfcnul"
+          "attr": "earfcnul",
+          "attr_fallback": "earfcn"
         },
         {
           "cdd": "PCI",
@@ -1088,7 +1090,6 @@
       "name": "GSM Trx arfcn (RadioNode)",
       "tech": "gsm",
       "category": "cell",
-      "source": "cmedit",
       "cmedit_mo": "Trx",
       "cmedit_cmd": "cmedit get {site_id}* Trx.({attrs}) -t",
       "key_fdn": "GsmSector={GsmSectorId}",
@@ -1107,7 +1108,7 @@
         },
         {
           "cdd": "TRX COUNT",
-          "attr": "__count__"
+          "attr": "__trxcount__"
         }
       ]
     }
