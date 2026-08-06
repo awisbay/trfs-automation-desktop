@@ -1377,13 +1377,33 @@ def build_gsm_child_map(audit_map: dict) -> Dict[str, str]:
     return m
 
 
+def build_bsc_by_cell(records: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """geranCellId → BSC name, harvested from the live cmedit source records
+    (each ``GeranCell=<id>`` record carries the ``__bsc__`` = NodeId column).
+    Lets generated cmedit/cmbulk FDNs use the REAL BSC the cell lives on rather
+    than a placeholder — the primary BSC source, ahead of the CDD/form."""
+    out: Dict[str, str] = {}
+    for ldn, attrs in records.items():
+        m = re.match(r"GeranCell=([^,]+)", ldn)
+        if not m:
+            continue
+        bsc = (attrs.get("__bsc__") or "").strip()
+        if bsc:
+            out.setdefault(m.group(1), bsc)
+    return out
+
+
 def _build_fdn(node: str, mo: str, param: str = "", fdn_prefix: str = "",
                gsm_fdn_prefix: str = "",
-               gsm_child_map: Optional[Dict[str, str]] = None) -> str:
+               gsm_child_map: Optional[Dict[str, str]] = None,
+               bsc_by_cell: Optional[Dict[str, str]] = None,
+               default_bsc: str = "") -> str:
     """Pick the right FDN shape for a target MO. GSM ``GeranCell`` MOs live on
     the BSC (not the audited RadioNode) with a fixed BscFunction/GeranCellM
-    lineage, so they use the configurable ``gsm_fdn_prefix`` template — and, when
-    the parameter belongs to a child MO, the child segment is appended
+    lineage, so they use the configurable ``gsm_fdn_prefix`` template — the
+    ``{bsc}`` placeholder is filled per cell, preferring the real BSC from the
+    cmedit source (``bsc_by_cell``), then ``default_bsc`` (CDD/form). When the
+    parameter belongs to a child MO, the child segment is appended
     (``…,GeranCell=<id>,<Child>=1``). Every other MO uses the node-rooted
     ``MeContext=<node>,ManagedElement=<node>`` FDN built from the dump path."""
     top = mo.split("=", 1)[0].strip()
@@ -1392,11 +1412,15 @@ def _build_fdn(node: str, mo: str, param: str = "", fdn_prefix: str = "",
         # mo already carries a child (e.g. ChannelGroup=0 from a per-index CDD
         # column) trust that real instance instead of forcing ``=1``.
         leaf = mo
+        cid_m = re.match(r"GeranCell=([^,]+)", mo)
+        cid = cid_m.group(1) if cid_m else ""
         if "," not in mo:
             child = (gsm_child_map or {}).get((param or "").lower())
             if child:
                 leaf = f"{mo},{child}=1"
-        return f"{gsm_fdn_prefix.rstrip(',')},{leaf}"
+        bsc = ((bsc_by_cell or {}).get(cid) or default_bsc or "<BSC>")
+        prefix = gsm_fdn_prefix.replace("{bsc}", bsc)
+        return f"{prefix.rstrip(',')},{leaf}"
     return _enm_fdn(node, mo, fdn_prefix)
 
 
@@ -1430,7 +1454,9 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
                             statuses=("Mismatch",),
                             fdn_prefix: str = "",
                             gsm_fdn_prefix: str = "",
-                            gsm_child_map: Optional[Dict[str, str]] = None
+                            gsm_child_map: Optional[Dict[str, str]] = None,
+                            bsc_by_cell: Optional[Dict[str, str]] = None,
+                            default_bsc: str = ""
                             ) -> List[str]:
     """One CMEdit CLI file per node: ``cmedit set <FDN> <param>=<value>``
     (one command per parameter). Returns the files written."""
@@ -1441,7 +1467,7 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
         lines = _enm_header("CMEDIT", generated_by, stamp, audit_xlsx)
         for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map)
+                             gsm_child_map, bsc_by_cell, default_bsc)
             lines.append(
                 f"cmedit set {fdn} {param}={_format_set_value(val, norm, actual)}")
         path = os.path.join(out_dir, f"{node}_SetParameter_{stamp}_cmedit.txt")
@@ -1454,7 +1480,9 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
 def build_cmedit_commands(results: List[AuditResult], site: str,
                           statuses=("Mismatch",), fdn_prefix: str = "",
                           gsm_fdn_prefix: str = "",
-                          gsm_child_map: Optional[Dict[str, str]] = None
+                          gsm_child_map: Optional[Dict[str, str]] = None,
+                          bsc_by_cell: Optional[Dict[str, str]] = None,
+                          default_bsc: str = ""
                           ) -> List[tuple]:
     """The exact ``cmedit set <FDN> <param>=<value>`` commands for the rows to
     align — same FDN/value logic as the CMEdit file export, but returned as
@@ -1463,7 +1491,7 @@ def build_cmedit_commands(results: List[AuditResult], site: str,
     for node, rows in _collect_set_rows(results, statuses, site).items():
         for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map)
+                             gsm_child_map, bsc_by_cell, default_bsc)
             cmds.append(
                 (node, f"cmedit set {fdn} {param}={_format_set_value(val, norm, actual)}"))
     return cmds
@@ -1474,7 +1502,9 @@ def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,
                             statuses=("Mismatch",),
                             fdn_prefix: str = "",
                             gsm_fdn_prefix: str = "",
-                            gsm_child_map: Optional[Dict[str, str]] = None
+                            gsm_child_map: Optional[Dict[str, str]] = None,
+                            bsc_by_cell: Optional[Dict[str, str]] = None,
+                            default_bsc: str = ""
                             ) -> List[str]:
     """One CM Bulk CLI file per node, parameters grouped per FDN into one block::
 
@@ -1494,7 +1524,7 @@ def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,
         fdn_params: Dict[str, list] = {}
         for mo, param, val, norm, actual in rows:
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map)
+                             gsm_child_map, bsc_by_cell, default_bsc)
             fdn_params.setdefault(fdn, []).append(
                 (param, _format_set_value(val, norm, actual)))
         lines = _enm_header("CMBULK", generated_by, stamp, audit_xlsx)

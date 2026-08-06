@@ -589,6 +589,16 @@ class AuditPage:
             broker_items = [it for it in items if it.parameter == "__bscbroker__"]
             items = [it for it in items
                      if it.parameter not in ("__trxcount__", "__bscbroker__")]
+            # BSC sources for GSM (GeranCell) cmedit/cmbulk FDN generation:
+            #   primary  → real BSC per cell from the live cmedit source,
+            #   fallback → the CDD BSC column (most common), then the form field.
+            try:
+                self._bsc_by_cell = audit_core.build_bsc_by_cell(records)
+            except Exception:
+                self._bsc_by_cell = {}
+            cdd_bscs = Counter((it.expected or "").strip() for it in broker_items
+                               if (it.expected or "").strip())
+            self._cdd_bsc = cdd_bscs.most_common(1)[0][0] if cdd_bscs else ""
             results = audit_core.compare(items, records)
             try:
                 tc = audit_core.trx_count_check(trx_items, records)
@@ -766,40 +776,52 @@ class AuditPage:
             try:
                 from audit import cdd_reader
                 amap = cdd_reader.load_map()
-                tmpl = amap.get("gsm_fdn_prefix", "")
-                bsc = (self._form.get("bsc_name") or "").strip() or "<BSC>"
-                gsm_fdn_prefix = tmpl.replace("{bsc}", bsc)
+                # Pass the RAW template ({bsc} intact) — _build_fdn fills the BSC
+                # per cell, preferring the live cmedit source over the fallback.
+                gsm_fdn_prefix = amap.get("gsm_fdn_prefix", "")
                 gsm_child_map = audit_core.build_gsm_child_map(amap)
             except Exception:
                 pass
+            bsc_by_cell = getattr(self, "_bsc_by_cell", {}) or {}
+            default_bsc = ((self._form.get("bsc_name") or "").strip()
+                           or getattr(self, "_cdd_bsc", "") or "<BSC>")
             # Three formats from the same Mismatch rows: moshell (.mos, the only
             # one the Run button executes) + ENM CMEdit + CM Bulk (separate .txt
             # files — different command syntax, review-and-apply manually).
+            # GSM GeranCell params are cmedit-only, so a GSM-only audit yields an
+            # empty .mos but still real cmedit/cmbulk — always generate all three.
             paths = audit_core.generate_moshell_scripts(
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",))
-            if not paths:
-                self._log("No Mismatch rows — nothing to generate.")
-                self._set_status("No mismatches to script.", ACCENT_WARM)
-                return
             cmedit_paths = audit_core.generate_cmedit_scripts(
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
-                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
             cmbulk_paths = audit_core.generate_cmbulk_scripts(
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
-                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
             allp = paths + cmedit_paths + cmbulk_paths
+            if not allp:
+                self._log("No Mismatch rows — nothing to generate.")
+                self._set_status("No mismatches to script.", ACCENT_WARM)
+                return
             self._log(f"✓ Generated {len(allp)} script(s) in {script_dir} "
                       f"(.mos runnable; cmedit/cmbulk are separate files):")
             for p in allp:
                 self._log("   " + os.path.basename(p))
+            if not paths:
+                self._log("Note: all mismatches are GSM/cmedit-sourced — no "
+                          "runnable .mos (use the cmedit/cmbulk files via ENM).")
             self._set_status(
                 f"Generated {len(paths)} .mos + {len(cmedit_paths)} cmedit + "
                 f"{len(cmbulk_paths)} cmbulk.", SUCCESS)
             self._script_dir = script_dir
-            self.runscript_btn.visible = True
+            # The Run button executes the .mos only — show it only when there is
+            # a runnable .mos.
+            self.runscript_btn.visible = bool(paths)
             self.page.update()
             try:
                 os.startfile(script_dir)   # open the folder (Windows) to edit
@@ -818,15 +840,18 @@ class AuditPage:
         gsm_fdn_prefix, gsm_child_map = "", {}
         try:
             amap = cdd_reader.load_map()
-            bsc = (self._form.get("bsc_name") or "").strip() or "<BSC>"
-            gsm_fdn_prefix = amap.get("gsm_fdn_prefix", "").replace("{bsc}", bsc)
+            gsm_fdn_prefix = amap.get("gsm_fdn_prefix", "")
             gsm_child_map = audit_core.build_gsm_child_map(amap)
         except Exception:
             pass
+        bsc_by_cell = getattr(self, "_bsc_by_cell", {}) or {}
+        default_bsc = ((self._form.get("bsc_name") or "").strip()
+                       or getattr(self, "_cdd_bsc", "") or "<BSC>")
         site = (self._gen_ctx or {}).get("site") or self.site_field.value.strip()
         cmds = audit_core.build_cmedit_commands(
             self._results, site, fdn_prefix=fdn_prefix,
-            gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map)
+            gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
+            bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
         if not cmds:
             self._set_status("No mismatch commands to apply.", ACCENT_WARM); return
         if not (self._form.get("host") and self._form.get("username")

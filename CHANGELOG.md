@@ -4,6 +4,20 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.8.1] - 2026-08-06
+
+### Fixed
+- **GSM cmedit/cmbulk scripts now use the real BSC from the source.** The BSC in
+  the generated `GeranCell` FDN was only filled from the main form's BSC field,
+  leaving a `<BSC>` placeholder when it was blank. The generator now takes the
+  BSC from the live cmedit source per cell (the `NodeId` column, captured as
+  `__bsc__`), falling back to the CDD `BSC` column and finally the form field.
+- **Generate Scripts no longer stops on a GSM-only audit.** When every mismatch
+  was GSM/cmedit-sourced (so the runnable `.mos` is empty), the generator
+  returned early and produced no cmedit/cmbulk files at all. All three formats
+  are now always generated; the Run Scripts button appears only when there is a
+  runnable `.mos`.
+
 ## [1.8.0] - 2026-08-05
 
 ### Added

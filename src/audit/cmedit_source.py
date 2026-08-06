@@ -174,6 +174,12 @@ def _parse_cmedit_table(out: str, wanted: List[str],
     col_pos = {c.lower(): i for i, c in enumerate(header_cols)}
     key_cols = _KEY_PH.findall(key_fdn) if key_fdn else []
 
+    # The BSC identity is the ``NodeId`` (a.k.a. MeContext/ManagedElement)
+    # column — the node the GeranCell physically lives on. Captured as the
+    # synthetic ``__bsc__`` so generated cmedit/cmbulk FDNs use the REAL BSC
+    # from the source, not a placeholder from the form.
+    nodeid_pos = col_pos.get("nodeid", col_pos.get("mecontext", -1))
+
     leaf_pos, leaf_class = -1, ""
     if not key_fdn:
         first_attr = min(attr_pos.values())
@@ -216,6 +222,8 @@ def _parse_cmedit_table(out: str, wanted: List[str],
                 continue
             key = f"{leaf_class}={leaf_val}" if leaf_class else leaf_val
         rec = records.setdefault(key, {})
+        if nodeid_pos >= 0 and nodeid_pos < len(toks) and toks[nodeid_pos]:
+            rec.setdefault("__bsc__", toks[nodeid_pos])
         # Count how many raw rows map to this key — for multi-instance MOs
         # (e.g. Trx under a GsmSector) this is the instance count, exposed as
         # ``__count__`` so a profile can audit "how many TRX per sector".
