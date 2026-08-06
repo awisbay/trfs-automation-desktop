@@ -1111,6 +1111,22 @@
           "attr": "__trxcount__"
         }
       ]
+    },
+    {
+      "name": "GSM BSC IP Broker (config.json bsc_broker_map)",
+      "_note": "Expected broker IP is NOT a CDD column: the CDD BSC column names the node's BSC, and config.json bsc_broker_map maps that BSC to its broker IP. The node's actual AbisIp.bscBrokerIpAddress (dump) is compared to it by broker_check(). __bscbroker__ marks these rows so audit_page routes them to that check.",
+      "tech": "gsm",
+      "category": "node",
+      "sheet": "GSM",
+      "header_row": 4,
+      "node_key_column": "gsmNodeName",
+      "mo_fdn": "AbisIp=1",
+      "columns": [
+        {
+          "cdd": "BSC",
+          "attr": "__bscbroker__"
+        }
+      ]
     }
   ]
 }

@@ -1168,6 +1168,7 @@ class FormPage:
             self._show_errors(errors)
             return
 
+        self._persist_session(f)
         self.page.integration_form = f
         self.page.go("/cutover")
 
@@ -1177,7 +1178,9 @@ class FormPage:
             return
         # Standalone CDD audit — no field validation required. Hand off the
         # form so the audit page can prefill Site ID + Node Name.
-        self.page.integration_form = self._collect_form()
+        f = self._collect_form()
+        self._persist_session(f)
+        self.page.integration_form = f
         self.page.go("/audit")
 
     def _on_integration(self, e):

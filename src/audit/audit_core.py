@@ -474,6 +474,67 @@ def trx_count_check(trx_items: List[AuditItem],
     return out
 
 
+def broker_check(broker_items: List[AuditItem],
+                 records: Dict[str, Dict[str, str]],
+                 bsc_broker_map: Dict[str, str]) -> List[AuditResult]:
+    """Audit each GSM node's IP-broker against config.json ``bsc_broker_map``.
+
+    The CDD names the BSC a node belongs to (``BSC`` column → ``__bscbroker__``
+    items); ``bsc_broker_map`` maps that BSC to its broker IP. The node's own
+    ``AbisIp.bscBrokerIpAddress`` (from the dump) is compared to that expected
+    IP — catching a node wired to the WRONG BSC's broker (the ping to the wrong
+    broker still succeeds, so this mismatch is otherwise invisible). One row per
+    node; the actual IP is annotated with the BSC it actually points at."""
+    import collections
+    # node → expected BSC name (from the CDD BSC column), first non-empty wins.
+    bsc_by_node: Dict[str, str] = {}
+    for it in broker_items:
+        node = (it.node or it.key or "").strip()
+        bsc = (it.expected or "").strip()
+        if node and bsc:
+            bsc_by_node.setdefault(node, bsc)
+
+    # node → set of actual broker IPs found on its AbisIp MOs.
+    actual_by_node = collections.defaultdict(set)
+    for ldn, attrs in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] != "AbisIp":
+            continue
+        m = re.search(r"ManagedElement=([^,]+)", ldn)
+        node = m.group(1) if m else ""
+        ip = (attrs.get("bscBrokerIpAddress") or "").strip()
+        if node and ip:
+            actual_by_node[node].add(ip)
+
+    # reverse map: broker IP → BSC name, so a wrong actual IP names its real BSC.
+    ip_to_bsc = {str(v).strip(): k for k, v in (bsc_broker_map or {}).items()}
+
+    def _annot(ip: str) -> str:
+        b = ip_to_bsc.get(ip)
+        return f"{ip} ({b})" if b else ip
+
+    out: List[AuditResult] = []
+    for node, bsc in sorted(bsc_by_node.items()):
+        expected_ip = (bsc_broker_map or {}).get(bsc)
+        actuals = sorted(actual_by_node.get(node, set()))
+        actual_str = ", ".join(_annot(a) for a in actuals)
+        if expected_ip is None:
+            status = "NotFound"
+            expected_disp = f"{bsc} (not in bsc_broker_map)"
+        else:
+            expected_disp = f"{expected_ip} ({bsc})"
+            if not actuals:
+                status = "NotFound"
+            elif len(actuals) == 1 and actuals[0] == str(expected_ip).strip():
+                status = "Match"
+            else:
+                status = "Mismatch"
+        out.append(AuditResult(
+            "ip-broker", node, "AbisIp", "bscBrokerIpAddress",
+            expected_disp, actual_str or "(none)", status,
+            "config.json bsc_broker_map", node, ref_cell=f"BSC {bsc}"))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1091,6 +1152,13 @@ def _banner(name: str) -> str:
     return f"# {bar}\n# {name}\n# {bar}"
 
 
+# Synthetic audit categories that compare an aggregate/derived value, not a
+# single settable MO attribute — they have no valid ``set`` target, so every
+# script generator skips them (a "GsmSector [BULUAN]" MO or "10.x (BSC)" value
+# would only produce a broken set line).
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker"}
+
+
 def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
                              site: str, audit_xlsx: str,
                              generated_by: str = "",
@@ -1108,6 +1176,8 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
     seen = set()
     for r in results:
         if r.status not in statuses or r.expected == "":
+            continue
+        if r.category in _NON_SETTABLE_CATEGORIES:
             continue
         # cmedit-sourced params (BSC GeranCell) can't be set via moshell — they
         # only go into the cmedit/cmbulk scripts, never the runnable .mos.
@@ -1175,6 +1245,8 @@ def _collect_set_rows(results: List[AuditResult], statuses, site: str):
     seen = set()
     for r in results:
         if r.status not in statuses or r.expected == "":
+            continue
+        if r.category in _NON_SETTABLE_CATEGORIES:
             continue
         node = r.node or r.key or site
         sig = (node, r.mo, r.parameter)

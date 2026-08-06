@@ -60,6 +60,14 @@ def _load_config() -> dict:
 
 _CFG = _load_config()
 
+
+def get_config() -> dict:
+    """The loaded config.json (or built-in defaults). Public accessor so other
+    modules (e.g. the audit page's IP-broker check) can read ``bsc_broker_map``
+    and friends without importing the private ``_CFG`` global."""
+    return _CFG
+
+
 # ── Script path resolution ──────────────────────────────────────
 # Every script path in config.json should be a FULL absolute path
 # (starts with ``/``). Operators can point each script at any

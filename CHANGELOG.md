@@ -4,6 +4,28 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.8.0] - 2026-08-05
+
+### Added
+- **GSM IP-broker audit.** The CDD Audit now verifies each GSM node's
+  `AbisIp.bscBrokerIpAddress` (from the dump) against the broker IP expected for
+  its BSC. The BSC comes from the CDD `BSC` column; the expected broker IP comes
+  from `config.json → bsc_broker_map`. A node wired to the wrong BSC's broker
+  (whose ping still succeeds, so the fault is otherwise invisible) is reported as
+  a Mismatch, and the actual IP is annotated with the BSC it really points at
+  (e.g. expected `10.14.194.131 (MINBS00)` vs actual `10.14.204.3 (MINBS01)`).
+
+### Fixed
+- **Aggregate audit rows no longer leak into generated scripts.** TRX-count (and
+  the new IP-broker) rows compare a derived value with no single settable MO
+  attribute, so they are now excluded from the `.mos`, cmedit, and cmbulk
+  scripts instead of emitting malformed `set` lines.
+- **Form values are no longer lost when opening CDD Audit or Cut Over.** The
+  form was only persisted when launching an Integration run, so entering Audit
+  or Cut Over and returning showed an empty form. Both paths now persist the
+  form. The CDD Audit page also remembers its own inputs (CDD/LLD/dump files,
+  cluster, batch nodes) across navigation via a per-page session state.
+
 ## [1.7.4] - 2026-08-05
 
 ### Fixed

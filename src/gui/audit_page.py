@@ -37,6 +37,13 @@ class AuditPage:
         self._form = getattr(page, "integration_form", {}) or {}
         self._results = None        # last audit results (for script generation)
         self._gen_ctx = None        # {site, safe, out_dir, xlsx}
+        # Restore the page's own inputs (CDD/dump/cluster/batch) from the last
+        # visit so navigating away and back doesn't wipe them.
+        try:
+            from session import load_page_state
+            self._state = load_page_state("audit")
+        except Exception:
+            self._state = {}
 
     # ── UI ───────────────────────────────────────────────────────
     def build(self) -> ft.View:
@@ -46,24 +53,30 @@ class AuditPage:
         except Exception:
             pass
 
-        self.site_field = self._tf("Site ID", self._form.get("shortcode", ""), expand=1)
-        self.lte_field = self._tf("LTE CDD file", "", expand=3)
-        self.nr_field = self._tf("NR CDD file", "", expand=3)
-        self.gsm_field = self._tf("GSM CDD file (audited live via cmedit)", "", expand=3)
+        st = self._state
+        self.site_field = self._tf(
+            "Site ID",
+            st.get("site") or self._form.get("shortcode", ""), expand=1)
+        self.lte_field = self._tf("LTE CDD file", st.get("lte", ""), expand=3)
+        self.nr_field = self._tf("NR CDD file", st.get("nr", ""), expand=3)
+        self.gsm_field = self._tf(
+            "GSM CDD file (audited live via cmedit)", st.get("gsm", ""), expand=3)
         self.lld_field = self._tf(
             "LLD file — optional; baseband type + RiLink/CPRI port allocation",
-            "", expand=3)
+            st.get("lld", ""), expand=3)
         self.dump_field = self._tf(
             "Dump file(s) — optional; cm/modump. Blank = auto-find in "
-            "LOG/<SiteID>/DUMP/", "", expand=3)
-        self.cluster_field = self._tf("Cluster name", "", expand=None)
+            "LOG/<SiteID>/DUMP/", st.get("dump", ""), expand=3)
+        self.cluster_field = self._tf(
+            "Cluster name", st.get("cluster", ""), expand=None)
         self.cluster_field.width = 260
         self.batch_count_text = ft.Text("", size=12, color=ACCENT,
                                         weight=ft.FontWeight.BOLD)
         self.batch_field = ft.TextField(
             label="Batch nodes — node1;node2;node3;…  (live cmedit export). "
                   "Leave blank to use the single-site Site ID above.",
-            value="", multiline=True, min_lines=2, max_lines=5, expand=True,
+            value=st.get("batch", ""),
+            multiline=True, min_lines=2, max_lines=5, expand=True,
             filled=True, border_radius=14, on_change=self._on_batch_change,
             bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
             border_color=BORDER, focused_border_color=ACCENT,
@@ -171,9 +184,27 @@ class AuditPage:
         return ft.View(route="/audit", padding=0, spacing=0, bgcolor=BG_TOP,
                        controls=[body], services=[self.file_picker])
 
+    def _save_state(self):
+        """Persist the page's own inputs so they survive navigating away."""
+        try:
+            from session import save_page_state
+            save_page_state("audit", {
+                "site": self.site_field.value,
+                "lte": self.lte_field.value,
+                "nr": self.nr_field.value,
+                "gsm": self.gsm_field.value,
+                "lld": self.lld_field.value,
+                "dump": self.dump_field.value,
+                "cluster": self.cluster_field.value,
+                "batch": self.batch_field.value,
+            })
+        except Exception:
+            pass
+
     def _go_back(self, e):
         """Return to the Integration Summary if the audit was opened from it
         (re-shows the summary without re-running); otherwise go to the form."""
+        self._save_state()
         if getattr(self.page, "integration_has_summary", False):
             self.page.integration_show_summary_only = True
             self.page.go("/integration_run")
@@ -203,6 +234,7 @@ class AuditPage:
             file_type=ft.FilePickerFileType.CUSTOM, allow_multiple=False)
         if files:
             field.value = files[0].path
+            self._save_state()
             self.page.update()
 
     async def _browse_lte(self, e):
@@ -234,6 +266,7 @@ class AuditPage:
             file_type=ft.FilePickerFileType.CUSTOM, allow_multiple=True)
         if files:
             self.dump_field.value = " | ".join(f.path for f in files)
+            self._save_state()
             self.page.update()
 
     # ── Run ──────────────────────────────────────────────────────
@@ -250,6 +283,7 @@ class AuditPage:
             pass
 
     def _run_audit(self, e):
+        self._save_state()
         site = self.site_field.value.strip()
         lte = self.lte_field.value.strip()
         nr = self.nr_field.value.strip()
@@ -550,7 +584,11 @@ class AuditPage:
             # TRX COUNT rows use a per-sector aggregate compare, not the normal
             # per-attribute one — pull them out and audit them separately.
             trx_items = [it for it in items if it.parameter == "__trxcount__"]
-            items = [it for it in items if it.parameter != "__trxcount__"]
+            # IP-broker rows: expected value comes from config.json (broker IP
+            # for the CDD's BSC), not a CDD column — audited by broker_check.
+            broker_items = [it for it in items if it.parameter == "__bscbroker__"]
+            items = [it for it in items
+                     if it.parameter not in ("__trxcount__", "__bscbroker__")]
             results = audit_core.compare(items, records)
             try:
                 tc = audit_core.trx_count_check(trx_items, records)
@@ -561,6 +599,25 @@ class AuditPage:
                               f"{tcc.get('Mismatch',0)} mismatch.")
             except Exception as exc:
                 self._log(f"trx count check failed: {exc}")
+            try:
+                if broker_items:
+                    try:
+                        from integration_runner import get_config
+                        bsc_broker_map = (get_config() or {}).get(
+                            "bsc_broker_map", {})
+                    except Exception:
+                        bsc_broker_map = {}
+                    bk = audit_core.broker_check(
+                        broker_items, records, bsc_broker_map)
+                    if bk:
+                        results += bk
+                        bkc = Counter(r.status for r in bk)
+                        self._log(
+                            f"IP broker: {bkc.get('Match',0)} node(s) match, "
+                            f"{bkc.get('Mismatch',0)} wrong broker, "
+                            f"{bkc.get('NotFound',0)} unresolved.")
+            except Exception as exc:
+                self._log(f"ip broker check failed: {exc}")
 
             # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
             # into the parameter Detail.
