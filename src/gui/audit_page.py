@@ -849,10 +849,35 @@ class AuditPage:
         default_bsc = ((self._form.get("bsc_name") or "").strip()
                        or getattr(self, "_cdd_bsc", "") or "<BSC>")
         site = (self._gen_ctx or {}).get("site") or self.site_field.value.strip()
-        cmds = audit_core.build_cmedit_commands(
-            self._results, site, fdn_prefix=fdn_prefix,
-            gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
-            bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
+
+        # Prefer the GENERATED cmedit files if they exist — so edits the operator
+        # made after Generate (trimming lines, fixing a value) are what gets
+        # applied. Fall back to building fresh from the audit results otherwise.
+        script_dir = getattr(self, "_script_dir", "")
+        cmedit_files = (sorted(glob.glob(os.path.join(script_dir, "*_cmedit.txt")))
+                        if script_dir else [])
+        if cmedit_files:
+            cmds = []
+            for p in cmedit_files:
+                node = re.sub(r"_SetParameter_\d{8}_\d{6}_cmedit\.txt$", "",
+                              os.path.basename(p))
+                try:
+                    with open(p, "r", encoding="utf-8") as fh:
+                        for ln in fh:
+                            ln = ln.strip()
+                            if ln and not ln.startswith("#"):
+                                cmds.append((node, ln))
+                except Exception as exc:
+                    self._log(f"  ✗ read {os.path.basename(p)}: {exc}")
+            source_note = (f"Source: {len(cmedit_files)} generated cmedit file(s) "
+                           "in the SCRIPTS folder — reflects your edits.")
+        else:
+            cmds = audit_core.build_cmedit_commands(
+                self._results, site, fdn_prefix=fdn_prefix,
+                gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
+            source_note = ("Source: audit results in memory — click Generate "
+                           "Scripts first if you want to edit before applying.")
         if not cmds:
             self._set_status("No mismatch commands to apply.", ACCENT_WARM); return
         if not (self._form.get("host") and self._form.get("username")
@@ -860,41 +885,92 @@ class AuditPage:
             self._set_status("SSH creds from the main form are required to "
                              "apply.", DANGER); return
 
+        # Group commands per node so the operator picks WHICH nodes to apply
+        # (not one flat wall of 758 commands). Order preserved.
+        from collections import OrderedDict
+        by_node: "OrderedDict[str, list]" = OrderedDict()
+        for node, cmd in cmds:
+            by_node.setdefault(node, []).append(cmd)
+
         dry = ft.Checkbox(label="Dry run — log the commands, don't send",
                           value=True)
-        preview = "\n".join(c for _n, c in cmds[:250])
-        if len(cmds) > 250:
-            preview += f"\n… (+{len(cmds) - 250} more)"
+        node_checks = {
+            node: ft.Checkbox(label=f"{node}   ·   {len(cl)} cmd(s)", value=True)
+            for node, cl in by_node.items()}
+        preview = ft.Text("", size=11, selectable=True, font_family="Consolas",
+                          color=TEXT)
+
+        def _refresh_preview():
+            sel = [n for n, c in node_checks.items() if c.value]
+            lines = []
+            for n in sel:
+                lines.append(f"# ── {n} ({len(by_node[n])}) ──")
+                lines.extend(by_node[n][:60])
+                if len(by_node[n]) > 60:
+                    lines.append(f"… (+{len(by_node[n]) - 60} more)")
+            total = sum(len(by_node[n]) for n in sel)
+            preview.value = ("\n".join(lines[:400])
+                             or "(no node selected)")
+            title_txt.value = (f"Apply cmedit — {len(sel)} node(s), "
+                               f"{total} command(s)")
+            self.page.update()
+
+        for c in node_checks.values():
+            c.on_change = lambda e: _refresh_preview()
+
+        def _set_all(v):
+            for c in node_checks.values():
+                c.value = v
+            _refresh_preview()
+
+        title_txt = ft.Text("", weight=ft.FontWeight.BOLD, color=ACCENT_WARM)
+
+        def do_apply(_):
+            sel = [n for n, c in node_checks.items() if c.value]
+            sel_cmds = [(n, cmd) for (n, cmd) in cmds if n in sel]
+            if not sel_cmds:
+                self._set_status("Select at least one node to apply.",
+                                 ACCENT_WARM)
+                return
+            self._close_dialog(dlg)
+            threading.Thread(target=self._apply_cmedit_worker,
+                             args=(sel_cmds, dry.value), daemon=True).start()
+
+        node_list = ft.Column(list(node_checks.values()), spacing=2,
+                              scroll=ft.ScrollMode.AUTO,
+                              height=min(220, 34 + 26 * len(node_checks)))
         dlg = ft.AlertDialog(
             modal=True,
-            title=ft.Text(f"Apply {len(cmds)} cmedit set command(s)?",
-                          weight=ft.FontWeight.BOLD, color=ACCENT_WARM),
-            content=ft.Container(width=860, content=ft.Column([
+            title=title_txt,
+            content=ft.Container(width=880, content=ft.Column([
                 ft.Text("Each runs via cli.py over SSH and CHANGES the node. "
-                        "Review carefully — leave 'Dry run' on for a safe "
-                        "preview first.", color=TEXT_MUTED, size=12),
+                        "Pick node(s), then Apply. Leave 'Dry run' on for a "
+                        "safe preview first.", color=TEXT_MUTED, size=12),
+                ft.Text(source_note, size=11, color=ACCENT),
                 dry,
+                ft.Row([
+                    ft.Text("Nodes:", size=12, color=TEXT_MUTED),
+                    ft.Container(expand=True),
+                    ft.TextButton("Select all", on_click=lambda e: _set_all(True)),
+                    ft.TextButton("Clear", on_click=lambda e: _set_all(False)),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                node_list,
+                ft.Text("Preview:", size=12, color=TEXT_MUTED),
                 ft.Container(
-                    height=360, bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
+                    height=240, bgcolor=ft.Colors.with_opacity(0.25, BG_BOTTOM),
                     border_radius=8, padding=10,
-                    content=ft.Column([ft.Text(
-                        preview, size=11, selectable=True,
-                        font_family="Consolas", color=TEXT)],
-                        scroll=ft.ScrollMode.AUTO)),
+                    content=ft.Column([preview], scroll=ft.ScrollMode.AUTO)),
             ], tight=True, spacing=10)),
             actions=[
                 ft.TextButton("Cancel",
                               on_click=lambda e2: self._close_dialog(dlg)),
                 ft.ElevatedButton(
                     "Apply", icon=ft.Icons.BOLT,
-                    style=primary_button_style(),
-                    on_click=lambda e2: (self._close_dialog(dlg),
-                                         threading.Thread(
-                        target=self._apply_cmedit_worker,
-                        args=(cmds, dry.value), daemon=True).start())),
+                    style=primary_button_style(), on_click=do_apply),
             ],
         )
         self._show_dialog(dlg)
+        _refresh_preview()
 
     def _apply_cmedit_worker(self, cmds, dry):
         from integration_runner import IntegrationSSH, CLI_PY
@@ -1203,10 +1279,27 @@ class AuditPage:
             self._set_status("No scripts found — Generate first.", ACCENT_WARM)
             return
         mos_n = sum(1 for p in files if p.lower().endswith(".mos"))
-        checks = [ft.Checkbox(label=os.path.basename(p), value=True)
-                  for p in files]
+
+        # One clickable row per script, labelled by NODE + type so the operator
+        # picks nodes to run (not raw filenames). Default all-on; edit the files
+        # first if a subset of lines is wanted.
+        def _label(p):
+            base = os.path.basename(p)
+            if base.lower().endswith(".mos"):
+                node, _ = self._node_and_stamp(base)
+                return f"{node}   ·   .mos (moshell)"
+            node = re.sub(r"_SetParameter_\d{8}_\d{6}_cmedit\.txt$", "", base)
+            return f"{node}   ·   cmedit (cli.py, per-line)"
+
+        checks = [ft.Checkbox(label=_label(p), value=True) for p in files]
         rows = ft.Column(checks, spacing=2, scroll=ft.ScrollMode.AUTO,
-                         height=min(260, 40 + 24 * len(files)))
+                         height=min(300, 40 + 26 * len(files)))
+
+        def _set_all(v):
+            for c in checks:
+                c.value = v
+            self.page.update()
+
         parallel_cb = ft.Checkbox(
             label="Run .mos in parallel via mobatch (-p up to 30) — recommended "
                   "for many nodes (cmedit files always run per-line via cli.py)",
@@ -1215,6 +1308,7 @@ class AuditPage:
         def do_run(_):
             selected = [files[i] for i, c in enumerate(checks) if c.value]
             if not selected:
+                self._set_status("Select at least one node to run.", ACCENT_WARM)
                 return
             parallel = bool(parallel_cb.value)
             self._close_dialog(dlg)
@@ -1234,7 +1328,13 @@ class AuditPage:
                         "the gateway). Sequential = amos, one node at a time.",
                         size=11, color=TEXT_MUTED),
                 parallel_cb,
-                ft.Text("Select scripts to run:", size=12, color=TEXT_MUTED),
+                ft.Row([
+                    ft.Text("Select node(s) to run:", size=12, color=TEXT_MUTED),
+                    ft.Container(expand=True),
+                    ft.TextButton("Select all",
+                                  on_click=lambda e: _set_all(True)),
+                    ft.TextButton("Clear", on_click=lambda e: _set_all(False)),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 rows,
             ], spacing=10, tight=True)),
             actions=[

@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.8.3] - 2026-08-06
+
+### Changed
+- **Apply (cmedit) is now per-node and honors edited scripts.** Instead of one
+  flat wall of every command, the dialog lists each node with a checkbox
+  (Select all / Clear) and a live preview of the selected nodes. When cmedit
+  scripts have been generated, Apply reads the `*_cmedit.txt` files from the
+  SCRIPTS folder — so edits made after Generate (trimmed lines, fixed values)
+  are what gets applied; otherwise it builds fresh from the audit results.
+- **Run Scripts dialog is node-centric.** Each entry is labelled by node and
+  type (`.mos (moshell)` / `cmedit (cli.py, per-line)`) with Select all / Clear.
+
 ## [1.8.2] - 2026-08-06
 
 ### Changed
