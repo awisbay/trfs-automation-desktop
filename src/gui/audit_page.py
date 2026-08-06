@@ -814,14 +814,15 @@ class AuditPage:
                 self._log("   " + os.path.basename(p))
             if not paths:
                 self._log("Note: all mismatches are GSM/cmedit-sourced — no "
-                          "runnable .mos (use the cmedit/cmbulk files via ENM).")
+                          ".mos; Run Scripts runs the cmedit files per-line via "
+                          "cli.py.")
             self._set_status(
                 f"Generated {len(paths)} .mos + {len(cmedit_paths)} cmedit + "
                 f"{len(cmbulk_paths)} cmbulk.", SUCCESS)
             self._script_dir = script_dir
-            # The Run button executes the .mos only — show it only when there is
-            # a runnable .mos.
-            self.runscript_btn.visible = bool(paths)
+            # Run Scripts executes .mos (moshell) and cmedit files (per-line via
+            # cli.py) — show it whenever either exists.
+            self.runscript_btn.visible = bool(paths or cmedit_paths)
             self.page.update()
             try:
                 os.startfile(script_dir)   # open the folder (Windows) to edit
@@ -1190,17 +1191,26 @@ class AuditPage:
     # ── #3: Run generated scripts (review/edit first, then run) ──
     def _open_run_scripts(self, e):
         sd = getattr(self, "_script_dir", "")
-        files = sorted(glob.glob(os.path.join(sd, "*.mos"))) if sd else []
+        # Runnable files that live in the folder — the user may edit them first,
+        # then pick which to run (not necessarily all). ``.mos`` runs via
+        # moshell; ``*_cmedit.txt`` runs per-line via cli.py. ``*_cmbulk.txt`` is
+        # for ENM CM Bulk import, not per-line execution, so it's excluded here.
+        files = []
+        if sd:
+            files = (sorted(glob.glob(os.path.join(sd, "*.mos")))
+                     + sorted(glob.glob(os.path.join(sd, "*_cmedit.txt"))))
         if not files:
             self._set_status("No scripts found — Generate first.", ACCENT_WARM)
             return
+        mos_n = sum(1 for p in files if p.lower().endswith(".mos"))
         checks = [ft.Checkbox(label=os.path.basename(p), value=True)
                   for p in files]
         rows = ft.Column(checks, spacing=2, scroll=ft.ScrollMode.AUTO,
                          height=min(260, 40 + 24 * len(files)))
         parallel_cb = ft.Checkbox(
-            label="Run in parallel via mobatch (-p up to 30) — recommended "
-                  "for many nodes", value=len(files) > 1)
+            label="Run .mos in parallel via mobatch (-p up to 30) — recommended "
+                  "for many nodes (cmedit files always run per-line via cli.py)",
+            value=mos_n > 1)
 
         def do_run(_):
             selected = [files[i] for i, c in enumerate(checks) if c.value]
@@ -1216,7 +1226,9 @@ class AuditPage:
             title=ft.Text("Run Scripts on live node(s)"),
             content=ft.Container(width=640, content=ft.Column([
                 ft.Text("⚠ This SETS parameters on the LIVE node(s). Review/edit "
-                        "the .mos files first (Generate opened the folder).",
+                        "the script files first (Generate opened the folder). "
+                        ".mos runs via moshell; cmedit files run per-line via "
+                        "cli.py.",
                         size=12, color=ACCENT_WARM),
                 ft.Text("Parallel = one mobatch job (light on the app, runs on "
                         "the gateway). Sequential = amos, one node at a time.",
@@ -1242,6 +1254,35 @@ class AuditPage:
             return m.group(1), m.group(2)
         return re.sub(r"\.mos$", "", basename), ""
 
+    def _run_cmedit_file(self, ssh, path):
+        """Run a generated cmedit script file line-by-line via cli.py — the same
+        transport as the live 'Apply' path. Comment/blank lines are skipped, so
+        an edited file (the user may trim it to a subset) runs exactly as saved.
+        Returns (ok, fail)."""
+        from integration_runner import CLI_PY
+        _ERR = re.compile(r"\berror\b|exception|invalid|not found|"
+                          r"no instances|fail(ed|ure)?", re.IGNORECASE)
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh]
+        cmds = [ln for ln in lines if ln and not ln.startswith("#")]
+        self._log(f"── {os.path.basename(path)}: {len(cmds)} cmedit line(s) "
+                  f"via cli.py ──")
+        ok = fail = 0
+        for i, cmd in enumerate(cmds, 1):
+            try:
+                out = ssh.run_command(f'python {CLI_PY} "{cmd}"', timeout=120)
+                if _ERR.search(out or ""):
+                    fail += 1
+                    self._log(f"  ✗ [{i}/{len(cmds)}] {cmd}\n"
+                              f"     → {(out or '').strip()[-200:]}")
+                else:
+                    ok += 1
+                    self._log(f"  ✓ [{i}/{len(cmds)}] {cmd}")
+            except Exception as ex:
+                fail += 1
+                self._log(f"  ✗ [{i}/{len(cmds)}] {cmd} — {ex}")
+        return ok, fail
+
     def _run_scripts_worker(self, files, parallel=False):
         ssh = None
         self._start_timer()
@@ -1261,16 +1302,32 @@ class AuditPage:
                 port = 5023
             label = (self._gen_ctx or {}).get("site", "SCRIPTS")
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", label)
-            self._log(f"SSH → {host}:{port} as {user} to run {len(files)} script(s)"
-                      f"{' via mobatch (parallel)' if parallel else ' (sequential)'}...")
+            # Split by type: .mos → moshell/mobatch; *_cmedit.txt → cli.py per line.
+            mos_files = [p for p in files if p.lower().endswith(".mos")]
+            cmedit_files = [p for p in files
+                            if p.lower().endswith("_cmedit.txt")]
+            self._log(f"SSH → {host}:{port} as {user} to run "
+                      f"{len(mos_files)} .mos + {len(cmedit_files)} cmedit "
+                      f"file(s)...")
             ssh = IntegrationSSH(host=host, port=port, username=user,
                                  password=pwd, log_callback=self._log)
             ssh.connect(timeout=30)
 
-            if parallel and len(files) > 1:
+            # cmedit files first (per-line via cli.py), independent of the
+            # mobatch/moshell path used for .mos.
+            if cmedit_files:
+                cok = cfail = 0
+                for p in cmedit_files:
+                    o, f = self._run_cmedit_file(ssh, p)
+                    cok += o
+                    cfail += f
+                self._log(f"cmedit: {cok} ok, {cfail} failed across "
+                          f"{len(cmedit_files)} file(s).")
+
+            if mos_files and parallel and len(mos_files) > 1:
                 node_files = []
                 stamp = ""
-                for p in files:
+                for p in mos_files:
                     n, s = self._node_and_stamp(os.path.basename(p))
                     node_files.append((n, p))
                     stamp = stamp or s
@@ -1305,11 +1362,11 @@ class AuditPage:
                                          ACCENT_WARM)
                 else:
                     self._log("⚠ No .log files downloaded to parse.")
-                    self._set_status(f"mobatch ran {len(files)} node(s); "
+                    self._set_status(f"mobatch ran {len(mos_files)} node(s); "
                                      "no logs found.", ACCENT_WARM)
-            else:
+            elif mos_files:
                 ok = 0
-                for path in files:
+                for path in mos_files:
                     node, _ = self._node_and_stamp(os.path.basename(path))
                     self._log(f"── Running {os.path.basename(path)} on {node} ──")
                     try:
@@ -1319,8 +1376,15 @@ class AuditPage:
                         ok += 1
                     except Exception as ex:
                         self._log(f"   ✗ failed: {ex}")
-                self._set_status(f"Ran {ok}/{len(files)} script(s) — check log.",
-                                 SUCCESS if ok == len(files) else ACCENT_WARM)
+                self._set_status(
+                    f"Ran {ok}/{len(mos_files)} .mos script(s) — check log.",
+                    SUCCESS if ok == len(mos_files) else ACCENT_WARM)
+            elif cmedit_files:
+                # Only cmedit files were selected — the per-line run above is the
+                # whole job; surface a status for it.
+                self._set_status(
+                    f"Ran {len(cmedit_files)} cmedit file(s) via cli.py — "
+                    "check log.", SUCCESS)
         except Exception as exc:
             self._fail(f"Run scripts failed: {exc}")
         finally:

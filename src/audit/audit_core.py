@@ -1464,7 +1464,9 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
     stamp = _stamp()
     written: List[str] = []
     for node, rows in _collect_set_rows(results, statuses, site).items():
-        lines = _enm_header("CMEDIT", generated_by, stamp, audit_xlsx)
+        # No comment header — the ENM CMEdit CLI errors on ``#`` lines, and the
+        # file is run per-line via cli.py, so keep it commands-only.
+        lines: List[str] = []
         for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
                              gsm_child_map, bsc_by_cell, default_bsc)
@@ -1527,7 +1529,8 @@ def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,
                              gsm_child_map, bsc_by_cell, default_bsc)
             fdn_params.setdefault(fdn, []).append(
                 (param, _format_set_value(val, norm, actual)))
-        lines = _enm_header("CMBULK", generated_by, stamp, audit_xlsx)
+        # No comment header — the CM Bulk importer errors on ``#`` lines.
+        lines: List[str] = []
         for fdn, params in fdn_params.items():
             lines.append("set")
             lines.append(f"FDN : {fdn}")

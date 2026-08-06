@@ -4,6 +4,20 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.8.2] - 2026-08-06
+
+### Changed
+- **Run Scripts now runs cmedit files too, from the folder.** The audit's
+  cmedit scripts are executed the same way as `.mos`: Run Scripts lists the
+  files in the SCRIPTS folder so they can be edited (or trimmed to a subset)
+  first, then each selected file runs — `.mos` via moshell, `*_cmedit.txt`
+  per-line via `python cli.py "cmedit set …"`. The button now also appears for
+  a GSM-only audit (no `.mos`).
+- **cmedit/cmbulk scripts no longer carry a comment header.** The `# ----`
+  header (Generate by / Format / Datetime / …) is removed from the cmedit and
+  cmbulk exports — the ENM CMEdit CLI and CM Bulk importer error on `#` lines.
+  The `.mos` header is unchanged (moshell treats `#` as a comment).
+
 ## [1.8.1] - 2026-08-06
 
 ### Fixed
