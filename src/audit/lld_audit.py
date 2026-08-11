@@ -56,6 +56,22 @@ def _ref_parts(ref: str):
             port.group(1).strip() if port else "")
 
 
+def _product_name(a: Dict[str, str]) -> str:
+    """productName for an FRU — from a flattened ``productData.productName`` or a
+    standalone ``productName`` (cmdump), else parsed out of the raw ``productData``
+    struct string the modump emits, e.g.
+    ``{productionDate=..., productName=RAN Processor 6655, ...}``."""
+    v = a.get("productData.productName") or a.get("productName")
+    if v:
+        return v
+    pd = a.get("productData")
+    if pd:
+        m = re.search(r"productName\s*=\s*([^,}]+)", str(pd))
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def _fru_product_name(records: Dict[str, Dict[str, str]], node: str) -> str:
     """The node's baseband FRU (BB-1) productName, if present."""
     node_l = _norm(node)
@@ -65,8 +81,7 @@ def _fru_product_name(records: Dict[str, Dict[str, str]], node: str) -> str:
         me = re.search(r"ManagedElement=([^,]+)", ldn)
         if me and _norm(me.group(1)) != node_l:
             continue
-        return (a.get("productData.productName")
-                or a.get("productName") or "")
+        return _product_name(a)
     return ""
 
 

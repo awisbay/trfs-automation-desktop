@@ -93,11 +93,13 @@
         {
           "cdd": "DL BW(Mhz)",
           "attr": "dlChannelBandwidth",
+          "attr_fallback": "channelBandwidth",
           "norm": "bw"
         },
         {
           "cdd": "DL BW(Mhz)",
           "attr": "ulChannelBandwidth",
+          "attr_fallback": "channelBandwidth",
           "norm": "bw"
         },
         {

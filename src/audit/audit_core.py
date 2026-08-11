@@ -18,10 +18,18 @@ from openpyxl.utils import get_column_letter
 
 
 # ── Value normalization (from enp-generator audit_engine.normalize) ──
+_ENUM_RE = re.compile(r"^\d+\s*\((.+)\)$")
+
+
 def normalize(v) -> str:
     if v is None:
         return ""
     s = str(v).strip()
+    # Dump enums render as "<code> (<LABEL>)" e.g. "0 (NORMAL_SECTOR)"; the CDD
+    # carries the LABEL. Compare on the label so they match.
+    m = _ENUM_RE.match(s)
+    if m:
+        return m.group(1).strip().lower()
     try:
         f = float(s)
         return str(int(f)) if f.is_integer() else str(f)
@@ -392,8 +400,12 @@ def compare(items: List[AuditItem],
             actual_alt = (lookup.get(it.attr_alt)
                           or low.get(it.attr_alt.lower()))
         if actual is None and actual_alt is None:
-            status = "NotFound"
-            actual_str = ""
+            # The MO EXISTS (we resolved it above) but the attribute isn't
+            # present — i.e. the node's value is null/unset. The CDD expects a
+            # value, so that's a Mismatch (not a NotFound, which we reserve for
+            # a value we couldn't locate at all / a missing MO).
+            status = "Mismatch"
+            actual_str = "(not set)"
         else:
             norm = _NORMALIZERS.get(it.norm, normalize)
             prim = "" if actual is None else str(actual)

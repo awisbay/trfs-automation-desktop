@@ -4,6 +4,28 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.1] - 2026-08-11
+
+### Fixed
+- **modump: cell → SectorCarrier/NRSectorCarrier reference now parsed.** The DCG
+  parser dropped list-reference attributes rendered as `sectorCarrierRef[1]`
+  followed by `>>> sectorCarrierRef = <FDN>`. It now captures them, so every
+  via-ref param resolves from a modump (was NotFound): configuredMaxTxPower,
+  sectorCarrierType, noOf(Used)Tx/RxAntennas, arfcnDL/UL, bSChannelBwDL,
+  latitude, longitude.
+- **Baseband HW type from modump.** `FieldReplaceableUnit=BB-1` stores its
+  identity in a `productData` struct (`{…, productName=RAN Processor 6655, …}`)
+  rather than a standalone `productName` — the LLD audit now parses it, so the
+  baseband row matches instead of reading empty.
+- **EUtranCellTDD bandwidth.** DL BW falls back to `channelBandwidth` for TDD
+  cells (which have no dl/ulChannelBandwidth), so it no longer reads NotFound.
+- **Null attribute is a Mismatch, not NotFound.** When the MO exists but the
+  audited attribute is absent (the node's value is null/unset) it is now a
+  Mismatch (`actual = "(not set)"`); NotFound/MO_NotFound stay for a value that
+  cannot be located or a missing MO.
+- **Enum values compare on their label.** A dump enum `0 (NORMAL_SECTOR)` now
+  matches the CDD's `NORMAL_SECTOR`.
+
 ## [1.9.0] - 2026-08-06
 
 ### Added

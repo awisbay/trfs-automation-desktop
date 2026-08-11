@@ -151,6 +151,21 @@ def _parse_dcg_text(text: str) -> Dict[str, Dict[str, str]]:
             active_struct = pending_struct
             continue
 
+        # A LIST reference/value: an ``attr[N]`` header (pending_struct) followed
+        # by ``>>> attr = <value>`` lines — e.g. EUtranCellFDD's
+        #   sectorCarrierRef[1]
+        #    >>> sectorCarrierRef = ManagedElement=…,SectorCarrier=B41C1_S2
+        # Store the value(s) under the attr so via_ref can follow it. Kept before
+        # struct-member handling since those need an active_struct.
+        if pending_struct and not active_struct and s.startswith(">>>"):
+            mm = _parse_struct_member(s)
+            if mm:
+                val = mm[1].strip()
+                existing = records[cur_ldn].get(pending_struct)
+                records[cur_ldn][pending_struct] = (
+                    f"{existing};{val}" if existing else val)
+                continue
+
         member = _parse_struct_member(s)
         if member and active_struct:
             struct_fields.append(f"{member[0]}={member[1]}")
