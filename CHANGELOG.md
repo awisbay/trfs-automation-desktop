@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.5] - 2026-08-11
+
+### Fixed
+- **ElecTilt fallback for LTE AIR/AAS sectors.** A sector served by an AIR
+  antenna with no physical RET (e.g. a 3-sector site whose RETs only cover
+  sectors 1–2) was reported NotFound. The tilt now falls back to the cell's
+  `SectorCarrier.digitalTilt` (via `sectorCarrierRef`) for LTE — mirroring the
+  NR `CommonBeamforming.digitalTilt` fallback — so those cells resolve. RET
+  stays the primary source when present.
+
 ## [1.9.4] - 2026-08-11
 
 ### Added

@@ -130,21 +130,33 @@ def audit_etilt(targets: List[tuple],
         t = a.get("electricalAntennaTilt")
         if p and t not in (None, ""):
             ret_by[p].append((_below_me(ldn), str(t)))
-    # CommonBeamforming (below-ME + digitalTilt) keyed by NRSectorCarrier.
-    cb_by_nrsc: Dict[str, tuple] = {}
+    # digitalTilt fallback (AIR/beamforming, no physical RET):
+    #   LTE cell → sectorCarrierRef → SectorCarrier.digitalTilt
+    #   NR  cell → nRSectorCarrierRef → CommonBeamforming.digitalTilt
+    sc_digital: Dict[str, tuple] = {}       # SectorCarrier below-ME → (mo, tilt)
     for ldn, a in records.items():
-        if "CommonBeamforming=" in ldn and "digitalTilt" in a:
+        if ldn.split(",")[-1].split("=", 1)[0] == "SectorCarrier" \
+                and a.get("digitalTilt") not in (None, ""):
+            sc_digital[_below_me(ldn)] = (_below_me(ldn), a.get("digitalTilt"))
+    cb_by_nrsc: Dict[str, tuple] = {}       # NRSectorCarrier leaf → (mo, tilt)
+    for ldn, a in records.items():
+        if "CommonBeamforming=" in ldn and a.get("digitalTilt") not in (None, ""):
             m = re.search(r"NRSectorCarrier=([^,]+)", ldn)
             if m:
                 cb_by_nrsc[m.group(1)] = (_below_me(ldn), a.get("digitalTilt"))
-    # NR cell → its NRSectorCarrier leaf (for the fallback).
-    nrsc_ref = {}
+    # cell → carrier handle for the fallback: ('sc', SectorCarrier below-ME) or
+    # ('nrsc', NRSectorCarrier leaf).
+    cell_carrier: Dict[str, tuple] = {}
     for ldn, a in records.items():
+        m = re.search(r"(?:^|,)EUtranCell(?:FDD|TDD)=([^,]+)$", ldn)
+        if m and a.get("sectorCarrierRef"):
+            cell_carrier[m.group(1)] = ("sc", _below_me(a["sectorCarrierRef"]))
+            continue
         m = re.search(r"(?:^|,)NRCell(?:CU|DU)=([^,]+)$", ldn)
         if m and a.get("nRSectorCarrierRef"):
             r = re.search(r"NRSectorCarrier=([^,]+)", a["nRSectorCarrierRef"])
             if r:
-                nrsc_ref[m.group(1)] = r.group(1)
+                cell_carrier[m.group(1)] = ("nrsc", r.group(1))
 
     out: List[AuditResult] = []
     for cell, node, cdd_tilt in targets:
@@ -159,16 +171,22 @@ def audit_etilt(targets: List[tuple],
                 matched += [(mo, t, "electricalAntennaTilt") for mo, t in lst]
         src = "RetSubUnit.electricalAntennaTilt"
         if not matched:
-            leaf = nrsc_ref.get(cell)
-            cb = cb_by_nrsc.get(leaf) if leaf else None
+            # No physical RET → digital beamforming tilt on the cell's carrier.
+            kind, key = cell_carrier.get(cell, (None, None))
+            cb = None
+            if kind == "sc":
+                cb = sc_digital.get(key)
+                src = "SectorCarrier.digitalTilt"
+            elif kind == "nrsc":
+                cb = cb_by_nrsc.get(key)
+                src = "CommonBeamforming.digitalTilt"
             if cb is None:
                 out.append(AuditResult(
                     "etilt", node, "RetSubUnit", "electricalAntennaTilt",
                     cdd_tilt, "", "NotFound",
-                    "RET userLabel match (none)", node, ref_cell=cell))
+                    "no RET userLabel / digitalTilt match", node, ref_cell=cell))
                 continue
             matched = [(cb[0], str(cb[1]), "digitalTilt")]
-            src = "CommonBeamforming.digitalTilt"
         # One row per matching RET MO — each is directly settable (value ×10).
         seen = set()
         for mo, t_raw, param in matched:
