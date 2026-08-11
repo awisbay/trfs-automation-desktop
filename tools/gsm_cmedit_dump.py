@@ -2,10 +2,12 @@
 """
 NodeCraft GSM BSC cmedit dump — run this on the ENM scripting host.
 
-Enter the SITE ID (e.g. MIN340). The script collects every GSM GeranCell
-(+ child MO) parameter the CDD audit needs, scoped PRECISELY to that site
-(band-anchored M<digits>8*/M<digits>9*, so MIN3407 / MIN3405 are excluded),
-shows a CLI progress bar, and writes the result to
+Enter the SITE ID (e.g. MIN340). The script first checks the site has GSM
+cells: green "Cell found" → it proceeds; red "CELL NOT FOUND" → it stops
+immediately. It then collects every GSM GeranCell (+ child MO) parameter the
+CDD audit needs, scoped PRECISELY to that site (band-anchored
+M<digits>8*/M<digits>9*, so MIN3407 / MIN3405 are excluded), shows a CLI
+progress bar, and writes the result to
 /home/shared/<user>/AUDIT/<SITEID>_gsm_cmedit_<timestamp>.txt.
 
 Upload that .txt in NodeCraft → CDD Audit → "GSM cmedit log" to run the GSM
@@ -84,8 +86,38 @@ def _progress(done, total, label=""):
     sys.stdout.flush()
 
 
+# ── Terminal colours ───────────────────────────────────────────────
+GREEN, RED, BOLD, RESET = "\033[92m", "\033[91m", "\033[1m", "\033[0m"
+
 session = enmscripting.open()
 terminal = session.terminal()
+
+
+def _site_has_cells():
+    """Quick pre-check: does this site have any GeranCell? Returns the first
+    matching cell id, else None."""
+    for pfx in prefixes:
+        cmd = "cmedit get *BS* GeranCell.(gerancellid==%s*,cgi) -t" % pfx
+        try:
+            res = terminal.execute(cmd)
+        except Exception:
+            continue
+        if res.is_command_result_available():
+            for line in res.get_output():
+                for tok in cell_rx.findall(line):
+                    if site_rx.match(tok):
+                        return tok
+    return None
+
+
+print("Searching GSM cells for %s ..." % siteid)
+_found = _site_has_cells()
+if not _found:
+    print("%s%s CELL NOT FOUND for %s %s" % (BOLD, RED, siteid, RESET))
+    enmscripting.close(session)
+    sys.exit(1)
+print("%s%s Cell found: %s — collecting ...%s" % (BOLD, GREEN, _found, RESET))
+
 n_ok = 0
 done = 0
 print("Collecting GSM cmedit for %s -> %s" % (siteid, outname))
