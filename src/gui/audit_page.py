@@ -761,6 +761,33 @@ class AuditPage:
                 except Exception as exc:
                     self._log(f"  ✗ ESS audit failed: {exc}")
 
+            # Electrical antenna tilt (ElecTilt) — cell linked to its RetSubUnit
+            # by the RET userLabel convention; falls back to beamforming tilt.
+            try:
+                from audit import etilt_audit
+                et_specs = []
+                if lte and os.path.isfile(lte):
+                    et_specs.append((lte, "eNodeBName"))
+                if nr and os.path.isfile(nr):
+                    et_specs.append((nr, "gNodeBName"))
+                et_total = []
+                for path, keycol in et_specs:
+                    for node in nodes:
+                        tg = etilt_audit.read_etilt_targets(
+                            path, "CDD", 3, keycol, node, log=self._log)
+                        if tg:
+                            et_total += etilt_audit.audit_etilt(
+                                tg, records, log=self._log)
+                if et_total:
+                    results += et_total
+                    ec = Counter(r.status for r in et_total)
+                    self._log(f"ElecTilt: {ec.get('Match',0)} match, "
+                              f"{ec.get('Mismatch',0)} mismatch, "
+                              f"{ec.get('NotFound',0)} not found "
+                              f"({len(et_total)} cell(s)).")
+            except Exception as exc:
+                self._log(f"etilt audit failed: {exc}")
+
             c = Counter(r.status for r in results)
             self._log(f"Result: Match={c['Match']} Mismatch={c['Mismatch']} "
                       f"ParamNotFound={c['NotFound']} MO_NotFound={c['MO_NotFound']}")

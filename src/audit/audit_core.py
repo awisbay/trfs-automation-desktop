@@ -1259,7 +1259,7 @@ def _banner(name: str) -> str:
 # single settable MO attribute — they have no valid ``set`` target, so every
 # script generator skips them (a "GsmSector [BULUAN]" MO or "10.x (BSC)" value
 # would only produce a broken set line).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker", "ess"}
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker", "ess", "etilt"}
 
 
 def generate_moshell_scripts(results: List[AuditResult], out_dir: str,

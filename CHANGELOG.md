@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.3] - 2026-08-11
+
+### Added
+- **Electrical antenna tilt (ElecTilt) audit.** Each cell's CDD `ElecTilt` is
+  checked against the node's antenna tilt. With no direct cell→RET reference in
+  the dump, cells are linked to their `RetSubUnit` by the RET `userLabel`
+  convention (`<site><band-letters>-<sector>`, e.g. `GFATIMLY-1` for band L /
+  sector 1) and compared to `electricalAntennaTilt` (0.1° → CDD degrees, node 20
+  == CDD 2). NR / AIR-beamforming cells with no physical RET fall back to
+  `CommonBeamforming.digitalTilt`. Reported per cell in the Detail sheet.
+
 ## [1.9.2] - 2026-08-11
 
 ### Added
