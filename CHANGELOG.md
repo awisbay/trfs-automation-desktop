@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.6] - 2026-08-11
+
+### Fixed
+- **ElecTilt `digitalTilt` fallback restricted to AIR/AAS sectors.** The
+  SectorCarrier.digitalTilt fallback now applies only when the sector's radio is
+  an AIR/AAS unit (resolved via `sectorFunctionRef` →
+  `SectorEquipmentFunction.rfBranchRef` → radio `productName`, e.g. `AIR 3265`).
+  A plain RET-fed sector that fails to match a RET is left NotFound instead of
+  silently borrowing digitalTilt.
+
 ## [1.9.5] - 2026-08-11
 
 ### Fixed

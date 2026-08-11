@@ -133,10 +133,41 @@ def audit_etilt(targets: List[tuple],
     # digitalTilt fallback (AIR/beamforming, no physical RET):
     #   LTE cell → sectorCarrierRef → SectorCarrier.digitalTilt
     #   NR  cell → nRSectorCarrierRef → CommonBeamforming.digitalTilt
+    # Radio type per FieldReplaceableUnit (to tell AIR/AAS from a plain radio):
+    #   SectorCarrier.sectorFunctionRef → SectorEquipmentFunction.rfBranchRef →
+    #   FieldReplaceableUnit.productData.productName ("AIR 3265 B41" = AIR).
+    fru_pname = {}
+    for ldn, a in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] != "FieldReplaceableUnit":
+            continue
+        pd = str(a.get("productData") or "")
+        m = re.search(r"productName\s*=\s*([^,}]+)", pd)
+        name = m.group(1).strip() if m else (a.get("productName") or "")
+        fru = re.search(r"FieldReplaceableUnit=([^,]+)", ldn)
+        if fru and name:
+            fru_pname[fru.group(1)] = name
+    sef_fru = {}                             # SEF below-ME → radio FRU name
+    for ldn, a in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] == "SectorEquipmentFunction" \
+                and a.get("rfBranchRef"):
+            m = re.search(r"FieldReplaceableUnit=([^,]+)", a["rfBranchRef"])
+            if m:
+                sef_fru[_below_me(ldn)] = m.group(1)
+
+    def _is_air(sc_attrs) -> bool:
+        ref = sc_attrs.get("sectorFunctionRef")
+        if not ref:
+            return False
+        fru = sef_fru.get(_below_me(ref), "")
+        pn = fru_pname.get(fru, "")
+        return bool(re.search(r"AIR|AAS", pn, re.I) or "AAS" in fru.upper())
+
     sc_digital: Dict[str, tuple] = {}       # SectorCarrier below-ME → (mo, tilt)
     for ldn, a in records.items():
+        # Only AIR/AAS SectorCarriers expose a meaningful digitalTilt; a plain
+        # RET-fed sector must NOT use it (it's the physical RET's job).
         if ldn.split(",")[-1].split("=", 1)[0] == "SectorCarrier" \
-                and a.get("digitalTilt") not in (None, ""):
+                and a.get("digitalTilt") not in (None, "") and _is_air(a):
             sc_digital[_below_me(ldn)] = (_below_me(ldn), a.get("digitalTilt"))
     cb_by_nrsc: Dict[str, tuple] = {}       # NRSectorCarrier leaf → (mo, tilt)
     for ldn, a in records.items():
