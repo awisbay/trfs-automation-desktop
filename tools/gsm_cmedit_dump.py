@@ -5,14 +5,17 @@ NodeCraft GSM BSC cmedit dump — run this on the ENM scripting host.
 Enter the SITE ID (e.g. MIN340). The script collects every GSM GeranCell
 (+ child MO) parameter the CDD audit needs, scoped PRECISELY to that site
 (band-anchored M<digits>8*/M<digits>9*, so MIN3407 / MIN3405 are excluded),
-and writes them to <SITEID>_gsm_cmedit_<timestamp>.txt.
+shows a CLI progress bar, and writes the result to
+/home/shared/<user>/AUDIT/<SITEID>_gsm_cmedit_<timestamp>.txt.
 
 Upload that .txt in NodeCraft → CDD Audit → "GSM cmedit log" to run the GSM
 audit offline (no SSH from the tool needed).
 """
 import enmscripting
 import sys
+import os
 import re
+import getpass
 import datetime
 
 # (MO, command) pairs — ``__PFX__`` is replaced with each band-anchored prefix.
@@ -58,16 +61,40 @@ def _belongs(line):
     return (not toks) or any(site_rx.match(t) for t in toks)
 
 stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-outname = "%s_gsm_cmedit_%s.txt" % (siteid, stamp)
+
+# Save under /home/shared/<user>/AUDIT/ (created if needed).
+save_dir = "/home/shared/%s/AUDIT" % getpass.getuser()
+try:
+    os.makedirs(save_dir)
+except OSError:
+    pass                       # already exists (py2/py3-safe, no exist_ok)
+outname = os.path.join(save_dir, "%s_gsm_cmedit_%s.txt" % (siteid, stamp))
+
+total = len(COMMANDS) * len(prefixes)
+
+
+def _progress(done, total, label=""):
+    """In-place CLI progress bar, e.g. [########----------]  40%  (12/30) MO."""
+    width = 30
+    frac = float(done) / total if total else 1.0
+    filled = int(round(width * frac))
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stdout.write("\r[%s] %3d%%  (%d/%d)  %-24s"
+                     % (bar, int(round(frac * 100)), done, total, label))
+    sys.stdout.flush()
+
 
 session = enmscripting.open()
 terminal = session.terminal()
 n_ok = 0
+done = 0
+print("Collecting GSM cmedit for %s -> %s" % (siteid, outname))
 with open(outname, "w") as fh:
     fh.write("# NodeCraft GSM cmedit dump | SITE=%s | %s\n\n" % (siteid, stamp))
     for mo, tmpl in COMMANDS:
         for pfx in prefixes:
             cmd = tmpl.replace("__PFX__", pfx)
+            _progress(done, total, "%s %s*" % (mo, pfx))
             fh.write("##### NODECRAFT-CMEDIT MO=%s CMD=%s #####\n" % (mo, cmd))
             try:
                 res = terminal.execute(cmd)
@@ -81,6 +108,9 @@ with open(outname, "w") as fh:
             except Exception as exc:
                 fh.write("# ERROR: %s\n" % exc)
             fh.write("\n")
+            done += 1
+            _progress(done, total, "%s %s*" % (mo, pfx))
+    sys.stdout.write("\n")
 
 enmscripting.close(session)
 print("Done. %d query block(s) written to: %s" % (n_ok, outname))
