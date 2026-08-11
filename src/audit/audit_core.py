@@ -1261,6 +1261,10 @@ def _banner(name: str) -> str:
 # would only produce a broken set line).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker", "ess", "etilt"}
 
+# Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
+# e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.
+_MOSHELL_SETTABLE = {"etilt"}
+
 
 def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
                              site: str, audit_xlsx: str,
@@ -1280,7 +1284,8 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
     for r in results:
         if r.status not in statuses or r.expected == "":
             continue
-        if r.category in _NON_SETTABLE_CATEGORIES:
+        if (r.category in _NON_SETTABLE_CATEGORIES
+                and r.category not in _MOSHELL_SETTABLE):
             continue
         if r.parameter.startswith("__"):
             continue          # synthetic (e.g. __count__) — not a settable attr
@@ -1294,7 +1299,7 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             continue
         seen.add(sig)
         by_node.setdefault(node, {}).setdefault(_mo_group(r.mo), []).append(
-            (r.mo, r.parameter, r.expected))
+            (r.mo, r.parameter, r.expected, r.norm, r.actual))
 
     written: List[str] = []
     for node, groups in by_node.items():
@@ -1322,8 +1327,10 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             lines.append(_banner(g))
             # Sort by parameter (then MO) so all lines of one parameter are
             # contiguous — easy to review or delete a whole parameter at once.
-            for mo, param, val in sorted(groups[g], key=lambda x: (x[1], x[0])):
-                lines.append(f"set {mo}$ {param} {val}")
+            for mo, param, val, norm, actual in sorted(
+                    groups[g], key=lambda x: (x[1], x[0])):
+                lines.append(
+                    f"set {mo}$ {param} {_format_set_value(val, norm, actual)}")
         # Close the log opened with l+ at the top.
         lines.append("")
         lines.append("l-")
@@ -1409,6 +1416,11 @@ def _format_set_value(value, norm: str = "", actual: str = "") -> str:
     if norm == "geo":
         try:
             return str(int(round(float(s) * 1e6)))
+        except (ValueError, TypeError):
+            return s
+    if norm == "tilt10":                       # CDD degrees → node 0.1° units
+        try:
+            return str(int(round(float(s) * 10)))
         except (ValueError, TypeError):
             return s
     if s in ("0", "1"):

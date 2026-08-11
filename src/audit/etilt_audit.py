@@ -116,24 +116,28 @@ def audit_etilt(targets: List[tuple],
     beamforming tilt."""
     if not targets:
         return []
-    # RET index: (alphaPrefix, sector) → sorted set of tilts.
+
+    def _below_me(ldn):
+        return re.sub(r"^.*?ManagedElement=[^,]+,", "", ldn)
+
+    # RET index: (alphaPrefix, sector) → list of (retMoBelowME, tiltRaw).
     import collections
-    ret_by = collections.defaultdict(set)
+    ret_by = collections.defaultdict(list)
     for ldn, a in records.items():
         if ldn.split(",")[-1].split("=", 1)[0] != "RetSubUnit":
             continue
         p = _parse_ret(a.get("userLabel") or "")
         t = a.get("electricalAntennaTilt")
         if p and t not in (None, ""):
-            ret_by[p].add(str(t))
-    # CommonBeamforming.digitalTilt keyed by its NRSectorCarrier (below-ME).
-    cb_by_nrsc: Dict[str, str] = {}
+            ret_by[p].append((_below_me(ldn), str(t)))
+    # CommonBeamforming (below-ME + digitalTilt) keyed by NRSectorCarrier.
+    cb_by_nrsc: Dict[str, tuple] = {}
     for ldn, a in records.items():
         if "CommonBeamforming=" in ldn and "digitalTilt" in a:
             m = re.search(r"NRSectorCarrier=([^,]+)", ldn)
             if m:
-                cb_by_nrsc[m.group(1)] = a.get("digitalTilt")
-    # cell record → nRSectorCarrierRef leaf, for the NR fallback.
+                cb_by_nrsc[m.group(1)] = (_below_me(ldn), a.get("digitalTilt"))
+    # NR cell → its NRSectorCarrier leaf (for the fallback).
     nrsc_ref = {}
     for ldn, a in records.items():
         m = re.search(r"(?:^|,)NRCell(?:CU|DU)=([^,]+)$", ldn)
@@ -148,28 +152,31 @@ def audit_etilt(targets: List[tuple],
         if not pc:
             continue
         site, band, sector = pc
-        tilts = set()
-        for (ap, rs), ts in ret_by.items():
+        # (mo, tiltRaw, param) for every matching RET, else the NR fallback.
+        matched = []
+        for (ap, rs), lst in ret_by.items():
             if rs == sector and ap.startswith(site) and band in ap[len(site):]:
-                tilts |= ts
+                matched += [(mo, t, "electricalAntennaTilt") for mo, t in lst]
         src = "RetSubUnit.electricalAntennaTilt"
-        if not tilts:
-            # NR / AIR fallback via CommonBeamforming.digitalTilt.
+        if not matched:
             leaf = nrsc_ref.get(cell)
-            dt = cb_by_nrsc.get(leaf) if leaf else None
-            if dt is None:
+            cb = cb_by_nrsc.get(leaf) if leaf else None
+            if cb is None:
                 out.append(AuditResult(
                     "etilt", node, "RetSubUnit", "electricalAntennaTilt",
                     cdd_tilt, "", "NotFound",
                     "RET userLabel match (none)", node, ref_cell=cell))
                 continue
-            tilts = {str(dt)}
+            matched = [(cb[0], str(cb[1]), "digitalTilt")]
             src = "CommonBeamforming.digitalTilt"
-        degs = sorted({_tilt_deg(t) for t in tilts}, key=lambda x: float(x))
-        actual = degs[0] if len(degs) == 1 else "/".join(degs)
-        status = ("Match" if len(degs) == 1 and _eq(degs[0], cdd_tilt)
-                  else "Mismatch")
-        out.append(AuditResult(
-            "etilt", node, "RetSubUnit", "electricalAntennaTilt",
-            cdd_tilt, actual, status, src, node, ref_cell=cell))
+        # One row per matching RET MO — each is directly settable (value ×10).
+        seen = set()
+        for mo, t_raw, param in matched:
+            if mo in seen:
+                continue
+            seen.add(mo)
+            status = "Match" if _eq(_tilt_deg(t_raw), cdd_tilt) else "Mismatch"
+            out.append(AuditResult(
+                "etilt", node, mo, param, cdd_tilt, _tilt_deg(t_raw),
+                status, src, node, ref_cell=cell, norm="tilt10"))
     return out

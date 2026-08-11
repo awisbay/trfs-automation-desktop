@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.4] - 2026-08-11
+
+### Added
+- **ElecTilt mismatches generate a `.mos` fix.** A tilt Mismatch now emits a
+  moshell `set <RetSubUnit> electricalAntennaTilt <deg×10>` line (one per
+  physical RET, de-duped), converting the CDD degrees to the node's 0.1° units.
+  Tilt is a RET operation, so it goes into the `.mos` only — cmedit/cmbulk skip
+  it. The `.mos` generator now applies node-convention value formatting
+  (list/DMS/geo/boolean/tilt) like the cmedit/cmbulk exports already did.
+
 ## [1.9.3] - 2026-08-11
 
 ### Added
