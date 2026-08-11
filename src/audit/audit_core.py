@@ -426,7 +426,8 @@ def compare(items: List[AuditItem],
 
 
 _CELL_MO_INV = re.compile(
-    r"(?:^|,)(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|GeranCell)=([^,]+)",
+    r"(?:^|,)(EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|GeranCell|GsmSector)"
+    r"=([^,]+)",
     re.IGNORECASE)
 
 
@@ -632,7 +633,7 @@ class CellInvRow:
 
 _CANON_CELL = {"eutrancellfdd": "EUtranCellFDD", "eutrancelltdd": "EUtranCellTDD",
                "nrcelldu": "NRCellDU", "nrcellcu": "NRCellCU",
-               "gerancell": "GeranCell"}
+               "gerancell": "GeranCell", "gsmsector": "GsmSector"}
 
 
 def cell_inventory_rows(items: List[AuditItem],

@@ -4,6 +4,14 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.2] - 2026-08-11
+
+### Added
+- **GsmSector in the Cell Inventory.** The Cell Inventory sheet now lists
+  `GsmSector` (from the CDD `CELLNAME` column vs the node's GsmSector MOs),
+  alongside EUtranCell/NRCell/GeranCell — so a missing or extra GSM sector shows
+  up per-cell, not just a count.
+
 ## [1.9.1] - 2026-08-11
 
 ### Fixed
