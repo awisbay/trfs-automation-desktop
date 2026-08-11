@@ -108,6 +108,72 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
     return records
 
 
+# ── Offline GSM cmedit: dump script + log parser ────────────────────
+# The BSC GeranCell audit can run live (SSH) or offline: the operator runs a
+# generated enmscripting dump on the ENM server, saves the .txt, and uploads it
+# here. Both routes end up as the SAME ``{ldn: {attr: value}}`` records.
+
+_LOG_MARKER = "##### NODECRAFT-CMEDIT"
+
+
+# NOTE: the standalone ENM dump script that produces the uploadable log
+# lives OUTSIDE the app at tools/gsm_cmedit_dump.py (run on the ENM host).
+# Only the upload PARSER lives here.
+
+
+def parse_cmedit_log(text: str, profiles, site_id: str = "",
+                     log=lambda m: None) -> Dict[str, Dict[str, str]]:
+    """Parse an uploaded GSM cmedit dump (from tools/gsm_cmedit_dump.py) back
+    into ``{ldn: {attr: value}}`` records — the same shape/filtering as the live
+    ``fetch_cmedit_records``, so the audit treats offline and live identically."""
+    cell_rx = None
+    try:
+        from integration_runner import gsm_cell_id_re
+        cell_rx = gsm_cell_id_re(site_id) if site_id else None
+    except Exception:
+        pass
+
+    prof_by_mo: Dict[str, list] = {}
+    for prof in profiles:
+        if prof.get("source") != "cmedit":
+            continue
+        mo = prof.get("cmedit_mo") or _leaf_class(prof.get("mo_fdn", ""))
+        prof_by_mo.setdefault(mo, []).append(prof)
+
+    # Split on the marker; the capturing group hands back each block's MO.
+    parts = re.split(rf"^{re.escape(_LOG_MARKER)}\s+MO=(\S+).*$",
+                     text, flags=re.M)
+    records: Dict[str, Dict[str, str]] = {}
+    if len(parts) < 3:
+        log("[audit/cmedit-log] no NodeCraft markers found — is this the right "
+            "file? Expected the dump script's output.")
+        return records
+    dropped = 0
+    for mo, body in zip(parts[1::2], parts[2::2]):
+        for prof in prof_by_mo.get(mo, []):
+            attrs = list(dict.fromkeys(
+                c["attr"] for c in prof.get("columns", [])
+                if c.get("attr") and not c["attr"].startswith("__")))
+            parsed = _parse_cmedit_table(body, attrs,
+                                         key_fdn=prof.get("key_fdn", ""))
+            if cell_rx is not None:
+                kept = {}
+                for ldn, a in parsed.items():
+                    m = re.search(r"GeranCell=([^,]+)", ldn)
+                    if m and not cell_rx.match(m.group(1)):
+                        dropped += 1
+                        continue
+                    kept[ldn] = a
+                parsed = kept
+            for ldn, a in parsed.items():
+                records.setdefault(ldn, {}).update(a)
+    if dropped:
+        log(f"[audit/cmedit-log] dropped {dropped} foreign cell(s) not "
+            f"matching site {site_id}")
+    log(f"[audit/cmedit-log] parsed {len(records)} MO(s) from the log.")
+    return records
+
+
 _FDN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*=[^,\s]+(?:,[A-Za-z][A-Za-z0-9_]*=[^,\s]+)*")
 
 

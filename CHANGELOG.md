@@ -4,6 +4,57 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.0] - 2026-08-06
+
+### Added
+- **ESS (LTE/NR spectrum sharing) audit.** New "ESS" sheet in the report. For
+  each pair on the CDD's `ESS` sheet it checks, against the node dump: the LTE
+  and NR cells exist; `essScLocalId`/`essScPairId` are equal on the LTE
+  `SectorCarrier` and NR `NRSectorCarrier` (and match the CDD); and
+  `essEnabled=true` on both the LTE `GUtranCellRelation` and NR
+  `EUtranCellRelation` (matched by gNB ID so a neighbour relation can't clobber
+  the pair).
+- **DL BW audit** — new `bw` normalizer compares the CDD's MHz against the
+  node's kHz `dlChannelBandwidth`/`ulChannelBandwidth` (10 == 10000).
+- **MIMO fallback** — new `attr_alt`: the antenna count matches against
+  `noOfTxAntennas` *or* `noOfUsedTxAntennas` (and Rx likewise), so a `0` primary
+  with a valid "used" value still validates (and the used value is displayed).
+
+### Changed
+- **Trimmed the audit parameter set.** Per request, ~136 LTE/NR/GSM parameters
+  were removed from `audit_map.json` (and 15 now-empty GSM/LTE profiles dropped)
+  so the audit focuses on the parameters that matter for this scope.
+- **GSM audit improvements.**
+  - TRX count now audits the CDD `No of UL TRX` column directly against the
+    number of `Trx` per `GsmSector` (simpler than the old `TRX COUNT` formula).
+  - Added GSM node `UserLabel_Node` audit (`ManagedElement.userLabel`, like LTE).
+  - Added GSM cell `gsmSectorId` audit from the CDD `CELLNAME` column.
+  - BSC IP-broker now reports EVERY `AbisIp` MO (one row per `GsmSector`),
+    not a single aggregated row — so a single wrongly-brokered sector shows.
+  - CDD header matching is whitespace-tolerant (double spaces / nbsp), e.g.
+    `No of  UL TRX` matches `No of UL TRX`.
+
+### Added (continued)
+- **Offline GSM (GeranCell) audit via an uploaded cmedit log.** The CDD Audit
+  page has a new "GSM cmedit log (txt)" field. When set, the GSM BSC audit is
+  driven by that log instead of a live SSH cmedit — same records, same audit.
+  Leave it blank to keep the live path. The log is produced by a **separate**
+  standalone ENM script, `tools/gsm_cmedit_dump.py` (not bundled in the app):
+  the operator runs it on the ENM scripting host, enters a SITE ID (e.g.
+  MIN340), and it collects every GeranCell (+ child MO) parameter scoped to that
+  site with band-anchored `M<digits>8*/M<digits>9*` prefixes so neighbours like
+  MIN3407 / MIN3405 are excluded. The upload parser applies the same precise
+  site filter as a safety net.
+
+## [1.8.4] - 2026-08-06
+
+### Added
+- **Remark column in the Integration Summary.** The saved summary Excel (and the
+  clipboard copy) now has a trailing "Remark" column next to the Yes/No/Pending
+  status, filled with each step's short progress detail — e.g. the SGw check's
+  "1/29 with packet loss". With more than one node the remark is prefixed by the
+  node label. The column is left-aligned and text-wrapped.
+
 ## [1.8.3] - 2026-08-06
 
 ### Changed

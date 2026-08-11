@@ -943,6 +943,10 @@ class IntegrationRunPage:
 
         # Per-node step result tracking: {node_tag: {step_key: state}}
         self._step_results: dict[str, dict[str, str]] = {}
+        # Per-node step remark/detail: {node_tag: {step_key: detail}} — the same
+        # short status string shown on the progress row (e.g. the SGw check's
+        # "1/29 with packet loss"), carried into the summary's Remark column.
+        self._step_details: dict[str, dict[str, str]] = {}
 
         # Per-node duration tracking: {node_tag: seconds}
         self._node_durations: dict[str, float] = {}
@@ -975,6 +979,8 @@ class IntegrationRunPage:
             self.page.integration_show_summary_only = False
             self._step_results = (
                 getattr(self.page, "integration_step_results", {}) or {})
+            self._step_details = (
+                getattr(self.page, "integration_step_details", {}) or {})
             self._node_durations = (
                 getattr(self.page, "integration_node_durations", {}) or {})
             self._run_finished = True
@@ -1502,6 +1508,10 @@ class IntegrationRunPage:
         if key in steps:
             steps[key].set_state(state, detail)
         self._step_results.setdefault(node, {})[key] = state
+        # Keep the latest non-empty remark for this step; don't let a later
+        # empty detail wipe a meaningful one.
+        if detail:
+            self._step_details.setdefault(node, {})[key] = detail
         # Mark the UI dirty so the flush loop repaints the status cell
         # on its next tick (≤0.25 s) even if no log line follows. This
         # is what keeps the progress column in sync with the worker —
@@ -2159,10 +2169,11 @@ class IntegrationRunPage:
         """
         rows: list[list[str]] = []
 
-        # Header
+        # Header — trailing "Remark" column carries each step's short status
+        # detail (e.g. the SGw check's "1/29 with packet loss").
         header = ["PRE INTEGRATION CHECK LIST"] + [
             node_labels[nt] for nt in node_order
-        ]
+        ] + ["Remark"]
         rows.append(header)
 
         for key, label, applies_to, _ in INTEGRATION_STEPS:
@@ -2220,6 +2231,19 @@ class IntegrationRunPage:
                 else:
                     cell = "pending"
                 row.append(cell)
+
+            # Remark column: the step's detail string, per node. Prefix with the
+            # node label when more than one node so it's clear which is which.
+            remarks = []
+            for ntag in node_order:
+                details = self._step_details.get(ntag, {})
+                d = details.get(key, "")
+                if not d and key == "enrollment_sync":
+                    d = details.get("enrollment", "")
+                if d:
+                    remarks.append(
+                        f"{node_labels[ntag]}: {d}" if len(node_order) > 1 else d)
+            row.append("; ".join(remarks))
             rows.append(row)
         return rows
 
@@ -2385,6 +2409,9 @@ class IntegrationRunPage:
         na_fill = PatternFill("solid", fgColor="FFFF00")       # bright yellow
         pending_fill = PatternFill("solid", fgColor="FFEB9C")  # muted yellow
         center = Alignment(horizontal="center", vertical="center")
+        left_wrap = Alignment(horizontal="left", vertical="center",
+                              wrap_text=True)
+        remark_col = len(rows[0])   # last column is the free-text Remark
 
         for r_idx, row in enumerate(rows, start=1):
             for c_idx, value in enumerate(row, start=1):
@@ -2398,6 +2425,10 @@ class IntegrationRunPage:
                     cell.font = Font(bold=True, color="000000")
                     cell.fill = label_fill
                     cell.alignment = center
+                elif c_idx == remark_col:
+                    # Free-text remark — left-aligned, wrapped, no status fill.
+                    cell.font = Font(color="000000")
+                    cell.alignment = left_wrap
                 else:
                     if value == "Yes":
                         cell.font = Font(bold=True, color="006100")
@@ -2417,7 +2448,8 @@ class IntegrationRunPage:
 
         ws.column_dimensions["A"].width = 40
         for c in range(2, len(rows[0]) + 1):
-            ws.column_dimensions[get_column_letter(c)].width = 26
+            ws.column_dimensions[get_column_letter(c)].width = (
+                48 if c == remark_col else 26)
         for r in range(1, len(rows) + 1):
             ws.row_dimensions[r].height = 20
 
@@ -2490,6 +2522,8 @@ class IntegrationRunPage:
         # from scratch) WITHOUT re-running the integration.
         self.page.integration_step_results = {
             k: dict(v) for k, v in self._step_results.items()}
+        self.page.integration_step_details = {
+            k: dict(v) for k, v in self._step_details.items()}
         self.page.integration_node_durations = dict(self._node_durations)
         self.page.integration_has_summary = True
 

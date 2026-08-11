@@ -123,10 +123,28 @@ def normalize_bbtype(v) -> str:
     return m.group(1) if m else s.lower()
 
 
+def normalize_bw(v) -> str:
+    """Channel bandwidth to a common unit: the CDD is in MHz (``10``), the node's
+    ``dl/ulChannelBandwidth`` is in kHz (``10000``). Reduce both to MHz so
+    ``10`` and ``10000`` compare equal (``1.4``/``1400`` handled too)."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() == "null":
+        return ""
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    if not m:
+        return s.lower()
+    f = float(m.group())
+    if f >= 1000:            # kHz → MHz
+        f = f / 1000.0
+    return str(int(f)) if f == int(f) else str(f)
+
+
 # name -> comparator; selected per-column via the CDD map's optional "norm".
 _NORMALIZERS = {"segments": normalize_segments, "latlong": normalize_latlong,
                 "list": normalize_list, "geo": normalize_geo,
-                "bbtype": normalize_bbtype}
+                "bbtype": normalize_bbtype, "bw": normalize_bw}
 
 
 # Boolean equivalence for the compare: many GSM/LTE attrs are ``1``/``0`` in the
@@ -171,6 +189,10 @@ class AuditItem:
     attr_fallback: str = ""  # try this attr if ``parameter`` is absent — e.g.
                            #   EUtranCellFDD uses earfcnDl/Ul, EUtranCellTDD uses
                            #   a single ``earfcn``
+    attr_alt: str = ""     # accept EITHER attr — match if expected equals this
+                           #   MO's value OR the alt's, and the alt wins for
+                           #   display when the primary is empty/0 (e.g. MIMO
+                           #   noOfRxAntennas=0 but noOfUsedRxAntennas=4)
     from_cmedit: bool = False  # sourced from live cmedit (BSC GeranCell) — such
                            #   params can't be set via moshell, so they're kept
                            #   out of the .mos script (cmedit/cmbulk only)
@@ -362,15 +384,28 @@ def compare(items: List[AuditItem],
         if actual is None and it.attr_fallback:
             actual = (lookup.get(it.attr_fallback)
                       or low.get(it.attr_fallback.lower()))
-        if actual is None:
+        # Alternative attribute: accept EITHER MO value. The alt is preferred for
+        # display when the primary is empty/0 (e.g. noOfRxAntennas=0 while
+        # noOfUsedRxAntennas=4 — the "used" one is the real answer).
+        actual_alt = None
+        if it.attr_alt:
+            actual_alt = (lookup.get(it.attr_alt)
+                          or low.get(it.attr_alt.lower()))
+        if actual is None and actual_alt is None:
             status = "NotFound"
             actual_str = ""
         else:
-            actual_str = str(actual)
             norm = _NORMALIZERS.get(it.norm, normalize)
-            status = ("Match" if (norm(actual_str) == norm(it.expected)
-                                  or _bool_equal(it.expected, actual_str))
-                      else "Mismatch")
+            prim = "" if actual is None else str(actual)
+            alt = "" if actual_alt is None else str(actual_alt)
+            # Display the primary unless it's empty/0 and the alt has a value.
+            actual_str = (alt if prim in ("", "0") and alt not in ("", "0")
+                          else prim)
+            exp_n = norm(it.expected)
+            match = (norm(prim) == exp_n or _bool_equal(it.expected, prim)
+                     or (it.attr_alt and (norm(alt) == exp_n
+                                          or _bool_equal(it.expected, alt))))
+            status = "Match" if match else "Mismatch"
         results.append(AuditResult(
             it.category, it.key, eff_mo, it.parameter,
             it.expected, actual_str, status, it.source, it.node, ref_cell,
@@ -480,12 +515,11 @@ def broker_check(broker_items: List[AuditItem],
     """Audit each GSM node's IP-broker against config.json ``bsc_broker_map``.
 
     The CDD names the BSC a node belongs to (``BSC`` column → ``__bscbroker__``
-    items); ``bsc_broker_map`` maps that BSC to its broker IP. The node's own
-    ``AbisIp.bscBrokerIpAddress`` (from the dump) is compared to that expected
-    IP — catching a node wired to the WRONG BSC's broker (the ping to the wrong
-    broker still succeeds, so this mismatch is otherwise invisible). One row per
-    node; the actual IP is annotated with the BSC it actually points at."""
-    import collections
+    items); ``bsc_broker_map`` maps that BSC to its broker IP. EVERY ``AbisIp``
+    MO's ``bscBrokerIpAddress`` (from the dump) is compared to that expected IP —
+    ONE ROW PER AbisIp, keyed by its ``GsmSector`` (unique) — catching any single
+    sector wired to the WRONG BSC's broker (the ping still succeeds, so it is
+    otherwise invisible). The actual IP is annotated with the BSC it points at."""
     # node → expected BSC name (from the CDD BSC column), first non-empty wins.
     bsc_by_node: Dict[str, str] = {}
     for it in broker_items:
@@ -494,44 +528,42 @@ def broker_check(broker_items: List[AuditItem],
         if node and bsc:
             bsc_by_node.setdefault(node, bsc)
 
-    # node → set of actual broker IPs found on its AbisIp MOs.
-    actual_by_node = collections.defaultdict(set)
+    # reverse map: broker IP → BSC name, so a wrong actual IP names its real BSC.
+    ip_to_bsc = {str(v).strip(): k for k, v in (bsc_broker_map or {}).items()}
+
+    out: List[AuditResult] = []
     for ldn, attrs in records.items():
         if ldn.split(",")[-1].split("=", 1)[0] != "AbisIp":
             continue
         m = re.search(r"ManagedElement=([^,]+)", ldn)
         node = m.group(1) if m else ""
+        bsc = bsc_by_node.get(node)
+        if not bsc:
+            continue          # node not in the CDD BSC map — nothing to expect
+        sec = re.search(r"GsmSector=([^,]+)", ldn)
+        sector = sec.group(1) if sec else "?"
+        sname = (attrs.get("gsmSectorName") or "").strip()
         ip = (attrs.get("bscBrokerIpAddress") or "").strip()
-        if node and ip:
-            actual_by_node[node].add(ip)
-
-    # reverse map: broker IP → BSC name, so a wrong actual IP names its real BSC.
-    ip_to_bsc = {str(v).strip(): k for k, v in (bsc_broker_map or {}).items()}
-
-    def _annot(ip: str) -> str:
-        b = ip_to_bsc.get(ip)
-        return f"{ip} ({b})" if b else ip
-
-    out: List[AuditResult] = []
-    for node, bsc in sorted(bsc_by_node.items()):
         expected_ip = (bsc_broker_map or {}).get(bsc)
-        actuals = sorted(actual_by_node.get(node, set()))
-        actual_str = ", ".join(_annot(a) for a in actuals)
+        ref = f"GsmSector={sector}" + (f" ({sname})" if sname else "")
         if expected_ip is None:
             status = "NotFound"
             expected_disp = f"{bsc} (not in bsc_broker_map)"
+            actual_disp = ip or "(none)"
         else:
             expected_disp = f"{expected_ip} ({bsc})"
-            if not actuals:
+            b = ip_to_bsc.get(ip)
+            actual_disp = (f"{ip} ({b})" if b else ip) or "(none)"
+            if not ip:
                 status = "NotFound"
-            elif len(actuals) == 1 and actuals[0] == str(expected_ip).strip():
+            elif ip == str(expected_ip).strip():
                 status = "Match"
             else:
                 status = "Mismatch"
         out.append(AuditResult(
             "ip-broker", node, "AbisIp", "bscBrokerIpAddress",
-            expected_disp, actual_str or "(none)", status,
-            "config.json bsc_broker_map", node, ref_cell=f"BSC {bsc}"))
+            expected_disp, actual_disp, status,
+            "config.json bsc_broker_map", node, ref_cell=ref))
     return out
 
 
@@ -1051,6 +1083,59 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
         ws.column_dimensions[col].width = wdt
 
 
+def _write_ess_sheet(ws, ess_rows: list) -> None:
+    """ESS (LTE/NR spectrum sharing) pairing on its own sheet — one row per
+    CDD ESS pair, showing existence, essScLocalId/essScPairId on the LTE
+    SectorCarrier and NR NRSectorCarrier (vs the CDD), and essEnabled on both
+    relations. Green/red status like Detail; the specific failing cell is
+    yellow-highlighted."""
+    headers = ["Node", "LTE Cell", "NR Cell", "LTE Exists", "NR Exists",
+               "essScLocalId (CDD)", "essScLocalId (SC)", "essScLocalId (NRSC)",
+               "essScPairId (CDD)", "essScPairId (SC)", "essScPairId (NRSC)",
+               "essEnabled LTE", "essEnabled NR", "Status"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.fill = _FILL_HEADER
+        c.font = _HEADER_FONT
+        c.alignment = _CENTER
+        c.border = _BORDER
+    status_col = len(headers)
+    for r in ess_rows:
+        ws.append([
+            r.node, r.lte_cell, r.nr_cell,
+            "Yes" if r.lte_exists else "No",
+            "Yes" if r.nr_exists else "No",
+            r.ess_local, r.sc_local, r.nrsc_local,
+            r.ess_pair, r.sc_pair, r.nrsc_pair,
+            r.ess_lte, r.ess_nr, r.status])
+        row = ws.max_row
+        fill = _STATUS_FILL.get(r.status)
+        if fill:
+            ws.cell(row=row, column=status_col).fill = fill
+        # Yellow-flag the specific failing check(s).
+        if not r.lte_exists:
+            ws.cell(row, 4).fill = _FILL_NOTFOUND
+        if not r.nr_exists:
+            ws.cell(row, 5).fill = _FILL_NOTFOUND
+        if not (r.sc_local == r.ess_local == r.nrsc_local):
+            for c in (7, 8):
+                ws.cell(row, c).fill = _FILL_NOTFOUND
+        if not (r.sc_pair == r.ess_pair == r.nrsc_pair):
+            for c in (10, 11):
+                ws.cell(row, c).fill = _FILL_NOTFOUND
+        if r.ess_lte != "true":
+            ws.cell(row, 12).fill = _FILL_NOTFOUND
+        if r.ess_nr != "true":
+            ws.cell(row, 13).fill = _FILL_NOTFOUND
+        for c in range(1, len(headers) + 1):
+            ws.cell(row, c).border = _BORDER
+    ws.freeze_panes = "A2"
+    widths = {"A": 30, "B": 16, "C": 16, "D": 9, "E": 9, "F": 15, "G": 14,
+              "H": 16, "I": 16, "J": 16, "K": 16, "L": 12, "M": 12, "N": 10}
+    for col, wdt in widths.items():
+        ws.column_dimensions[col].width = wdt
+
+
 _FILL_MISSING = PatternFill("solid", fgColor="FFC7CE")     # red-ish (missing)
 _FILL_EXTRA2 = PatternFill("solid", fgColor="BDD7EE")      # blue (extra)
 
@@ -1082,7 +1167,8 @@ def _write_cell_inventory_sheet(ws, rows: List["CellInvRow"]) -> None:
 
 def write_excel(results: List[AuditResult], out_path: str, meta: dict,
                 lld_results: Optional[List["LldResult"]] = None,
-                cell_rows: Optional[List["CellInvRow"]] = None) -> str:
+                cell_rows: Optional[List["CellInvRow"]] = None,
+                ess_rows: Optional[list] = None) -> str:
     wb = Workbook()
 
     # Summary sheet
@@ -1126,6 +1212,10 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
     if cell_rows:
         _write_cell_inventory_sheet(wb.create_sheet("Cell Inventory"), cell_rows)
 
+    # ESS sheet — LTE/NR spectrum-sharing pairing.
+    if ess_rows:
+        _write_ess_sheet(wb.create_sheet("ESS"), ess_rows)
+
     wb.save(out_path)
     return out_path
 
@@ -1156,7 +1246,7 @@ def _banner(name: str) -> str:
 # single settable MO attribute — they have no valid ``set`` target, so every
 # script generator skips them (a "GsmSector [BULUAN]" MO or "10.x (BSC)" value
 # would only produce a broken set line).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker"}
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker", "ess"}
 
 
 def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
@@ -1179,6 +1269,8 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             continue
         if r.category in _NON_SETTABLE_CATEGORIES:
             continue
+        if r.parameter.startswith("__"):
+            continue          # synthetic (e.g. __count__) — not a settable attr
         # cmedit-sourced params (BSC GeranCell) can't be set via moshell — they
         # only go into the cmedit/cmbulk scripts, never the runnable .mos.
         if r.from_cmedit:
@@ -1248,6 +1340,8 @@ def _collect_set_rows(results: List[AuditResult], statuses, site: str):
             continue
         if r.category in _NON_SETTABLE_CATEGORIES:
             continue
+        if r.parameter.startswith("__"):
+            continue          # synthetic (e.g. __count__) — not a settable attr
         node = r.node or r.key or site
         sig = (node, r.mo, r.parameter)
         if sig in seen:

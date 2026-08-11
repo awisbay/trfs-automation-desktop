@@ -61,6 +61,10 @@ class AuditPage:
         self.nr_field = self._tf("NR CDD file", st.get("nr", ""), expand=3)
         self.gsm_field = self._tf(
             "GSM CDD file (audited live via cmedit)", st.get("gsm", ""), expand=3)
+        self.gsm_log_field = self._tf(
+            "GSM cmedit log (txt) — optional; offline GeranCell audit. Blank = "
+            "live via SSH. Use 'GSM Log Script' to collect it.",
+            st.get("gsm_log", ""), expand=3)
         self.lld_field = self._tf(
             "LLD file — optional; baseband type + RiLink/CPRI port allocation",
             st.get("lld", ""), expand=3)
@@ -148,6 +152,8 @@ class AuditPage:
                     browse_row(self.lte_field, self._browse_lte, "LTE CDD"),
                     browse_row(self.nr_field, self._browse_nr, "NR CDD"),
                     browse_row(self.gsm_field, self._browse_gsm, "GSM CDD"),
+                    browse_row(self.gsm_log_field, self._browse_gsm_log,
+                               "GSM Log"),
                     browse_row(self.lld_field, self._browse_lld, "LLD"),
                     browse_row(self.dump_field, self._browse_dump, "Dump(s)"),
                     ft.Divider(height=1, color=BORDER),
@@ -193,6 +199,7 @@ class AuditPage:
                 "lte": self.lte_field.value,
                 "nr": self.nr_field.value,
                 "gsm": self.gsm_field.value,
+                "gsm_log": self.gsm_log_field.value,
                 "lld": self.lld_field.value,
                 "dump": self.dump_field.value,
                 "cluster": self.cluster_field.value,
@@ -249,6 +256,16 @@ class AuditPage:
     async def _browse_lld(self, e):
         await self._pick_cdd(self.lld_field, "Select LLD (Tx/CPRI) workbook")
 
+    async def _browse_gsm_log(self, e):
+        files = await self.file_picker.pick_files(
+            dialog_title="Select GSM cmedit log (.txt)",
+            allowed_extensions=["txt", "log"],
+            file_type=ft.FilePickerFileType.CUSTOM, allow_multiple=False)
+        if files:
+            self.gsm_log_field.value = files[0].path
+            self._save_state()
+            self.page.update()
+
     def _on_batch_change(self, e):
         nodes = [n for n in re.split(r"[;\n]+", self.batch_field.value)
                  if n.strip()]
@@ -288,6 +305,7 @@ class AuditPage:
         lte = self.lte_field.value.strip()
         nr = self.nr_field.value.strip()
         gsm = self.gsm_field.value.strip()
+        gsm_log = self.gsm_log_field.value.strip()
         lld = self.lld_field.value.strip()
         dumps = [p.strip() for p in self.dump_field.value.split("|") if p.strip()]
         cluster = self.cluster_field.value.strip()
@@ -313,7 +331,8 @@ class AuditPage:
         self.page.update()
         threading.Thread(
             target=self._worker,
-            args=(site, lte, nr, gsm, dumps, cluster, batch_nodes, lld),
+            args=(site, lte, nr, gsm, dumps, cluster, batch_nodes, lld,
+                  gsm_log),
             daemon=True).start()
 
     # ── Elapsed timer ────────────────────────────────────────────
@@ -363,7 +382,7 @@ class AuditPage:
         self.page.update()
 
     def _worker(self, site, lte, nr, gsm, dumps=None, cluster="", batch_nodes=None,
-                lld=""):
+                lld="", gsm_log=""):
         ssh = None
         dumps = dumps or []
         batch_nodes = batch_nodes or []
@@ -491,9 +510,33 @@ class AuditPage:
             # ── 2. GSM: live cmedit (BSC), SSH creds from main form ──
             gsm_cmedit = [p for p in audit_map.get("profiles", [])
                           if p.get("tech") == "gsm" and p.get("source") == "cmedit"]
+
+            # 2a. OFFLINE: a GSM cmedit log (from tools/gsm_cmedit_dump.py) was
+            # uploaded → parse it INSTEAD of any live SSH cmedit. Site-boundary
+            # filtering is applied for a single site; for batch we trust the log.
+            gsm_from_log = False
+            if gsm and gsm_cmedit and gsm_log:
+                if os.path.isfile(gsm_log):
+                    self._log(f"GSM cmedit OFFLINE log: {os.path.basename(gsm_log)}")
+                    try:
+                        with open(gsm_log, "r", encoding="utf-8",
+                                  errors="replace") as fh:
+                            text = fh.read()
+                        recs = cmedit_source.parse_cmedit_log(
+                            text, gsm_cmedit,
+                            site_id=("" if is_batch else site), log=self._log)
+                        records.update(recs)
+                        gsm_from_log = True
+                        self._log(f"  → {len(recs)} GSM MO(s) from log; live "
+                                  "cmedit skipped.")
+                    except Exception as exc:
+                        self._log(f"  ✗ GSM log parse failed: {exc}")
+                else:
+                    self._log(f"⚠ GSM log not found: {gsm_log}")
+
             # Batch: derive Site IDs from the node list (part before '_',
             # de-duplicated), then fetch GSM per site — reusing the batch SSH.
-            if gsm and is_batch and gsm_cmedit and ssh is not None:
+            if gsm and is_batch and gsm_cmedit and ssh is not None and not gsm_from_log:
                 sites = sorted({n.split("_")[0].strip()
                                 for n in batch_nodes if n.strip()})
                 self._log(f"GSM batch: {len(sites)} site(s) from node list → "
@@ -506,7 +549,7 @@ class AuditPage:
                         records.update(recs)
                     except Exception as exc:
                         self._log(f"  ✗ GSM cmedit {s}: {exc}")
-            if gsm and not is_batch:
+            if gsm and not is_batch and not gsm_from_log:
                 gsm_cmedit = [p for p in audit_map.get("profiles", [])
                               if p.get("tech") == "gsm" and p.get("source") == "cmedit"]
                 host = self._form.get("host", "")
@@ -581,14 +624,13 @@ class AuditPage:
                 audit_core.aggregate_trx(records)
             except Exception as exc:
                 self._log(f"trx aggregation failed: {exc}")
-            # TRX COUNT rows use a per-sector aggregate compare, not the normal
-            # per-attribute one — pull them out and audit them separately.
-            trx_items = [it for it in items if it.parameter == "__trxcount__"]
+            # TRX count is now a plain per-sector column: CDD "No of UL TRX" vs
+            # ``__count__`` (the number of Trx aggregate_trx folded onto each
+            # GsmSector) — handled by the normal compare below.
             # IP-broker rows: expected value comes from config.json (broker IP
             # for the CDD's BSC), not a CDD column — audited by broker_check.
             broker_items = [it for it in items if it.parameter == "__bscbroker__"]
-            items = [it for it in items
-                     if it.parameter not in ("__trxcount__", "__bscbroker__")]
+            items = [it for it in items if it.parameter != "__bscbroker__"]
             # BSC sources for GSM (GeranCell) cmedit/cmbulk FDN generation:
             #   primary  → real BSC per cell from the live cmedit source,
             #   fallback → the CDD BSC column (most common), then the form field.
@@ -600,15 +642,6 @@ class AuditPage:
                                if (it.expected or "").strip())
             self._cdd_bsc = cdd_bscs.most_common(1)[0][0] if cdd_bscs else ""
             results = audit_core.compare(items, records)
-            try:
-                tc = audit_core.trx_count_check(trx_items, records)
-                if tc:
-                    results += tc
-                    tcc = Counter(r.status for r in tc)
-                    self._log(f"TRX count: {tcc.get('Match',0)} sector(s) match, "
-                              f"{tcc.get('Mismatch',0)} mismatch.")
-            except Exception as exc:
-                self._log(f"trx count check failed: {exc}")
             try:
                 if broker_items:
                     try:
@@ -692,6 +725,42 @@ class AuditPage:
                 else:
                     self._log(f"⚠ LLD file not found: {lld}")
 
+            # ESS (LTE/NR spectrum sharing) — pairs from the LTE CDD's ESS sheet
+            # vs the node dump. Own 'ESS' sheet in the report.
+            ess_rows = []
+            if lte and os.path.isfile(lte):
+                try:
+                    from audit import ess_audit
+                    for node in nodes:
+                        pairs = ess_audit.read_ess_pairs(lte, node, log=self._log)
+                        if pairs:
+                            ess_rows += ess_audit.audit_ess(
+                                pairs, records, log=self._log)
+                            # SharingGroup count must equal the ESS pair count
+                            # (one SpectrumSharingFunction SharingGroup per cell).
+                            sg = ess_audit.count_sharing_groups(records, node)
+                            if sg == len(pairs):
+                                sg_status, sg_actual = "Match", str(sg)
+                            elif sg == 0:
+                                # Some dumps (modump) omit the SpectrumSharingFunction
+                                # MO branch entirely — flag as NotFound, not a
+                                # false Mismatch.
+                                sg_status = "NotFound"
+                                sg_actual = "0 (SpectrumSharingFunction not in dump)"
+                            else:
+                                sg_status, sg_actual = "Mismatch", str(sg)
+                            results.append(audit_core.AuditResult(
+                                "ess", node, "SpectrumSharingFunction=1",
+                                "SharingGroup count", str(len(pairs)), sg_actual,
+                                sg_status, "ESS pairs vs node SharingGroup", node))
+                    if ess_rows:
+                        ec = Counter(x.status for x in ess_rows)
+                        self._log(f"ESS: {ec.get('Match',0)} match, "
+                                  f"{ec.get('Mismatch',0)} mismatch "
+                                  f"({len(ess_rows)} pair(s)).")
+                except Exception as exc:
+                    self._log(f"  ✗ ESS audit failed: {exc}")
+
             c = Counter(r.status for r in results)
             self._log(f"Result: Match={c['Match']} Mismatch={c['Mismatch']} "
                       f"ParamNotFound={c['NotFound']} MO_NotFound={c['MO_NotFound']}")
@@ -710,7 +779,8 @@ class AuditPage:
                 "LLD": os.path.basename(lld) if lld else "-",
                 "Mode": "Batch / Cluster" if is_batch else "Single site",
                 "Generated": ts,
-            }, lld_results=lld_results, cell_rows=cell_rows)
+            }, lld_results=lld_results, cell_rows=cell_rows,
+                ess_rows=ess_rows)
             self._result_path = out
             self._results = results
             self._gen_ctx = {"site": label, "out_dir": out_dir, "xlsx": out}

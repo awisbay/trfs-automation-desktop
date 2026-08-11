@@ -90,6 +90,11 @@ def _norm(s) -> str:
     return str(s).strip().lower() if s is not None else ""
 
 
+def _hnorm(s) -> str:
+    """Whitespace-normalized header: nbsp → space, collapse runs, strip."""
+    return re.sub(r"\s+", " ", str(s).replace("\xa0", " ")).strip()
+
+
 def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
                      audit_map: dict, log=lambda m: None) -> List[AuditItem]:
     """Read all profiles whose tech has a CDD file provided → AuditItems for
@@ -143,6 +148,12 @@ def _get_sheet(path, sheet, header_row, sheet_cache, wbcache):
         name = str(h).strip() if h is not None else ""
         if name and name not in col_idx:
             col_idx[name] = i
+        # Also index a whitespace-normalized alias (collapse double spaces,
+        # nbsp → space) so a CDD header like "No of  UL TRX" still matches the
+        # map's "No of UL TRX".
+        norm = _hnorm(name)
+        if norm and norm not in col_idx:
+            col_idx[norm] = i
     sheet_cache[key] = (col_idx, rows[1:])
     return sheet_cache[key]
 
@@ -261,9 +272,12 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
                 rd["_cell"] = cell
             for col in columns:
                 cdd_col = col["cdd"]
-                if cdd_col not in col_idx:
+                ci = col_idx.get(cdd_col)
+                if ci is None:
+                    ci = col_idx.get(_hnorm(cdd_col))
+                if ci is None:
                     continue
-                raw = row[col_idx[cdd_col]] if col_idx[cdd_col] < len(row) else None
+                raw = row[ci] if ci < len(row) else None
                 expected = "" if raw is None else str(raw).strip()
                 if expected == "":
                     continue
@@ -287,6 +301,7 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
                             key=key_val, source=f"{sheet}!{cdd_col}",
                             norm=sp.get("norm", col.get("norm", "")),
                             via_ref=col.get("via_ref", ""),
+                            attr_alt=sp.get("attr_alt", ""),
                             from_cmedit=from_cmedit,
                             node=node_val))
                     continue
@@ -299,6 +314,7 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
                     via_ref=col.get("via_ref", ""),
                     attr_format=col.get("attr_format", ""),
                     attr_fallback=col.get("attr_fallback", ""),
+                    attr_alt=col.get("attr_alt", ""),
                     from_cmedit=from_cmedit,
                     node=node_val))
     return items
