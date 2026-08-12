@@ -24,6 +24,7 @@ report:
 """
 from __future__ import annotations
 
+import collections
 import difflib
 import re
 from typing import Dict, List
@@ -107,6 +108,14 @@ def _index_node_rilinks(records: Dict[str, Dict[str, str]], node: str):
 
 
 _BAND_RE = re.compile(r"B\d+[A-Z0-9]*", re.IGNORECASE)
+
+
+def _canon_band(s: str) -> str:
+    """Canonical band key from a radio type / FRU name — the ``B<digits>``
+    tokens joined, so ``Radio 4499 B0AB28`` and node FRU ``B0B28_RRU1_L`` both
+    reduce to ``B0B28`` (and ``AIR 3229 B41B78AF`` / ``AAS_B41B78_RRU1`` →
+    ``B41B78``). Distinguishes B41 / B78 / B41B78 cleanly."""
+    return "".join(re.findall(r"B\d+", str(s or "").upper()))
 
 
 def _rru_index(radio_fru: str) -> str:
@@ -302,4 +311,37 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
             hw_type_lld="", hw_type_node=fru,
             data_port_lld="", data_port_node=dport,
             status="Unplanned", source="node RiLink"))
+
+    # RRU count per radio type: the LLD plans N rows of a band; the node must
+    # have N RRUs of that band. Counted per (BBID, band) TOTAL — robust to how
+    # the AAS bands are split/combined (B41/B78 vs B41B78) and to shared-sector
+    # rows (Sector "123"). One summary row per band.
+    lld_cnt: Dict[str, int] = collections.Counter()
+    lld_type: Dict[str, str] = {}
+    for p in planned:
+        cb = _canon_band(p["radio_type"])
+        if not cb:
+            continue
+        lld_cnt[cb] += 1
+        lld_type.setdefault(cb, p["radio_type"])
+    node_cnt: Dict[str, int] = collections.Counter()
+    node_frus: Dict[str, list] = collections.defaultdict(list)
+    for _p, (_rid, fru, _dp) in idx.items():
+        cb = _canon_band(fru)
+        if cb:
+            node_cnt[cb] += 1
+            node_frus[cb].append(fru)
+    for cb in sorted(set(lld_cnt) | set(node_cnt)):
+        exp, act = lld_cnt.get(cb, 0), node_cnt.get(cb, 0)
+        status = ("Match" if exp == act
+                  else "Unplanned" if exp == 0
+                  else "NotFound" if act == 0
+                  else "Mismatch")
+        out.append(LldResult(
+            node=node_name, bbid=bbid, ref_cell=f"count {cb}",
+            hw_type_lld=(f"{exp} x {lld_type.get(cb, cb)}" if exp else ""),
+            hw_type_node=(f"{act} RRU ({', '.join(sorted(node_frus[cb]))})"
+                          if act else ""),
+            status=status, source=f"{sheet}!RRU count",
+            hw_ok=(status == "Match")))
     return out

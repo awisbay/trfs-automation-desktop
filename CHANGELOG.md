@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.11] - 2026-08-12
+
+### Added
+- **LLD RRU-count check per radio type.** For each node the LLD now also verifies
+  the NUMBER of radios of each band: the count of planned CPRI rows of a band
+  (e.g. `Radio 4499 B0AB28`) must equal the number of that band's RRUs on the
+  node. Counted per (BBID, band) TOTAL — robust to shared-sector rows
+  (`Sector=123`) and to AAS band split/combine (`B41`+`B78` vs `B41B78`), which
+  a per-sector count gets wrong. One summary row per band (`count <band>`) in the
+  LLD sheet. Verified: MIN633 (B0B28=4, B1B3=5, B41=1, B41B78=2, B78=1) and
+  MIN1446 all Match.
+
 ## [1.9.10] - 2026-08-12
 
 ### Changed
