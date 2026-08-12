@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.9] - 2026-08-12
+
+### Added
+- **License anti-rollback (system-clock backdate protection).** The app keeps a
+  small HMAC-protected, hostname-bound "last seen" timestamp that only moves
+  forward; if the clock is later found set back (beyond a 1-day grace for
+  TZ/DST jitter) the license is refused with a clear message. Closes the easy
+  expiry bypass of setting the PC date back. Runs once at startup — no
+  measurable performance cost. (A binary-patching attacker remains out of scope
+  for client-side licensing.)
+
 ## [1.9.8] - 2026-08-11
 
 ### Changed

@@ -86,3 +86,4 @@ scratchpad_build.log
 # temp/monitoring artifacts
 scratchpad_monitor.csv
 src/_load_pid.txt
+.ncstate
