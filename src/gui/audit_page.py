@@ -682,7 +682,7 @@ class AuditPage:
                     ic = Counter(r.status for r in cell_rows)
                     self._log(f"Cell inventory: {ic.get('Match',0)} match, "
                               f"{ic.get('Missing',0)} missing, "
-                              f"{ic.get('Extra',0)} extra.")
+                              f"{ic.get('Unplanned',0)} unplanned.")
             except Exception as exc:
                 self._log(f"cell inventory failed: {exc}")
 
@@ -732,7 +732,7 @@ class AuditPage:
                             self._log(f"  ✗ LLD audit {node}: {exc}")
                     lc = Counter(x.status for x in lld_results)
                     self._log(f"LLD: Match={lc['Match']} Mismatch={lc['Mismatch']} "
-                              f"NotFound={lc['NotFound']} Extra={lc['Extra']}")
+                              f"NotFound={lc['NotFound']} Unplanned={lc['Unplanned']}")
                 else:
                     self._log(f"⚠ LLD file not found: {lld}")
 
@@ -825,7 +825,7 @@ class AuditPage:
             self._log(f"✓ Report saved: {out}")
             lc = Counter(x.status for x in lld_results)
             lld_tail = (f" · LLD {lc['Mismatch']} mismatch/"
-                        f"{lc['NotFound']} not-found/{lc['Extra']} extra"
+                        f"{lc['NotFound']} not-found/{lc['Unplanned']} unplanned"
                         if lld_results else "")
             self.status_text.value = (
                 f"Done — {c['Mismatch']} mismatch, "

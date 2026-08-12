@@ -286,5 +286,5 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
             bb_port_lld="", bb_port_node=np,
             hw_type_lld="", hw_type_node=fru,
             data_port_lld="", data_port_node=dport,
-            status="Extra", source="node RiLink"))
+            status="Unplanned", source="node RiLink"))
     return out

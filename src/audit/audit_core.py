@@ -244,7 +244,7 @@ class LldResult:
     hw_type_node: str = ""
     data_port_lld: str = ""    # Radio DATA port — planned vs actual
     data_port_node: str = ""
-    status: str = ""           # Match | Mismatch | NotFound | Extra
+    status: str = ""           # Match | Mismatch | NotFound | Unplanned
     source: str = ""
     # per-metric verdicts (False → that LLD|Node pair differs → highlighted).
     bb_ok: bool = True
@@ -628,7 +628,7 @@ class CellInvRow:
     cell: str                # the cell name
     in_cdd: str              # "Yes" | "No"
     on_node: str             # "Yes" | "No"
-    status: str              # Match | Missing (CDD-only) | Extra (node-only)
+    status: str              # Match | Missing (CDD-only) | Unplanned (node-only)
 
 
 _CANON_CELL = {"eutrancellfdd": "EUtranCellFDD", "eutrancelltdd": "EUtranCellTDD",
@@ -670,7 +670,7 @@ def cell_inventory_rows(items: List[AuditItem],
             in_cdd = cid in cdd[cls]
             on_node = cid in actual.get(cls, set())
             status = ("Match" if in_cdd and on_node
-                      else "Missing" if in_cdd else "Extra")
+                      else "Missing" if in_cdd else "Unplanned")
             rows.append(CellInvRow(
                 name, disp.get((cls, cid), cid),
                 "Yes" if in_cdd else "No",
@@ -833,14 +833,14 @@ def build_reverse_rows(node: str, records: Dict[str, Dict[str, str]],
 _FILL_MISMATCH = PatternFill("solid", fgColor="FFC7CE")   # red
 _FILL_NOTFOUND = PatternFill("solid", fgColor="FFEB9C")   # yellow
 _FILL_MATCH = PatternFill("solid", fgColor="C6EFCE")      # green
-_FILL_EXTRA = PatternFill("solid", fgColor="BDD7EE")      # blue (unplanned)
+_FILL_EXTRA = PatternFill("solid", fgColor="F8CBAD")      # orange (unplanned)
 _FILL_CDDMISSING = PatternFill("solid", fgColor="E2CFF3")  # purple (node-only)
 _FILL_HEADER = PatternFill("solid", fgColor="4472C4")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 
 _STATUS_FILL = {"Mismatch": _FILL_MISMATCH, "NotFound": _FILL_NOTFOUND,
                 "MO_NotFound": _FILL_NOTFOUND, "Match": _FILL_MATCH,
-                "Extra": _FILL_EXTRA, "CDD_missing": _FILL_CDDMISSING}
+                "Unplanned": _FILL_EXTRA, "CDD_missing": _FILL_CDDMISSING}
 
 
 _THIN = Side(style="thin", color="D9D9D9")
@@ -984,7 +984,7 @@ def _write_summary(summ, results, meta, lld_results=None):
 
     # ── LLD (physical baseband / CPRI) block ─────────────────────
     if lld_results:
-        lc = {"Match": 0, "Mismatch": 0, "NotFound": 0, "Extra": 0}
+        lc = {"Match": 0, "Mismatch": 0, "NotFound": 0, "Unplanned": 0}
         for x in lld_results:
             lc[x.status] = lc.get(x.status, 0) + 1
         graded = lc["Match"] + lc["Mismatch"] + lc["NotFound"]
@@ -1000,7 +1000,7 @@ def _write_summary(summ, results, meta, lld_results=None):
             ("✔  Match", lc["Match"], "C6EFCE", "006100", True),
             ("✖  Mismatch", lc["Mismatch"], "FFC7CE", "9C0006", True),
             ("⚠  Not found", lc["NotFound"], "FFEB9C", "9C6500", True),
-            ("➕ Unplanned (node extra)", lc["Extra"], "BDD7EE", "1F3864", False),
+            ("➕ Unplanned (node-only)", lc["Unplanned"], "F8CBAD", "C55A11", False),
         ]
         for label, count, fill, fcol, pct in rows:
             share = f"{count / graded * 100:.1f}%" if (graded and pct) else ""
@@ -1042,7 +1042,7 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
                                      LLD │ Node   LLD │ Node    LLD │ Node
 
     One row per planned link (or the baseband unit). Status colour matches the
-    Detail sheet (green/red/yellow) plus blue for unplanned (Extra) node links.
+    Detail sheet (green/red/yellow) plus orange for unplanned (node-only) links.
     """
     # ── header (rows 1-2) ────────────────────────────────────────
     #  single (2-row-merged) columns, then 3 paired groups, then Status.
@@ -1150,7 +1150,7 @@ def _write_ess_sheet(ws, ess_rows: list) -> None:
 
 
 _FILL_MISSING = PatternFill("solid", fgColor="FFC7CE")     # red-ish (missing)
-_FILL_EXTRA2 = PatternFill("solid", fgColor="BDD7EE")      # blue (extra)
+_FILL_EXTRA2 = PatternFill("solid", fgColor="F8CBAD")      # orange (unplanned)
 
 
 def _write_cell_inventory_sheet(ws, rows: List["CellInvRow"]) -> None:
@@ -1164,7 +1164,8 @@ def _write_cell_inventory_sheet(ws, rows: List["CellInvRow"]) -> None:
         c.font = _HEADER_FONT
         c.alignment = _CENTER
         c.border = _BORDER
-    fill = {"Match": _FILL_MATCH, "Missing": _FILL_MISSING, "Extra": _FILL_EXTRA2}
+    fill = {"Match": _FILL_MATCH, "Missing": _FILL_MISSING,
+            "Unplanned": _FILL_EXTRA2}
     for r in sorted(rows, key=lambda x: (x.mo_class, x.status != "Match", x.cell)):
         ws.append([r.mo_class, r.cell, r.in_cdd, r.on_node, r.status])
         row = ws.max_row
