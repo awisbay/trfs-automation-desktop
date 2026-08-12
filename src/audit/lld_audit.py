@@ -109,6 +109,14 @@ def _index_node_rilinks(records: Dict[str, Dict[str, str]], node: str):
 _BAND_RE = re.compile(r"B\d+[A-Z0-9]*", re.IGNORECASE)
 
 
+def _rru_index(radio_fru: str) -> str:
+    """The RRU/sector number in a radio FRU name — the digits right after
+    ``RRU``: ``AAS_B41_RRU2`` → ``2``, ``B0B28_RRU123_1`` → ``123``. Empty when
+    the name has no ``RRU`` token."""
+    m = re.search(r"RRU(\d+)", radio_fru or "", re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
 def _radio_type_matches(cdd_type: str, radio_fru: str) -> bool:
     """Best-effort radio-type check: compare CDD radio type vs the radio FRU
     name on riPortRef2 via shared band tokens (B41 / B1B3 / B0AB28≈B0B28)."""
@@ -265,8 +273,15 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
         # differing pair is highlighted. A BB port that was matched by radio
         # (e.g. AAS planned P, wired H) counts as a BB-port mismatch.
         bb_ok = _norm(p["port"]) == _norm(node_port)
-        hw_ok = (not p["radio_type"]
-                 or _radio_type_matches(p["radio_type"], radio_fru))
+        # HW check = radio band/type matches AND the radio FRU's RRU index lines
+        # up with the planned Sector (double-check): a shared radio named
+        # ``B0B28_RRU123_1`` on Sector 1 fails because ``123`` ≠ ``1`` — the RRU
+        # should be per-sector (RRU1/RRU2/RRU3).
+        band_ok = (not p["radio_type"]
+                   or _radio_type_matches(p["radio_type"], radio_fru))
+        rru = _rru_index(radio_fru)
+        sector_ok = (not p["sector"]) or (not rru) or (rru == p["sector"])
+        hw_ok = band_ok and sector_ok
         data_ok = (not p["data_port"]
                    or _norm(p["data_port"]) == _norm(radio_port))
         status = "Match" if (bb_ok and hw_ok and data_ok) else "Mismatch"

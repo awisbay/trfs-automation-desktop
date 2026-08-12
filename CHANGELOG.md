@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.10] - 2026-08-12
+
+### Changed
+- **LLD radio check now double-checks the Sector.** The radio HW match no longer
+  passes on band alone — it also requires the radio FRU's RRU index (the digits
+  after `RRU`) to line up with the planned `Sector`. So a shared radio named
+  `B0B28_RRU123_1` on Sector 1 is now a Mismatch (RRU should be per-sector,
+  `RRU1`/`RRU2`/`RRU3`); when the LLD itself plans a shared `Sector=123` and the
+  node matches, it stays Match.
+
 ## [1.9.9] - 2026-08-12
 
 ### Added
