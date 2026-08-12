@@ -107,6 +107,42 @@ def _index_node_rilinks(records: Dict[str, Dict[str, str]], node: str):
     return idx
 
 
+def _node_bb_port_links(records: Dict[str, Dict[str, str]], node: str):
+    """BB RiPort → list of radio FRUs linked there (to spot a BB port carrying
+    more than one RiLink — a duplicate/conflict)."""
+    node_l = _norm(node)
+    d: Dict[str, list] = collections.defaultdict(list)
+    for ldn, a in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] != "RiLink":
+            continue
+        me = re.search(r"ManagedElement=([^,]+)", ldn)
+        if me and _norm(me.group(1)) != node_l:
+            continue
+        _bb_fru, bb_port = _ref_parts(a.get("riPortRef1", ""))
+        radio_fru, _rp = _ref_parts(a.get("riPortRef2", ""))
+        if bb_port:
+            d[bb_port.upper()].append(radio_fru or a.get("riLinkId", ""))
+    return d
+
+
+def _node_sync_ports(records: Dict[str, Dict[str, str]], node: str):
+    """The set of BB RiPorts listed in the node's
+    ``NodeGroupSyncMember.syncRiPortCandidate`` — the BB ports used by
+    shared-between-BB (CPRI-sync) radios."""
+    node_l = _norm(node)
+    ports = set()
+    for ldn, a in records.items():
+        if ldn.split(",")[-1].split("=", 1)[0] != "NodeGroupSyncMember":
+            continue
+        me = re.search(r"ManagedElement=([^,]+)", ldn)
+        if me and _norm(me.group(1)) != node_l:
+            continue
+        for m in re.finditer(r"RiPort=([^,;\s}]+)",
+                             str(a.get("syncRiPortCandidate", ""))):
+            ports.add(m.group(1).upper())
+    return ports
+
+
 _BAND_RE = re.compile(r"B\d+[A-Z0-9]*", re.IGNORECASE)
 
 
@@ -240,6 +276,7 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
             "radio_type": str(cell(row, "Radio Type") or "").strip(),
             "sector": str(cell(row, "Sector") or "").strip(),
             "radio_no": str(cell(row, "Radio Number") or "").strip(),
+            "shared": str(cell(row, "Radio Shared between BB") or "").strip(),
         })
 
     idx = _index_node_rilinks(records, node_name)
@@ -344,4 +381,38 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
                           if act else ""),
             status=status, source=f"{sheet}!RRU count",
             hw_ok=(status == "Match")))
+
+    # Duplicate BB RiPort: a baseband port carrying more than one RiLink is a
+    # wiring conflict (the port-keyed pairing above hides it — the last wins).
+    for port, frus in sorted(_node_bb_port_links(records, node_name).items()):
+        if len(frus) > 1:
+            out.append(LldResult(
+                node=node_name, bbid=bbid, ref_cell=f"BB port {port}",
+                bb_port_lld="1 RiLink", bb_port_node=f"{len(frus)} RiLinks",
+                hw_type_node=", ".join(frus),
+                status="Mismatch", source="duplicate BB RiPort", bb_ok=False))
+
+    # Shared-between-BB radios: every LLD "Radio Shared between BB = Yes" port
+    # must be a NodeGroupSyncMember.syncRiPortCandidate on the node, and nothing
+    # extra. A different set (e.g. planned A,B,C but node has D,E,F) is wrong even
+    # if the count matches.
+    lld_shared = {p["port"].upper() for p in planned
+                  if p.get("shared", "").lower() == "yes" and p["port"]}
+    node_sync = _node_sync_ports(records, node_name)
+    if lld_shared or node_sync:
+        missing = sorted(lld_shared - node_sync)   # planned shared, not synced
+        extra = sorted(node_sync - lld_shared)     # synced, not planned shared
+        ok = not missing and not extra
+        note = []
+        if missing:
+            note.append("missing: " + ",".join(missing))
+        if extra:
+            note.append("extra: " + ",".join(extra))
+        out.append(LldResult(
+            node=node_name, bbid=bbid, ref_cell="shared-radio sync",
+            bb_port_lld=(",".join(sorted(lld_shared)) or "(none)"),
+            bb_port_node=(",".join(sorted(node_sync)) or "(none)"),
+            hw_type_node="; ".join(note),
+            status=("Match" if ok else "Mismatch"),
+            source="NodeGroupSyncMember.syncRiPortCandidate", bb_ok=ok))
     return out

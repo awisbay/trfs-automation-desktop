@@ -4,6 +4,19 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.12] - 2026-08-12
+
+### Added
+- **LLD: duplicate BB RiPort check.** A baseband RiPort carrying more than one
+  RiLink (a wiring conflict the port-keyed pairing otherwise hides) is now
+  flagged as a Mismatch listing the conflicting radios.
+- **LLD: Radio-Shared-between-BB check via `NodeGroupSyncMember`.** Every LLD
+  row with `Radio Shared between BB = Yes` must have its BB RiPort in the node's
+  `NodeGroupSyncMember.syncRiPortCandidate`, and nothing extra. A different port
+  set (e.g. planned A,B,C but the node syncs D,E,F) is a Mismatch even when the
+  count matches — the row lists the missing/extra ports. Verified on MIN633
+  (A,B,C,D,G,H,J,K,L match).
+
 ## [1.9.11] - 2026-08-12
 
 ### Added
