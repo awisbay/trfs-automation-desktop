@@ -4,6 +4,15 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.7] - 2026-08-11
+
+### Fixed
+- **GSM-only offline audit is valid without any dump.** When there is no dump,
+  no GSM cmedit log and no ENM login, the audit no longer fails with "No node
+  data" as long as a Site ID and a CDD are given — it proceeds and reports the
+  CDD params as NotFound for the site (same as a live audit that finds no cell).
+  Source priority is unchanged: uploaded log → live (ENM login) → skip/NotFound.
+
 ## [1.9.6] - 2026-08-11
 
 ### Fixed

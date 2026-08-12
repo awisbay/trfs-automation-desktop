@@ -579,8 +579,19 @@ class AuditPage:
                               "GSM (cmedit) audit skipped.")
 
             if not records:
-                self._fail("No node data (no dumps found and no GSM cmedit).")
-                return
+                # No live/dump data at all. Still proceed as long as there is a
+                # Site ID + a CDD to read — an offline GSM-only plan (no dump, no
+                # GSM log, no ENM login) is valid: its params simply read
+                # NotFound against the empty node, exactly like a live audit that
+                # finds no cell.
+                if not (site and cdd_paths):
+                    self._fail("No node data — provide a dump, a GSM log / ENM "
+                               "login, or a Site ID with a CDD.")
+                    return
+                self._log("No dump / live data — CDD params will be reported as "
+                          "NotFound for the Site ID.")
+                if not nodes and site:
+                    nodes = [site]
             if not nodes:
                 # last resort: derive nodes from record LDNs
                 seen = set()
