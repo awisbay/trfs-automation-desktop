@@ -4,6 +4,15 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.13] - 2026-08-17
+
+### Fixed
+- **Audit detail: friendly TRX label.** The GSM TRX-count row showed the internal
+  attribute name `__count__` in the Parameter column, so searching the report for
+  "TRX" found nothing even though the value was audited and matched. Synthetic
+  attributes now display the CDD column name instead (e.g. `__count__` →
+  "No of UL TRX").
+
 ## [1.9.12] - 2026-08-12
 
 ### Added

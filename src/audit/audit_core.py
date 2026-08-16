@@ -1201,7 +1201,13 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
         c.font = _HEADER_FONT
     status_col = 8   # 1-based index of the Status column
     for r in results:
-        ws.append([r.category, (r.node or r.key), r.ref_cell, r.mo, r.parameter,
+        # Synthetic attrs (e.g. ``__count__`` for the TRX count) are cryptic in
+        # the Parameter column — show the friendly CDD column from the source
+        # ("GSM!No of UL TRX" → "No of UL TRX") instead.
+        param = r.parameter
+        if param.startswith("__") and "!" in (r.source or ""):
+            param = r.source.split("!", 1)[1]
+        ws.append([r.category, (r.node or r.key), r.ref_cell, r.mo, param,
                    r.expected, r.actual, r.status, r.source])
         row = ws.max_row
         fill = _STATUS_FILL.get(r.status)
