@@ -46,9 +46,20 @@ def _parse_cell(cell: str):
 
 
 def _parse_ret(ul: str):
-    """``GFATIMLY-1_R1`` → (alpha-prefix 'GFATIMLY', sector '1')."""
-    m = re.match(r"^([A-Za-z]+)-(\d+)", ul or "")
-    return (m.group(1).upper(), m.group(2)) if m else None
+    """``GFATIMLY-1_R1`` → (prefix 'GFATIMLY', sector '1').
+
+    The prefix is everything before the ``-<sector>`` separator and MAY contain
+    digits — some site names embed one (e.g. ``TCAICZ1BULAGENSANSCOTFW-1_Y1``,
+    site ``…Z1…``). Splitting on the first dash (rather than an all-alpha regex)
+    keeps those sites matchable; the sector is the leading digits after it."""
+    ul = (ul or "").strip()
+    if "-" not in ul:
+        return None
+    left, right = ul.split("-", 1)
+    ms = re.match(r"(\d+)", right)
+    if not left or not ms:
+        return None
+    return left.upper(), ms.group(1)
 
 
 def _tilt_deg(raw) -> str:

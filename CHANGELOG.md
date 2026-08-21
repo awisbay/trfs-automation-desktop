@@ -4,6 +4,15 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.14] - 2026-08-21
+
+### Fixed
+- **ElecTilt: RET match failed on sites with a digit in the name.** The RET
+  `userLabel` parser required the prefix before `-<sector>` to be all letters,
+  so a site whose name embeds a digit (e.g. `Z1BULAGENSANSCOT`) never matched
+  any RET and every `electricalAntennaTilt` row came back NotFound. The prefix
+  now allows digits (split on the sector dash instead of an all-alpha regex).
+
 ## [1.9.13] - 2026-08-17
 
 ### Fixed
