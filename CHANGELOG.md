@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.15] - 2026-08-21
+
+### Fixed
+- **ElecTilt: RET userLabel parser hardened against fleet-wide label shapes.**
+  Studied ~13k live RET `userLabel`s and broadened the parser to also match a
+  branch letter before the sector (`…FWX-L1_Y2`, `…-R1ABCD_R2/R4` = left/right/
+  combined antenna branch) and to strip stray leading export junk (`$`/`;`).
+  Coverage of real (non-`N/A`) labels rose to 96.5%; the remainder are
+  genuinely un-sectorable placeholders (`N/A_*`, `null`, `R1_LG900_LNR700`).
+
 ## [1.9.14] - 2026-08-21
 
 ### Fixed

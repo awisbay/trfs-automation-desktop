@@ -48,15 +48,23 @@ def _parse_cell(cell: str):
 def _parse_ret(ul: str):
     """``GFATIMLY-1_R1`` → (prefix 'GFATIMLY', sector '1').
 
-    The prefix is everything before the ``-<sector>`` separator and MAY contain
-    digits — some site names embed one (e.g. ``TCAICZ1BULAGENSANSCOTFW-1_Y1``,
-    site ``…Z1…``). Splitting on the first dash (rather than an all-alpha regex)
-    keeps those sites matchable; the sector is the leading digits after it."""
-    ul = (ul or "").strip()
+    Observed RET userLabel shapes across the fleet (~13k real labels):
+      * ``GFATIMLY-1_R1``            — prefix, sector, port
+      * ``TCAICZ1BULAGENSANSCOTFW-1_Y1`` — site name embeds a digit (``…Z1…``)
+      * ``ASUNSIFWX-L1_Y2`` / ``…-R1ABCD_R2/R4`` — a branch letter (L/R/C =
+        left/right/combined antenna branch) precedes the sector digit
+      * ``$TCFGAPOBALABELSARFWX-1_Y1`` — a stray leading ``$``/``;`` from export
+
+    So: strip any leading non-alphanumeric junk, split on the FIRST dash (the
+    prefix may contain digits), then read the sector as the first run of digits
+    after the dash, skipping an optional leading branch letter. Labels with no
+    dash or no sector digit (``N/A_Y2``, ``null``, ``R1_LG900_LNR700``) are
+    genuinely un-sectorable and return None (→ NotFound)."""
+    ul = re.sub(r"^[^A-Za-z0-9]+", "", (ul or "").strip())
     if "-" not in ul:
         return None
     left, right = ul.split("-", 1)
-    ms = re.match(r"(\d+)", right)
+    ms = re.match(r"[A-Za-z]*(\d+)", right)
     if not left or not ms:
         return None
     return left.upper(), ms.group(1)
