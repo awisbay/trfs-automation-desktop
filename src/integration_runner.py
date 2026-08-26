@@ -77,7 +77,7 @@ def get_config() -> dict:
 # we treat it as relative to ``scripts_path`` (the legacy behaviour).
 # Old config.json files with bare names like ``"ES/create_arne.py"``
 # keep working, but the recommended form is the explicit full path.
-SCRIPTS_PATH = _CFG.get("scripts_path", "/home/shared/ESETARI/INOC/SCRIPTS")
+SCRIPTS_PATH = _CFG.get("scripts_path", "/home/shared/ms260229/INOC/SCRIPTS")
 
 
 def _resolve_script_path(value: str) -> str:
@@ -91,31 +91,31 @@ def _resolve_script_path(value: str) -> str:
 
 
 CLI_PY = _resolve_script_path(
-    _CFG.get("cli_py", "/home/shared/ESETARI/INOC/SCRIPTS/cli.py")
+    _CFG.get("cli_py", "/home/shared/ms260229/INOC/SCRIPTS/cli.py")
 )
 
 # Enrollment / ARNE scripts
 _CREATE_ARNE = _resolve_script_path(
     _CFG.get("create_arne_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/ES/create_arne_2.py")
+             "/home/shared/ms260229/INOC/SCRIPTS/ES/create_arne_2.py")
 )
 _ENTITY_MAKER = _resolve_script_path(
     _CFG.get("entity_maker_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/ES/entity_maker.sh")
+             "/home/shared/ms260229/INOC/SCRIPTS/ES/entity_maker.sh")
 )
 _EXE_ENTITY = _resolve_script_path(
     _CFG.get("exe_entity_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/ES/exe_entity.py")
+             "/home/shared/ms260229/INOC/SCRIPTS/ES/exe_entity.py")
 )
 _ENROLLMENT_MOS = _resolve_script_path(
     _CFG.get("enrollment_mos",
-             "/home/shared/ESETARI/INOC/SCRIPTS/ES/enroll/lhgenm1.mos")
+             "/home/shared/ms260229/INOC/SCRIPTS/ES/enroll/lhgenm1.mos")
 )
 
 # SGW reachability check
 _SGW_CHECK_MOS = _resolve_script_path(
     _CFG.get("sgw_check_mos",
-             "/home/shared/ESETARI/INOC/SCRIPTS/SGW_Check.mos")
+             "/home/shared/ms260229/INOC/SCRIPTS/SGW_Check.mos")
 )
 
 # New comprehensive ping tests. Two distinct scripts now:
@@ -127,7 +127,7 @@ _SGW_CHECK_MOS = _resolve_script_path(
 # reflects the combined outcome.
 _PING_TEST_LTE_NR = _resolve_script_path(
     _CFG.get("ping_test_lte_nr",
-             "/home/shared/ESETARI/INOC/SCRIPTS/DM/ping.txt")
+             "/home/shared/ms260229/INOC/SCRIPTS/DM/ping.txt")
 )
 _PING_TEST_GSM = _resolve_script_path(
     _CFG.get("ping_test_gsm",
@@ -138,15 +138,15 @@ _PING_TEST_GSM = _resolve_script_path(
 # LKF management scripts (typically at SCRIPTS_PATH root)
 _LKF_IMPORT = _resolve_script_path(
     _CFG.get("lkf_import_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/lkfimport.py")
+             "/home/shared/ms260229/INOC/SCRIPTS/lkfimport.py")
 )
 _LKF_INSTALL = _resolve_script_path(
     _CFG.get("lkf_install_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/lkfinstall.py")
+             "/home/shared/ms260229/INOC/SCRIPTS/lkfinstall.py")
 )
 _LKF_STATUS = _resolve_script_path(
     _CFG.get("lkf_status_script",
-             "/home/shared/ESETARI/INOC/SCRIPTS/lkfstatus.py")
+             "/home/shared/ms260229/INOC/SCRIPTS/lkfstatus.py")
 )
 
 # Where ENM's SMRS service stores per-node license files. Configurable
@@ -3839,7 +3839,7 @@ def run_sgw_check(
     """Transport reachability check.
 
     Scripts:
-      * LTE/NR — ``/home/shared/ESETARI/INOC/SCRIPTS/DM/ping.txt``
+      * LTE/NR — ``/home/shared/ms260229/INOC/SCRIPTS/DM/ping.txt``
         (backhaul + MME + SGW for both LTE and NR routers).
       * GSM    — ``/home/shared/common/INTEGRATION_TEAM/script/
         Ping_Test_BSC_brokerIP.txt`` (BSC broker IP reachability).

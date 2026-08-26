@@ -4,6 +4,13 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.16] - 2026-08-26
+
+### Changed
+- **Script base path `ESETARI` → `ms260229`.** Updated the ENM shared-scripts
+  location in `config.json` and the hardcoded fallbacks in `integration_runner.py`
+  (cli.py, create_arne, entity_maker, exe_entity, enrollment, LKF, SGW check).
+
 ## [1.9.15] - 2026-08-21
 
 ### Fixed
