@@ -35,10 +35,17 @@ class EssResult:
     nr_cell: str
     lte_exists: bool
     nr_exists: bool
-    ess_local: str          # expected essScLocalId (from CDD)
+    # essScLocalId equals the cell's own local id: on the LTE side it is the
+    # EUtranCell cellId, on the NR side the NRCell cellLocalId — so the two
+    # sides carry DIFFERENT expected values (e.g. LTE 171 vs NR 501). It is
+    # checked THREE ways: CDD == node cellId/cellLocalId == node essScLocalId.
+    lte_local_exp: str      # expected LTE essScLocalId = LTE cellId (from CDD)
+    lte_cellid: str         # EUtranCell.cellId on the node
     sc_local: str           # SectorCarrier essScLocalId (node)
+    nr_local_exp: str       # expected NR essScLocalId = NR cellLocalId (from CDD)
+    nr_localid: str         # NRCell.cellLocalId on the node
     nrsc_local: str         # NRSectorCarrier essScLocalId (node)
-    ess_pair: str           # expected essScPairId (from CDD)
+    ess_pair: str           # expected essScPairId (from CDD, same both sides)
     sc_pair: str            # SectorCarrier essScPairId (node)
     nrsc_pair: str          # NRSectorCarrier essScPairId (node)
     ess_lte: str            # essEnabled on the LTE GUtranCellRelation
@@ -134,8 +141,10 @@ def audit_ess(pairs: List[dict], records: Dict[str, Dict[str, str]],
     """Audit the ESS pairs against the node dump records."""
     if not pairs:
         return []
-    # Existing cells on the node.
+    # Existing cells on the node, plus each cell's own local id.
     lte_cells, nr_cells = set(), set()
+    lte_cellid: Dict[str, str] = {}   # LTE cell → EUtranCell.cellId
+    nr_localid: Dict[str, str] = {}   # NR cell  → NRCell.cellLocalId
     # essScLocalId → essScPairId, per carrier type (non-zero only).
     sc_pair_by_local: Dict[str, str] = {}
     nrsc_pair_by_local: Dict[str, str] = {}
@@ -147,9 +156,15 @@ def audit_ess(pairs: List[dict], records: Dict[str, Dict[str, str]],
         m = _LTE_CELL.search(ldn)
         if m:
             lte_cells.add(m.group(1))
+            cid = _norm(a.get("cellId"))
+            if cid:
+                lte_cellid[m.group(1)] = cid
         m = _NR_CELL.search(ldn)
         if m:
             nr_cells.add(m.group(1))
+            cid = _norm(a.get("cellLocalId"))
+            if cid:
+                nr_localid[m.group(1)] = cid
         leaf = ldn.split(",")[-1].split("=", 1)[0]
         if leaf == "SectorCarrier":
             sl = _norm(a.get("essScLocalId"))
@@ -177,24 +192,36 @@ def audit_ess(pairs: List[dict], records: Dict[str, Dict[str, str]],
     out: List[EssResult] = []
     for p in pairs:
         lte_cell, nr_cell = p["lte_cell"], p["nr_cell"]
-        ess_local, ess_pair = p["ess_local"], p["ess_pair"]
+        ess_pair = p["ess_pair"]
+        # Expected per-side local id = the cell's own local id from the CDD.
+        lte_local_exp = p["lte_local"]     # LTE cellId
+        nr_local_exp = p["nr_local"]       # NR cellLocalId
         lte_exists = lte_cell in lte_cells
         nr_exists = nr_cell in nr_cells
-        sc_pair = sc_pair_by_local.get(ess_local, "")
-        nrsc_pair = nrsc_pair_by_local.get(ess_local, "")
-        sc_local = ess_local if ess_local in sc_pair_by_local else ""
-        nrsc_local = ess_local if ess_local in nrsc_pair_by_local else ""
+        # The LTE SectorCarrier's essScLocalId must equal the LTE cellId; the NR
+        # NRSectorCarrier's must equal the NR cellLocalId. Look each side up by
+        # its OWN expected id.
+        sc_local = lte_local_exp if lte_local_exp in sc_pair_by_local else ""
+        nrsc_local = nr_local_exp if nr_local_exp in nrsc_pair_by_local else ""
+        sc_pair = sc_pair_by_local.get(lte_local_exp, "")
+        nrsc_pair = nrsc_pair_by_local.get(nr_local_exp, "")
+        # The node's own cell local id — the third leg of the check.
+        node_lte_id = lte_cellid.get(lte_cell, "")
+        node_nr_id = nr_localid.get(nr_cell, "")
         e_lte = ess_lte.get((lte_cell, p["gnb_id"], p["nr_local"]), "")
         e_nr = ess_nr.get((nr_cell, lte_cell), "")
 
+        # Three-way: CDD expected == node cellId/cellLocalId == node essScLocalId.
         ok = (lte_exists and nr_exists
-              and sc_local == ess_local and sc_pair == ess_pair
-              and nrsc_local == ess_local and nrsc_pair == ess_pair
+              and sc_local == lte_local_exp and node_lte_id == lte_local_exp
+              and nrsc_local == nr_local_exp and node_nr_id == nr_local_exp
+              and sc_pair == ess_pair and nrsc_pair == ess_pair
               and e_lte == "true" and e_nr == "true")
         out.append(EssResult(
             node=p["node"], lte_cell=lte_cell, nr_cell=nr_cell,
             lte_exists=lte_exists, nr_exists=nr_exists,
-            ess_local=ess_local, sc_local=sc_local, nrsc_local=nrsc_local,
+            lte_local_exp=lte_local_exp, lte_cellid=node_lte_id, sc_local=sc_local,
+            nr_local_exp=nr_local_exp, nr_localid=node_nr_id, nrsc_local=nrsc_local,
             ess_pair=ess_pair, sc_pair=sc_pair, nrsc_pair=nrsc_pair,
             ess_lte=e_lte or "(none)", ess_nr=e_nr or "(none)",
             status="Match" if ok else "Mismatch"))

@@ -4,6 +4,25 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.19] - 2026-08-27
+
+### Changed
+- **ESS: essScLocalId now checked three ways, per side.** Each side's
+  `essScLocalId` equals that cell's own local id — the LTE `EUtranCell.cellId`
+  and the NR `NRCell.cellLocalId` — which are different values (e.g. LTE 171 vs
+  NR 501). The audit previously compared BOTH carriers to a single CDD value,
+  which was wrong whenever the sheet documented only one side. It now verifies,
+  per side, that CDD == node cellId/cellLocalId == node essScLocalId, and the ESS
+  sheet shows the node's actual `cellId`/`cellLocalId` alongside the CDD and the
+  carrier value. This also removes the earlier LTE-vs-NSA-file discrepancy
+  (171 vs 501) — results are now identical whichever CDD is used.
+
+### Added
+- **Summary: "Coverage by section" table.** Lists the row count of every output
+  section (each audit category, plus ESS / LLD / Cell inventory); a section that
+  produced nothing is flagged amber, so a silently-dropped tech (e.g. NR) or a
+  skipped ESS sheet is obvious at a glance instead of just missing.
+
 ## [1.9.18] - 2026-08-27
 
 ### Added

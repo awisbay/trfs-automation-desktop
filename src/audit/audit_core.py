@@ -849,7 +849,8 @@ _CENTER = Alignment(horizontal="center", vertical="center")
 _LEFT = Alignment(horizontal="left", vertical="center")
 
 
-def _write_summary(summ, results, meta, lld_results=None):
+def _write_summary(summ, results, meta, lld_results=None,
+                   ess_rows=None, cell_rows=None):
     counts = {"Match": 0, "Mismatch": 0, "NotFound": 0, "MO_NotFound": 0,
               "CDD_missing": 0}
     for r in results:
@@ -936,6 +937,46 @@ def _write_summary(summ, results, meta, lld_results=None):
     vc.alignment = _CENTER
     for cell in (lc, vc):
         cell.border = _BORDER
+
+    # ── Coverage by section ──────────────────────────────────────
+    # One row per output section so a section that produced NOTHING (e.g. NR
+    # cells dropped, or the ESS sheet skipped) is visible at a glance instead of
+    # silently absent. Zero-row sections are flagged amber.
+    cat = {}
+    for res in results:
+        cat[res.category or "?"] = cat.get(res.category or "?", 0) + 1
+    sections = [(k, cat[k]) for k in sorted(cat)]
+    sections += [
+        ("ESS pairs", len(ess_rows or [])),
+        ("LLD checks", len(lld_results or [])),
+        ("Cell inventory", len(cell_rows or [])),
+    ]
+    r += 2
+    summ.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+    h = summ.cell(r, 1, "Coverage by section")
+    h.font = Font(bold=True, size=13, color="FFFFFF")
+    h.fill = PatternFill("solid", fgColor="4472C4")
+    h.alignment = _CENTER
+    r += 1
+    for c, txt in enumerate(("Section", "Rows", ""), 1):
+        cc = summ.cell(r, c, txt)
+        cc.font = Font(bold=True, color="FFFFFF")
+        cc.fill = PatternFill("solid", fgColor="8EA9DB")
+        cc.alignment = _CENTER
+        cc.border = _BORDER
+    r += 1
+    for label, n in sections:
+        a = summ.cell(r, 1, label)
+        b = summ.cell(r, 2, n)
+        note = summ.cell(r, 3, "empty" if n == 0 else "")
+        for cell in (a, b, note):
+            cell.border = _BORDER
+            cell.alignment = _LEFT if cell is a else _CENTER
+        if n == 0:
+            for cell in (a, b, note):
+                cell.fill = PatternFill("solid", fgColor="FFEB9C")
+                cell.font = Font(bold=True, color="9C6500")
+        r += 1
 
     # ── Per-node breakdown (batch/cluster audits) ────────────────
     nodes = {}
@@ -1103,7 +1144,9 @@ def _write_ess_sheet(ws, ess_rows: list) -> None:
     relations. Green/red status like Detail; the specific failing cell is
     yellow-highlighted."""
     headers = ["Node", "LTE Cell", "NR Cell", "LTE Exists", "NR Exists",
-               "essScLocalId (CDD)", "essScLocalId (SC)", "essScLocalId (NRSC)",
+               "LTE cellId (CDD)", "LTE cellId (node)", "essScLocalId (SC)",
+               "NR cellLocalId (CDD)", "NR cellLocalId (node)",
+               "essScLocalId (NRSC)",
                "essScPairId (CDD)", "essScPairId (SC)", "essScPairId (NRSC)",
                "essEnabled LTE", "essEnabled NR", "Status"]
     ws.append(headers)
@@ -1118,33 +1161,39 @@ def _write_ess_sheet(ws, ess_rows: list) -> None:
             r.node, r.lte_cell, r.nr_cell,
             "Yes" if r.lte_exists else "No",
             "Yes" if r.nr_exists else "No",
-            r.ess_local, r.sc_local, r.nrsc_local,
+            r.lte_local_exp, r.lte_cellid, r.sc_local,
+            r.nr_local_exp, r.nr_localid, r.nrsc_local,
             r.ess_pair, r.sc_pair, r.nrsc_pair,
             r.ess_lte, r.ess_nr, r.status])
         row = ws.max_row
         fill = _STATUS_FILL.get(r.status)
         if fill:
             ws.cell(row=row, column=status_col).fill = fill
-        # Yellow-flag the specific failing check(s).
+        # Yellow-flag the specific failing check(s). The local-id check is
+        # three-way: CDD == node cellId == node essScLocalId.
         if not r.lte_exists:
             ws.cell(row, 4).fill = _FILL_NOTFOUND
         if not r.nr_exists:
             ws.cell(row, 5).fill = _FILL_NOTFOUND
-        if not (r.sc_local == r.ess_local == r.nrsc_local):
+        if not (r.lte_local_exp == r.lte_cellid == r.sc_local):
             for c in (7, 8):
                 ws.cell(row, c).fill = _FILL_NOTFOUND
-        if not (r.sc_pair == r.ess_pair == r.nrsc_pair):
+        if not (r.nr_local_exp == r.nr_localid == r.nrsc_local):
             for c in (10, 11):
                 ws.cell(row, c).fill = _FILL_NOTFOUND
+        if not (r.sc_pair == r.ess_pair == r.nrsc_pair):
+            for c in (13, 14):
+                ws.cell(row, c).fill = _FILL_NOTFOUND
         if r.ess_lte != "true":
-            ws.cell(row, 12).fill = _FILL_NOTFOUND
+            ws.cell(row, 15).fill = _FILL_NOTFOUND
         if r.ess_nr != "true":
-            ws.cell(row, 13).fill = _FILL_NOTFOUND
+            ws.cell(row, 16).fill = _FILL_NOTFOUND
         for c in range(1, len(headers) + 1):
             ws.cell(row, c).border = _BORDER
     ws.freeze_panes = "A2"
-    widths = {"A": 30, "B": 16, "C": 16, "D": 9, "E": 9, "F": 15, "G": 14,
-              "H": 16, "I": 16, "J": 16, "K": 16, "L": 12, "M": 12, "N": 10}
+    widths = {"A": 30, "B": 16, "C": 16, "D": 9, "E": 9, "F": 16, "G": 16,
+              "H": 16, "I": 18, "J": 18, "K": 18, "L": 16, "M": 16, "N": 16,
+              "O": 12, "P": 12, "Q": 10}
     for col, wdt in widths.items():
         ws.column_dimensions[col].width = wdt
 
@@ -1188,7 +1237,7 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
     # Summary sheet
     summ = wb.active
     summ.title = "Summary"
-    _write_summary(summ, results, meta, lld_results)
+    _write_summary(summ, results, meta, lld_results, ess_rows, cell_rows)
 
     # Detail sheet
     ws = wb.create_sheet("Detail")
