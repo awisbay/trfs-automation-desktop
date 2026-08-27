@@ -4,6 +4,22 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.17] - 2026-08-27
+
+### Fixed
+- **NR audit silently skipped when the CDD header sits on a different row.** The
+  NSA (NR) CDD's `CDD` sheet has its header on row 4 while the LTE CDD has it on
+  row 3, but both profiles hardcoded `header_row=3`, so `gNodeBName` was not
+  found and every NR profile was skipped. The sheet reader now auto-detects the
+  header line by scanning for the profile's node-key column, so a one-row shift
+  in any CDD revision no longer drops a whole tech.
+- **ESS audit crashed with "tuple indices must be integers, not NoneType".** The
+  ESS sheet in the LTE CDD names its columns `SectorCarrier.essScLocalId/…PairId`
+  while the NSA CDD uses `NRSectorCarrier.*`; the reader only knew the NR names,
+  so the missing column resolved to a `None` index that was then used to index
+  the row. Every ESS column is now read through a None-guard, and both column
+  spellings are accepted.
+
 ## [1.9.16] - 2026-08-26
 
 ### Changed

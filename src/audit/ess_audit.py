@@ -85,25 +85,36 @@ def read_ess_pairs(path: str, node: str, log=lambda m: None) -> List[dict]:
         "gnb_id": col("gnb id"),
         "nr_cell": cellname_idxs[1] if len(cellname_idxs) > 1 else None,
         "nr_local": localid_idxs[1] if len(localid_idxs) > 1 else None,
-        "ess_local": col("nrsectorcarrier.esssclocalid"),
-        "ess_pair": col("nrsectorcarrier.essscpairid"),
+        # The ESS sheet in the LTE CDD names these "SectorCarrier.*" while the
+        # NSA CDD names them "NRSectorCarrier.*" — accept either.
+        "ess_local": col("nrsectorcarrier.esssclocalid",
+                         "sectorcarrier.esssclocalid"),
+        "ess_pair": col("nrsectorcarrier.essscpairid",
+                        "sectorcarrier.essscpairid"),
     }
     node_l = node.strip().lower()
     pairs = []
     for r in rows:
-        enb = _norm(r[idx["enb"]]) if idx["enb"] is not None else ""
-        gnb = _norm(r[idx["gnb"]]) if idx["gnb"] is not None else ""
+        # Every column may be absent (a CDD revision that renamed/omitted it) —
+        # read through a guard so a missing column yields "" instead of
+        # indexing the row with None (which raised "tuple indices must be
+        # integers, not NoneType" and aborted the whole ESS audit).
+        def g(key):
+            i = idx[key]
+            return _norm(r[i]) if i is not None and i < len(r) else ""
+        enb = g("enb")
+        gnb = g("gnb")
         if node_l not in (enb.lower(), gnb.lower()):
             continue
         pairs.append({
             "node": enb or gnb,
-            "lte_cell": _norm(r[idx["lte_cell"]]),
-            "lte_local": _norm(r[idx["lte_local"]]),
-            "gnb_id": _norm(r[idx["gnb_id"]]) if idx["gnb_id"] is not None else "",
-            "nr_cell": _norm(r[idx["nr_cell"]]),
-            "nr_local": _norm(r[idx["nr_local"]]),
-            "ess_local": _norm(r[idx["ess_local"]]),
-            "ess_pair": _norm(r[idx["ess_pair"]]),
+            "lte_cell": g("lte_cell"),
+            "lte_local": g("lte_local"),
+            "gnb_id": g("gnb_id"),
+            "nr_cell": g("nr_cell"),
+            "nr_local": g("nr_local"),
+            "ess_local": g("ess_local"),
+            "ess_pair": g("ess_pair"),
         })
     wb.close()
     return pairs

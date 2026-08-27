@@ -127,9 +127,16 @@ def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
     return items
 
 
-def _get_sheet(path, sheet, header_row, sheet_cache, wbcache):
-    """Return (col_idx, data_rows) for a sheet, reading it at most once."""
-    key = (path, sheet, header_row)
+def _get_sheet(path, sheet, header_row, sheet_cache, wbcache, want_col=None):
+    """Return (col_idx, data_rows) for a sheet, reading it at most once.
+
+    ``header_row`` is the *configured* header line, but CDD revisions routinely
+    shift it by a row (a leading blank/COREDEF banner row appears or disappears),
+    which silently breaks the whole profile. When ``want_col`` is given and it is
+    NOT present on the configured line, scan the next few rows and re-anchor onto
+    the first row that actually contains it — so the same profile works whether
+    the header sits on row 3 or row 4."""
+    key = (path, sheet, header_row, want_col)
     if key in sheet_cache:
         return sheet_cache[key]
     wb = wbcache.get(path)
@@ -143,8 +150,28 @@ def _get_sheet(path, sheet, header_row, sheet_cache, wbcache):
     if not rows:
         sheet_cache[key] = ({}, [])
         return sheet_cache[key]
+    # Re-anchor the header line if the configured row lacks the expected column.
+    hdr_i = 0
+    if want_col:
+        wanted = {str(want_col).strip(), _hnorm(str(want_col))}
+
+        def _has_wanted(r):
+            for c in r:
+                if c is None:
+                    continue
+                nm = str(c).strip()
+                if nm in wanted or _hnorm(nm) in wanted:
+                    return True
+            return False
+
+        if not _has_wanted(rows[0]):
+            for j in range(1, min(len(rows), 20)):
+                if _has_wanted(rows[j]):
+                    hdr_i = j
+                    break
+    header_cells = rows[hdr_i]
     col_idx: Dict[str, int] = {}
-    for i, h in enumerate(rows[0]):
+    for i, h in enumerate(header_cells):
         name = str(h).strip() if h is not None else ""
         if name and name not in col_idx:
             col_idx[name] = i
@@ -154,7 +181,7 @@ def _get_sheet(path, sheet, header_row, sheet_cache, wbcache):
         norm = _hnorm(name)
         if norm and norm not in col_idx:
             col_idx[norm] = i
-    sheet_cache[key] = (col_idx, rows[1:])
+    sheet_cache[key] = (col_idx, rows[hdr_i + 1:])
     return sheet_cache[key]
 
 
@@ -205,7 +232,8 @@ def _read_profile(path: str, node_l: str, prof: dict, log,
     from_cmedit = prof.get("source") == "cmedit"
     expand = prof.get("cell_expand")   # optional band→cell expansion
 
-    col_idx, data = _get_sheet(path, sheet, header_row, sheet_cache, wbcache)
+    col_idx, data = _get_sheet(path, sheet, header_row, sheet_cache, wbcache,
+                               want_col=node_key)
     if col_idx is None:
         log(f"[audit] sheet '{sheet}' not in {os.path.basename(path)} — skipped")
         return []
