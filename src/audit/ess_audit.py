@@ -56,65 +56,56 @@ def read_ess_pairs(path: str, node: str, log=lambda m: None) -> List[dict]:
     Header (row 1): eNodeBName, ENodeBID, CellName(LTE), LocalCellID(LTE),
     gNB Name, gNB ID, CellName(NR), LocalCellID(NR), NRSectorCarrier,
     NRSectorCarrier.essScLocalId, NRSectorCarrier.essScPairId, ..."""
+    from .sheet_reader import open_sheet
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    if "ESS" not in wb.sheetnames:
-        log("[audit/ess] no 'ESS' sheet in the LTE CDD — ESS audit skipped.")
+    # Layers 1–5 (sheet lookup, header detection, alias/normalized columns,
+    # guarded reads, diagnostics) all live in open_sheet now.
+    sv = open_sheet(
+        wb, "ESS",
+        required=[
+            ("enodebname",), ("cellname",), ("localcellid",),
+            # LTE CDD: "SectorCarrier.*"; NSA CDD: "NRSectorCarrier.*".
+            ("nrsectorcarrier.esssclocalid", "sectorcarrier.esssclocalid"),
+            ("nrsectorcarrier.essscpairid", "sectorcarrier.essscpairid"),
+        ],
+        header_hint=1, log=log, tag="ess")
+    if sv is None:
         wb.close()
         return []
-    ws = wb["ESS"]
-    rows = ws.iter_rows(values_only=True)
-    header = [_norm(c) for c in next(rows)]
-
-    def col(*names):
-        for i, h in enumerate(header):
-            hl = h.replace("\xa0", " ").strip().lower()
-            if hl in names:
-                return i
-        return None
-
-    # CellName appears twice (LTE then NR); take them positionally.
-    cellname_idxs = [i for i, h in enumerate(header)
-                     if h.replace("\xa0", " ").strip().lower() == "cellname"]
-    localid_idxs = [i for i, h in enumerate(header)
-                    if h.replace("\xa0", " ").strip().lower() == "localcellid"]
+    # CellName / LocalCellID appear twice (LTE then NR) — take positionally.
+    cell_is = sv.cols("cellname")
+    local_is = sv.cols("localcellid")
+    enb_i = sv.col("enodebname")
+    gnb_i = sv.col("gnb name")
     idx = {
-        "enb": col("enodebname"),
-        "lte_cell": cellname_idxs[0] if len(cellname_idxs) > 0 else None,
-        "lte_local": localid_idxs[0] if len(localid_idxs) > 0 else None,
-        "gnb": col("gnb name"),
-        "gnb_id": col("gnb id"),
-        "nr_cell": cellname_idxs[1] if len(cellname_idxs) > 1 else None,
-        "nr_local": localid_idxs[1] if len(localid_idxs) > 1 else None,
-        # The ESS sheet in the LTE CDD names these "SectorCarrier.*" while the
-        # NSA CDD names them "NRSectorCarrier.*" — accept either.
-        "ess_local": col("nrsectorcarrier.esssclocalid",
-                         "sectorcarrier.esssclocalid"),
-        "ess_pair": col("nrsectorcarrier.essscpairid",
-                        "sectorcarrier.essscpairid"),
+        "enb": enb_i,
+        "gnb": gnb_i,
+        "gnb_id": sv.col("gnb id"),
+        "lte_cell": cell_is[0] if len(cell_is) > 0 else None,
+        "lte_local": local_is[0] if len(local_is) > 0 else None,
+        "nr_cell": cell_is[1] if len(cell_is) > 1 else None,
+        "nr_local": local_is[1] if len(local_is) > 1 else None,
+        "ess_local": sv.col("nrsectorcarrier.esssclocalid",
+                            "sectorcarrier.esssclocalid"),
+        "ess_pair": sv.col("nrsectorcarrier.essscpairid",
+                           "sectorcarrier.essscpairid"),
     }
     node_l = node.strip().lower()
     pairs = []
-    for r in rows:
-        # Every column may be absent (a CDD revision that renamed/omitted it) —
-        # read through a guard so a missing column yields "" instead of
-        # indexing the row with None (which raised "tuple indices must be
-        # integers, not NoneType" and aborted the whole ESS audit).
-        def g(key):
-            i = idx[key]
-            return _norm(r[i]) if i is not None and i < len(r) else ""
-        enb = g("enb")
-        gnb = g("gnb")
+    for r in sv.rows:
+        enb = sv.get(r, idx["enb"])
+        gnb = sv.get(r, idx["gnb"])
         if node_l not in (enb.lower(), gnb.lower()):
             continue
         pairs.append({
             "node": enb or gnb,
-            "lte_cell": g("lte_cell"),
-            "lte_local": g("lte_local"),
-            "gnb_id": g("gnb_id"),
-            "nr_cell": g("nr_cell"),
-            "nr_local": g("nr_local"),
-            "ess_local": g("ess_local"),
-            "ess_pair": g("ess_pair"),
+            "lte_cell": sv.get(r, idx["lte_cell"]),
+            "lte_local": sv.get(r, idx["lte_local"]),
+            "gnb_id": sv.get(r, idx["gnb_id"]),
+            "nr_cell": sv.get(r, idx["nr_cell"]),
+            "nr_local": sv.get(r, idx["nr_local"]),
+            "ess_local": sv.get(r, idx["ess_local"]),
+            "ess_pair": sv.get(r, idx["ess_pair"]),
         })
     wb.close()
     return pairs

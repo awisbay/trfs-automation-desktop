@@ -4,6 +4,26 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.18] - 2026-08-27
+
+### Added
+- **General sheet-reading defense layer (`audit/sheet_reader.py`).** A shared
+  `open_sheet()` that every fragile reader can use, hardening five recurring
+  failure modes at once instead of patching each site: (1) tolerant sheet-name
+  lookup (case/space-insensitive), (2) header-row auto-detection by scanning for
+  the expected columns (a banner/blank row no longer shifts a whole category to
+  0 rows), (3) normalized + alias column matching with positional handling of
+  duplicate headers, (4) guarded cell reads that never index with `None`, and
+  (5) explicit diagnostics — the chosen header row and any missing columns are
+  logged, so a silent miss becomes a visible line.
+
+### Changed
+- **ESS and ElecTilt readers now go through `sheet_reader`.** Both previously
+  assumed a fixed header row and exact column spellings; they now self-correct a
+  shifted header and log what they found/missed. Behaviour is unchanged on the
+  known-good CDDs (verified: ESS 4 pairs on both LTE/NSA files, NR ElecTilt
+  targets read with the header auto-detected on row 4 despite a row-3 hint).
+
 ## [1.9.17] - 2026-08-27
 
 ### Fixed

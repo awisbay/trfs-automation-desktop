@@ -90,38 +90,33 @@ def read_etilt_targets(path: str, sheet: str, header_row: int,
                        node_key_col: str, node: str,
                        log=lambda m: None) -> List[tuple]:
     """(cellName, node, elecTilt) rows for ``node`` from a CDD sheet."""
+    from .sheet_reader import open_sheet
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     except Exception as exc:
         log(f"[audit/etilt] open {sheet}: {exc}")
         return []
-    if sheet not in wb.sheetnames:
+    sv = open_sheet(
+        wb, sheet,
+        required=[(node_key_col,), ("cellname",), ("electilt", "etilt")],
+        header_hint=header_row, log=log, tag="etilt")
+    if sv is None:
         wb.close()
         return []
-    ws = wb[sheet]
-    rows = ws.iter_rows(min_row=header_row, values_only=True)
-    header = [re.sub(r"\s+", " ", str(c).replace("\xa0", " ")).strip().lower()
-              if c is not None else "" for c in next(rows)]
-
-    def col(*names):
-        for i, h in enumerate(header):
-            if h in names:
-                return i
-        return None
-    ci_node = col(node_key_col.lower())
-    ci_cell = col("cellname")
-    ci_tilt = col("electilt", "etilt")
+    ci_node = sv.col(node_key_col)
+    ci_cell = sv.col("cellname")
+    ci_tilt = sv.col("electilt", "etilt")
     if ci_node is None or ci_cell is None or ci_tilt is None:
         wb.close()
         return []
     node_l = node.strip().lower()
     out = []
-    for r in rows:
-        nv = _norm(r[ci_node]) if ci_node < len(r) else ""
+    for r in sv.rows:
+        nv = sv.get(r, ci_node)
         if nv.lower() != node_l:
             continue
-        cell = _norm(r[ci_cell]) if ci_cell < len(r) else ""
-        tilt = _norm(r[ci_tilt]) if ci_tilt < len(r) else ""
+        cell = sv.get(r, ci_cell)
+        tilt = sv.get(r, ci_tilt)
         if cell and tilt != "":
             out.append((cell, nv, tilt))
     wb.close()
