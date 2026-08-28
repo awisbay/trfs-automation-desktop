@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.20] - 2026-08-28
+
+### Added
+- **Integration: disable FM alarm supervision after the backup upload.** Once the
+  Configuration Backup CV is uploaded to ENM, the integration workflow now runs
+  `cmedit set <node> fmalarmsupervision active=false` so the disruptive work that
+  follows doesn't flood ENM with alarms. Gated behind a new `disable_fm_after`
+  flag on `run_backup_cv` (opt-in from the integration workflow only) and
+  best-effort — a failure is logged but does not fail the backup step. Cut Over's
+  pre-change CV is unaffected.
+
 ## [1.9.19] - 2026-08-27
 
 ### Changed

@@ -4249,6 +4249,7 @@ def run_backup_cv(
     log_cb: Callable[[str], None],
     wait_for_user: Optional[Callable[[str], bool]] = None,
     backup_name: Optional[str] = None,
+    disable_fm_after: bool = False,
 ) -> tuple[bool, str]:
     """Create an SHM backup and wait until it succeeds.
 
@@ -4256,6 +4257,12 @@ def run_backup_cv(
     ``PreIntegration_*`` naming while other workflows (for example Cut Over)
     can create an explicitly labelled pre-change CV through the same proven
     SHM job/polling implementation.
+
+    ``disable_fm_after`` (integration workflow only) runs
+    ``cmedit set <node> fmalarmsupervision active=false`` once the backup has
+    been uploaded, so the disruptive integration work that follows doesn't
+    flood ENM with alarms. Off by default so Cut Over's pre-change CV is
+    unaffected.
     """
     all_output = ""
     backup_name = backup_name or f"PreIntegration_{time.strftime('%Y%m%d_%H%M')}"
@@ -4271,6 +4278,24 @@ def run_backup_cv(
             re.IGNORECASE | re.MULTILINE,
         )
         return match.group(1).strip() if match else ""
+
+    def _disable_fm_supervision() -> str:
+        """Once the backup is safely uploaded to ENM, silence FM alarm
+        supervision on the node so the subsequent integration work doesn't
+        flood ENM with alarms. Best-effort: a failure here is logged but does
+        NOT fail the (already-successful) backup step."""
+        fm_cmd = (
+            f'!python {CLI_PY} '
+            f'"cmedit set {node_name} fmalarmsupervision active=false"'
+        )
+        log_cb(f"Disabling FM alarm supervision on {node_name}...")
+        try:
+            out = ssh.run_amos_command_safe(fm_cmd, node_name, timeout=60)
+            log_cb(f"✓ FM alarm supervision set to active=false:\n{out}")
+            return out
+        except Exception as exc:
+            log_cb(f"⚠ Could not disable FM alarm supervision: {exc}")
+            return ""
 
     log_cb(
         f"Starting Backup CV for {node_name} "
@@ -4319,6 +4344,8 @@ def run_backup_cv(
 
         if status_value == "COMPLETED" and result_value == "SUCCESS":
             log_cb(f"✓ Backup CV completed successfully (job: {job_name}).")
+            if disable_fm_after:
+                all_output += _disable_fm_supervision()
             return True, all_output
 
         if status_value in {"FAILED", "ABORTED", "CANCELLED"} or \
@@ -4363,6 +4390,8 @@ def run_backup_cv(
             result_value = _extract_value("Result", out).upper()
             if status_value == "COMPLETED" and result_value == "SUCCESS":
                 log_cb(f"✓ Backup CV completed successfully (job: {job_name}).")
+                if disable_fm_after:
+                    all_output += _disable_fm_supervision()
                 return True, all_output
     return False, all_output
 

@@ -3398,6 +3398,7 @@ class IntegrationRunPage:
                             lambda: run_backup_cv(
                                 ssh, node_name, detail_cb,
                                 wait_for_user=None,
+                                disable_fm_after=True,
                             ),
                             node_tag, key,
                             max_attempts=2,
