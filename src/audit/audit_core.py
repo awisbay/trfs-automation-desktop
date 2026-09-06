@@ -690,6 +690,96 @@ def audit_gnbid_consistency(records: Dict[str, Dict[str, str]],
     return out
 
 
+def audit_endc_external(records: Dict[str, Dict[str, str]],
+                        nodes=None, log=lambda m: None) -> List[AuditResult]:
+    """EN-DC self-reference audit (co-sited NR under the SAME PLA/node).
+
+    On an EN-DC node the LTE side keeps an ``ExternalGNodeBFunction`` for the
+    node's OWN gNB (``gNodeBId`` == the node's ``GNBDUFunction.gNBId``), and under
+    it one ``ExternalGUtranCell`` per NR cell mirroring that cell's identity. If
+    the mirror is wrong or missing, EN-DC addition to the co-sited gNB fails.
+    This checks, per node that has NR:
+
+      * the self ``ExternalGNodeBFunction`` (gNodeBId == own gNBId) EXISTS;
+      * each self ``ExternalGUtranCell.nRPCI`` equals the real ``NRCellDU.nRPCI``
+        of the cell with the same ``localCellId``.
+
+    Pure config + internal — no CDD/expected and no live state, valid
+    pre-integration. ``ExternalGNodeBFunction`` uses attribute ``gNodeBId`` (its
+    ``gNBId`` is -1)."""
+    import collections
+
+    def _n(x):
+        return "" if x is None else str(x).strip()
+
+    def _below(l):
+        return re.sub(r"^.*?ManagedElement=[^,]+,", "", l)
+
+    own = {}                                       # node → own gNBId
+    nrpci = collections.defaultdict(dict)          # node → {cellLocalId: nRPCI}
+    self_ext = collections.defaultdict(list)       # node → [ext gNB LDN] (self)
+    ext_children = collections.defaultdict(list)   # ext gNB LDN → [(LDN, attrs)]
+
+    for l, a in records.items():
+        leaf = l.split(",")[-1].split("=", 1)[0]
+        mn = re.search(r"ManagedElement=([^,]+)", l)
+        node = mn.group(1) if mn else ""
+        if leaf in ("GNBDUFunction", "GNBCUCPFunction"):
+            v = _n(a.get("gNBId"))
+            if node and v and v != "-1":
+                own.setdefault(node, v)
+        elif leaf == "NRCellDU":
+            cid, pci = _n(a.get("cellLocalId")), _n(a.get("nRPCI"))
+            if node and cid and pci:
+                nrpci[node][cid] = pci
+        elif leaf == "ExternalGUtranCell":
+            ext_children[l.rsplit(",", 1)[0]].append((l, a))
+
+    # Second pass for self ExternalGNodeBFunction (needs own[] populated).
+    for l, a in records.items():
+        if l.split(",")[-1].split("=", 1)[0] != "ExternalGNodeBFunction":
+            continue
+        mn = re.search(r"ManagedElement=([^,]+)", l)
+        node = mn.group(1) if mn else ""
+        if node and _n(a.get("gNodeBId")) == own.get(node):
+            self_ext[node].append(l)
+
+    out: List[AuditResult] = []
+    target = list(nodes) if nodes else sorted(own)
+    for node in target:
+        g = own.get(node)
+        if not g:
+            continue                               # LTE-only node — nothing to mirror
+        keys = self_ext.get(node)
+        if not keys:
+            out.append(AuditResult(
+                "endc", node, "ExternalGNodeBFunction",
+                "self gNB reference", g, "(missing)", "Mismatch",
+                "EN-DC self-reference (same PLA)", node))
+            continue
+        out.append(AuditResult(
+            "endc", node, _below(sorted(keys)[0]),
+            "self gNB reference", g, g, "Match",
+            "EN-DC self-reference (same PLA)", node))
+        for sk in keys:
+            for cl, ca in ext_children.get(sk, []):
+                cid = _n(ca.get("localCellId"))
+                ext_pci = _n(ca.get("nRPCI"))
+                real = nrpci.get(node, {}).get(cid)
+                if real is None:
+                    st, exp, act = "NotFound", f"(no NRCellDU localCellId={cid})", \
+                        (ext_pci or "(none)")
+                elif ext_pci == real:
+                    st, exp, act = "Match", real, ext_pci
+                else:
+                    st, exp, act = "Mismatch", real, ext_pci
+                out.append(AuditResult(
+                    "endc", node, _below(cl), "nRPCI (ext mirror vs NRCellDU)",
+                    exp, act, st, "EN-DC external cell mirror", node,
+                    ref_cell=f"localCellId={cid}"))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1427,7 +1517,8 @@ def _banner(name: str) -> str:
 # no single attribute to set). ``ip-broker`` is NOT here: bscBrokerIpAddress is
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level", "consistency"}
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
+                            "consistency", "endc"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

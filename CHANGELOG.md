@@ -4,6 +4,19 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.25] - 2026-09-06
+
+### Added
+- **EN-DC self-reference audit (`endc`).** On an EN-DC node the LTE side must keep
+  an `ExternalGNodeBFunction` for the node's OWN gNB (co-sited, same PLA) whose
+  `gNodeBId` equals `GNBDUFunction.gNBId`, with an `ExternalGUtranCell` mirroring
+  each NR cell. The audit now verifies, per node with NR: the self
+  `ExternalGNodeBFunction` exists, and each self `ExternalGUtranCell.nRPCI`
+  matches the real `NRCellDU.nRPCI` of the cell with the same `localCellId` — a
+  broken/missing mirror would fail EN-DC addition. Pure config + internal (no CDD
+  or live state), valid pre-integration. `ExternalGNodeBFunction`'s id is read
+  from `gNodeBId` (its `gNBId` is -1); LTE-only nodes are skipped.
+
 ## [1.9.24] - 2026-09-06
 
 ### Added

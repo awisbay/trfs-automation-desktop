@@ -726,6 +726,21 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"gNBId consistency check failed: {exc}")
 
+            # EN-DC self-reference: the node's own gNB must be mirrored by an
+            # ExternalGNodeBFunction + ExternalGUtranCell (nRPCI) on the LTE side.
+            try:
+                ec = audit_core.audit_endc_external(
+                    records, nodes=nodes, log=self._log)
+                if ec:
+                    results += ec
+                    ecc = Counter(r.status for r in ec)
+                    self._log(
+                        f"EN-DC self-ref: {ecc.get('Match',0)} ok, "
+                        f"{ecc.get('Mismatch',0)} mismatch, "
+                        f"{ecc.get('NotFound',0)} unmatched.")
+            except Exception as exc:
+                self._log(f"EN-DC external check failed: {exc}")
+
             # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
             # into the parameter Detail.
             cell_rows = []
