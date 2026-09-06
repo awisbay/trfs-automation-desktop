@@ -568,12 +568,31 @@ class AuditPage:
                     # the CDD read keys and produced foreign rows in the report.
                     self._log(f"SSH → {host}:{port} as {user} for GSM cmedit "
                               f"(scope Site ID {site})...")
-                    ssh = IntegrationSSH(host=host, port=port, username=user,
-                                         password=pwd, log_callback=self._log)
-                    ssh.connect(timeout=30)
-                    gsm_recs = cmedit_source.fetch_cmedit_records(
-                        ssh, "", gsm_cmedit, site_id=site, log=self._log)
-                    records.update(gsm_recs)
+                    # ENM may be unreachable (VPN down, wrong host, firewall).
+                    # A GSM live check that can't connect must NOT abort the whole
+                    # audit — LTE/NR from the dump and every offline check are
+                    # still valid. Degrade gracefully: log it and continue; the
+                    # GSM (GeranCell) params simply come back NotFound. A short
+                    # connect timeout so we fail fast instead of blocking ~30s.
+                    try:
+                        ssh = IntegrationSSH(host=host, port=port, username=user,
+                                             password=pwd, log_callback=self._log)
+                        ssh.connect(timeout=12)
+                        gsm_recs = cmedit_source.fetch_cmedit_records(
+                            ssh, "", gsm_cmedit, site_id=site, log=self._log)
+                        records.update(gsm_recs)
+                    except Exception as exc:
+                        self._log(
+                            f"⚠ ENM not reachable for GSM cmedit ({exc}) — "
+                            "continuing WITHOUT the GSM live check; GSM params "
+                            "will be reported NotFound. Upload a GSM cmedit log "
+                            "for an offline GeranCell audit.")
+                        try:
+                            if ssh is not None:
+                                ssh.close()
+                        except Exception:
+                            pass
+                        ssh = None
                 elif gsm_cmedit and not (host and user and pwd):
                     self._log("⚠ GSM CDD given but no SSH from the main form — "
                               "GSM (cmedit) audit skipped.")

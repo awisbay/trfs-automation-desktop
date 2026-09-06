@@ -553,6 +553,9 @@ def broker_check(broker_items: List[AuditItem],
         bsc = bsc_by_node.get(node)
         if not bsc:
             continue          # node not in the CDD BSC map — nothing to expect
+        # Real MO FDN below ManagedElement (e.g. BtsFunction=1,GsmSector=X,
+        # AbisIp=1) so the generated set line targets the correct instance.
+        mo = re.sub(r"^.*?ManagedElement=[^,]+,", "", ldn)
         sec = re.search(r"GsmSector=([^,]+)", ldn)
         sector = sec.group(1) if sec else "?"
         sname = (attrs.get("gsmSectorName") or "").strip()
@@ -561,12 +564,19 @@ def broker_check(broker_items: List[AuditItem],
         ref = f"GsmSector={sector}" + (f" ({sname})" if sname else "")
         if expected_ip is None:
             status = "NotFound"
-            expected_disp = f"{bsc} (not in bsc_broker_map)"
+            # Non-settable placeholder: expected IP unknown, so no set line is
+            # generated (NotFound rows are skipped by the generators anyway).
+            expected_val = f"{bsc} (not in bsc_broker_map)"
             actual_disp = ip or "(none)"
+            src = "config.json bsc_broker_map"
         else:
-            expected_disp = f"{expected_ip} ({bsc})"
+            # The expected value is the CLEAN IP so it can be emitted as a
+            # settable ``bscBrokerIpAddress <ip>`` line; the BSC name it belongs
+            # to is carried in the Source column instead of inline.
+            expected_val = str(expected_ip).strip()
             b = ip_to_bsc.get(ip)
             actual_disp = (f"{ip} ({b})" if b else ip) or "(none)"
+            src = f"config.json bsc_broker_map ({bsc})"
             if not ip:
                 status = "NotFound"
             elif ip == str(expected_ip).strip():
@@ -574,9 +584,8 @@ def broker_check(broker_items: List[AuditItem],
             else:
                 status = "Mismatch"
         out.append(AuditResult(
-            "ip-broker", node, "AbisIp", "bscBrokerIpAddress",
-            expected_disp, actual_disp, status,
-            "config.json bsc_broker_map", node, ref_cell=ref))
+            "ip-broker", node, mo, "bscBrokerIpAddress",
+            expected_val, actual_disp, status, src, node, ref_cell=ref))
     return out
 
 
@@ -1313,9 +1322,11 @@ def _banner(name: str) -> str:
 
 # Synthetic audit categories that compare an aggregate/derived value, not a
 # single settable MO attribute — they have no valid ``set`` target, so every
-# script generator skips them (a "GsmSector [BULUAN]" MO or "10.x (BSC)" value
-# would only produce a broken set line).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ip-broker", "ess", "etilt"}
+# script generator skips them (a "GsmSector [BULUAN]" MO or an ESS pairing has
+# no single attribute to set). ``ip-broker`` is NOT here: bscBrokerIpAddress is
+# a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
+# the full FDN + clean IP and ARE generated (see broker_check).
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

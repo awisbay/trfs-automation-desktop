@@ -33,7 +33,11 @@
   "_comment_bsc": "BSC name -> expected broker IP. Used by the GSM SGW check to verify the node's AbisIp bscBrokerIpAddress points at the RIGHT BSC. Edit here when a BSC is added/changed (no rebuild).",
   "bsc_broker_map": {
     "MINBS00": "10.14.194.131",
-    "MINBS01": "10.14.204.3"
+    "MINBS01": "10.14.204.3",
+    "MINVBS02": "10.14.208.196",
+    "MINVBS06": "10.14.215.196",
+    "MINVBS12": "10.14.207.196",
+    "MINVBS16": "10.14.214.196"
   },
   "_comment_uri": "URI Reconfig + SW Level Check \u2014 ENM REST endpoints + target UpgradePackage ID. This value is used DIRECTLY (no auto-detect) for both URI Setting and SW Level Check. Edit it to the expected software version.",
   "uri_setting": {

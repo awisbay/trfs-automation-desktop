@@ -4,6 +4,25 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.21] - 2026-09-06
+
+### Fixed
+- **`bscBrokerIpAddress` now appears in the generated set scripts.** The IP-broker
+  audit stored a generic ``AbisIp`` MO and an annotated value ("10.x (BSC)"), so
+  it was marked non-settable and skipped by every script generator. It now stores
+  the real MO FDN (``BtsFunction=1,GsmSector=<x>,AbisIp=1``) and the clean IP,
+  with the BSC name moved to the Source column — so Mismatch rows generate a valid
+  `set …$ bscBrokerIpAddress <ip>` (moshell) and cmedit/cmbulk line.
+- **Audit no longer aborts when ENM is unreachable.** A GSM live cmedit check that
+  can't connect (VPN down, wrong host, firewall — e.g. WinError 10060) used to
+  fail the whole audit. It now degrades gracefully: the failure is logged and the
+  audit continues on the dump + offline checks, with GSM params reported NotFound.
+  Connect timeout for the GSM check lowered to 12s so it fails fast. (Leaving the
+  SSH credentials blank already ran fully offline.)
+
+### Changed
+- **`bsc_broker_map`: added MINVBS02, MINVBS06, MINVBS12, MINVBS16** (6 BSCs total).
+
 ## [1.9.20] - 2026-08-28
 
 ### Added
