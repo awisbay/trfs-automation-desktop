@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.27] - 2026-09-06
+
+### Fixed
+- **Chain traceability: false "broken at Radio" on cmdump.** A multi-value
+  `rfBranchRef` is `;`-separated in modump but **whitespace**-separated in cmdump;
+  the reader only split on `;`, so cmdump nodes reported every classic-radio cell
+  as broken. Now split on either — verified all 382 chains across the local dumps
+  resolve, and a real broken ref is still flagged (e.g. "1/4 target MO(s)
+  missing").
+
 ## [1.9.26] - 2026-09-06
 
 ### Added

@@ -870,10 +870,11 @@ def audit_chain_trace(records: Dict[str, Dict[str, str]],
 
         sef = resolve(sef_ref)
         radio_ref = sef.get("rfBranchRef") if sef else None
-        # rfBranchRef may be a LIST (';'-separated) on classic radios — one
-        # RfBranch per antenna branch; the chain resolves only if every target
-        # MO is present.
-        radio_targets = [r for r in re.split(r"[;\n]", _n(radio_ref)) if r.strip()]
+        # rfBranchRef may be a LIST on classic radios — one RfBranch per antenna
+        # branch. modump separates the FDNs with ';', cmdump with whitespace; an
+        # MO FDN never contains a space, so split on either. The chain resolves
+        # only if every target MO is present.
+        radio_targets = [r for r in re.split(r"[;\s]+", _n(radio_ref)) if r.strip()]
         radio_missing = [r for r in radio_targets if not exists(r)]
 
         if not carrier:
