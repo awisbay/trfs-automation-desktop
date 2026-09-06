@@ -712,6 +712,20 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"sw level check failed: {exc}")
 
+            # gNBId internal consistency: GNBDUFunction/GNBCUCPFunction/
+            # GNBCUUPFunction must all carry the same gNBId (no CDD needed).
+            try:
+                gc = audit_core.audit_gnbid_consistency(
+                    records, nodes=nodes, log=self._log)
+                if gc:
+                    results += gc
+                    gcc = Counter(r.status for r in gc)
+                    self._log(
+                        f"gNBId consistency: {gcc.get('Match',0)} ok, "
+                        f"{gcc.get('Mismatch',0)} inconsistent.")
+            except Exception as exc:
+                self._log(f"gNBId consistency check failed: {exc}")
+
             # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
             # into the parameter Detail.
             cell_rows = []

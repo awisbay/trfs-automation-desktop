@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.24] - 2026-09-06
+
+### Added
+- **gNBId internal-consistency audit.** A gNodeB's identity is stored on three MOs
+  (`GNBDUFunction`, `GNBCUCPFunction`, `GNBCUUPFunction`); they must all carry the
+  same `gNBId`. The audit now emits one `consistency` row per node checking they
+  agree (Match, or Mismatch showing the per-MO breakdown) — a misconfig the
+  per-MO CDD audit (GNBDUFunction only) would miss. No CDD/expected and no live
+  state needed, so it is valid even pre-integration. `ExternalGNodeBFunction` is
+  excluded here (it is a neighbour list under attribute `gNodeBId`, not this
+  node's identity).
+
 ## [1.9.23] - 2026-09-06
 
 ### Added

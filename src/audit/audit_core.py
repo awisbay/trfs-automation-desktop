@@ -645,6 +645,51 @@ def audit_sw_level(records: Dict[str, Dict[str, str]], expected: str,
     return out
 
 
+def audit_gnbid_consistency(records: Dict[str, Dict[str, str]],
+                            nodes=None, log=lambda m: None) -> List[AuditResult]:
+    """Internal consistency: a gNodeB's identity (gNBId) is stored on three MOs —
+    ``GNBDUFunction``, ``GNBCUCPFunction`` and ``GNBCUUPFunction`` — which MUST all
+    carry the SAME value. A mismatch is a real misconfiguration (a CU/DU-split or
+    a hand-edit gone wrong) that the per-MO CDD audit (which reads only
+    GNBDUFunction) would not catch. Needs no CDD/expected and no live state, so it
+    is valid even before integration. One row per node that has any of these MOs.
+
+    Note: ``ExternalGNodeBFunction`` also carries a gNB id, but under a DIFFERENT
+    attribute (``gNodeBId``; its ``gNBId`` is -1) and it is a NEIGHBOUR list, not
+    this node's identity — so it is deliberately excluded here (handled by the
+    EN-DC self-reference check instead)."""
+    import collections
+    per = collections.defaultdict(dict)     # node → {MO leaf: gNBId}
+    for ldn, a in records.items():
+        leaf = ldn.split(",")[-1].split("=", 1)[0]
+        if leaf not in ("GNBDUFunction", "GNBCUCPFunction", "GNBCUUPFunction"):
+            continue
+        v = ("" if a.get("gNBId") is None else str(a.get("gNBId")).strip())
+        if not v or v == "-1":
+            continue
+        mn = re.search(r"ManagedElement=([^,]+)", ldn)
+        if mn:
+            per[mn.group(1)][leaf] = v
+
+    _short = {"GNBDUFunction": "DU", "GNBCUCPFunction": "CUCP",
+              "GNBCUUPFunction": "CUUP"}
+    out: List[AuditResult] = []
+    target = list(nodes) if nodes else sorted(per)
+    for node in target:
+        d = per.get(node)
+        if not d:
+            continue
+        breakdown = "; ".join(f"{_short[k]}={d[k]}" for k in sorted(d))
+        vals = set(d.values())
+        status = "Match" if len(vals) == 1 else "Mismatch"
+        out.append(AuditResult(
+            "consistency", node,
+            "GNBDUFunction=1 / GNBCUCPFunction=1 / GNBCUUPFunction=1",
+            "gNBId (DU/CUCP/CUUP equal)", "all equal", breakdown, status,
+            "internal cross-MO consistency", node))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1382,7 +1427,7 @@ def _banner(name: str) -> str:
 # no single attribute to set). ``ip-broker`` is NOT here: bscBrokerIpAddress is
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level"}
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level", "consistency"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.
