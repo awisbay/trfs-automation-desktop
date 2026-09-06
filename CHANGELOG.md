@@ -4,6 +4,19 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.22] - 2026-09-06
+
+### Added
+- **SW level audit.** The audit now checks each node's software level against the
+  expected UpgradePackage id in config.json (`uri_setting.upgrade_package_id`) —
+  the same source of truth as the integration "SW Level Check" step, but read
+  from the DUMP (`SystemFunctions=1,SwM=1,UpgradePackage=<id>`) and reported as a
+  row in the Excel (category `sw-level`): Match when the expected package is
+  present, Mismatch showing the committed package when it differs, NotFound when
+  a dumped node has no UpgradePackage. Nodes with no dump records are skipped, so
+  an offline GSM-only audit is unaffected. Excluded from the generated set
+  scripts (a SW upgrade is not a `set`).
+
 ## [1.9.21] - 2026-09-06
 
 ### Fixed

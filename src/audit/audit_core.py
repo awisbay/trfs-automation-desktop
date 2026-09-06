@@ -589,6 +589,62 @@ def broker_check(broker_items: List[AuditItem],
     return out
 
 
+def audit_sw_level(records: Dict[str, Dict[str, str]], expected: str,
+                   nodes=None, log=lambda m: None) -> List[AuditResult]:
+    """Audit each node's software level against the expected UpgradePackage id
+    from config.json (``uri_setting.upgrade_package_id``) — the same source of
+    truth the integration "SW Level Check" step uses, but read from the DUMP
+    instead of a live AMOS ``pr`` and reported as an audit row.
+
+    The dump carries ``SystemFunctions=1,SwM=1,UpgradePackage=<id>`` MOs (the MO
+    id IS the version, e.g. ``CXP2010174/2-R42J13``), each with a ``state`` such
+    as ``7 (COMMIT_COMPLETED)``. A node is Match when the expected id is present
+    (mirroring the integration check's ``expected in found``); the committed
+    package is shown when it differs. Nodes with no dump records are skipped
+    (nothing to read); a node that has records but no UpgradePackage is
+    NotFound. Emits one row per node."""
+    expected = (expected or "").strip()
+    if not expected:
+        return []
+    import collections
+    ups_by_node = collections.defaultdict(list)   # node → [(up_id, state)]
+    node_has_records = set()
+    for ldn, a in records.items():
+        mn = re.search(r"ManagedElement=([^,]+)", ldn)
+        if mn:
+            node_has_records.add(mn.group(1))
+        parts = ldn.split(",")
+        leaf = parts[-1].split("=", 1)
+        if leaf[0] != "UpgradePackage" or len(leaf) < 2:
+            continue
+        if not any(p.startswith("SwM=") for p in parts):
+            continue
+        if mn and leaf[1]:
+            ups_by_node[mn.group(1)].append(
+                (leaf[1], str(a.get("state") or "")))
+
+    target = list(nodes) if nodes else sorted(node_has_records)
+    out: List[AuditResult] = []
+    for node in target:
+        if node not in node_has_records:
+            continue                      # no dump for this node — nothing to read
+        ups = ups_by_node.get(node, [])
+        found = [u for u, _ in ups]
+        committed = [u for u, s in ups if "COMMIT" in s.upper()]
+        if not found:
+            status, actual = "NotFound", "(none)"
+        elif expected in found:
+            status, actual = "Match", expected
+        else:
+            status = "Mismatch"
+            actual = committed[0] if committed else ", ".join(sorted(set(found)))
+        out.append(AuditResult(
+            "sw-level", node, "SystemFunctions=1,SwM=1,UpgradePackage",
+            "UpgradePackage", expected, actual, status,
+            "config.json uri_setting.upgrade_package_id", node))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1326,7 +1382,7 @@ def _banner(name: str) -> str:
 # no single attribute to set). ``ip-broker`` is NOT here: bscBrokerIpAddress is
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
-_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt"}
+_NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

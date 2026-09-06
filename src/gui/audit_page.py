@@ -692,6 +692,26 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"ip broker check failed: {exc}")
 
+            # SW level: node's UpgradePackage (from the dump) vs the expected
+            # id in config.json (uri_setting.upgrade_package_id) — same source
+            # of truth as the integration "SW Level Check" step, reported here.
+            try:
+                from integration_runner import get_config
+                sw_expected = ((get_config() or {}).get("uri_setting", {})
+                               .get("upgrade_package_id", ""))
+                sw = audit_core.audit_sw_level(
+                    records, sw_expected, nodes=nodes, log=self._log)
+                if sw:
+                    results += sw
+                    sc = Counter(r.status for r in sw)
+                    self._log(
+                        f"SW level: {sc.get('Match',0)} match, "
+                        f"{sc.get('Mismatch',0)} mismatch, "
+                        f"{sc.get('NotFound',0)} not found "
+                        f"(expected {sw_expected}).")
+            except Exception as exc:
+                self._log(f"sw level check failed: {exc}")
+
             # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
             # into the parameter Detail.
             cell_rows = []
