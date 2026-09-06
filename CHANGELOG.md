@@ -4,6 +4,14 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.28] - 2026-09-06
+
+### Changed
+- **gNBId consistency: one row per MO.** The check now emits a separate Detail row
+  for each of `GNBDUFunction=1`, `GNBCUCPFunction=1`, `GNBCUUPFunction=1` — each
+  compared to the consensus value (ties resolved toward DU) — instead of a single
+  combined row, so the specific MO that disagrees is flagged on its own line.
+
 ## [1.9.27] - 2026-09-06
 
 ### Fixed

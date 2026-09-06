@@ -652,14 +652,16 @@ def audit_gnbid_consistency(records: Dict[str, Dict[str, str]],
     carry the SAME value. A mismatch is a real misconfiguration (a CU/DU-split or
     a hand-edit gone wrong) that the per-MO CDD audit (which reads only
     GNBDUFunction) would not catch. Needs no CDD/expected and no live state, so it
-    is valid even before integration. One row per node that has any of these MOs.
+    is valid even before integration. ONE ROW PER MO (GNBDUFunction /
+    GNBCUCPFunction / GNBCUUPFunction), each compared to the consensus value, so
+    the odd MO out is flagged on its own line.
 
     Note: ``ExternalGNodeBFunction`` also carries a gNB id, but under a DIFFERENT
     attribute (``gNodeBId``; its ``gNBId`` is -1) and it is a NEIGHBOUR list, not
     this node's identity — so it is deliberately excluded here (handled by the
     EN-DC self-reference check instead)."""
     import collections
-    per = collections.defaultdict(dict)     # node → {MO leaf: gNBId}
+    per = collections.defaultdict(dict)     # node → {MO leaf: (mo_below, gNBId)}
     for ldn, a in records.items():
         leaf = ldn.split(",")[-1].split("=", 1)[0]
         if leaf not in ("GNBDUFunction", "GNBCUCPFunction", "GNBCUUPFunction"):
@@ -669,24 +671,33 @@ def audit_gnbid_consistency(records: Dict[str, Dict[str, str]],
             continue
         mn = re.search(r"ManagedElement=([^,]+)", ldn)
         if mn:
-            per[mn.group(1)][leaf] = v
+            mo_below = re.sub(r"^.*?ManagedElement=[^,]+,", "", ldn)
+            per[mn.group(1)][leaf] = (mo_below, v)
 
-    _short = {"GNBDUFunction": "DU", "GNBCUCPFunction": "CUCP",
-              "GNBCUUPFunction": "CUUP"}
+    order = ["GNBDUFunction", "GNBCUCPFunction", "GNBCUUPFunction"]
     out: List[AuditResult] = []
     target = list(nodes) if nodes else sorted(per)
     for node in target:
         d = per.get(node)
         if not d:
             continue
-        breakdown = "; ".join(f"{_short[k]}={d[k]}" for k in sorted(d))
-        vals = set(d.values())
-        status = "Match" if len(vals) == 1 else "Mismatch"
-        out.append(AuditResult(
-            "consistency", node,
-            "GNBDUFunction=1 / GNBCUCPFunction=1 / GNBCUUPFunction=1",
-            "gNBId (DU/CUCP/CUUP equal)", "all equal", breakdown, status,
-            "internal cross-MO consistency", node))
+        # Consensus = most common value (ties resolved toward DU, the canonical
+        # source); each MO is Match when it equals the consensus.
+        cnt = collections.Counter(v for _, v in d.values())
+        ref = None
+        if "GNBDUFunction" in d:
+            ref = d["GNBDUFunction"][1]
+        top = cnt.most_common(1)[0]
+        if top[1] > 1 or ref is None:
+            ref = top[0]
+        for leaf in order:
+            if leaf not in d:
+                continue
+            mo_below, v = d[leaf]
+            status = "Match" if v == ref else "Mismatch"
+            out.append(AuditResult(
+                "consistency", node, mo_below, "gNBId", ref, v, status,
+                "internal cross-MO consistency (DU/CUCP/CUUP)", node))
     return out
 
 
