@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.23] - 2026-09-06
+
+### Added
+- **Audit node/cell identity: eNB ID, gNB ID, cell ID.** Added to `audit_map.json`
+  (config-only, no code): LTE `ENodeBFunction.eNBId` ← CDD `ENodeBID`, LTE cell
+  `EUtranCell(FDD/TDD).cellId` ← CDD `CellID`, NR `GNBDUFunction.gNBId` ← CDD
+  `gNodeBID`, NR cell `NRCellDU.cellLocalId` ← CDD `LocalCellID`. PCI and TAC were
+  already audited. (PLMN/MCC/MNC and derived ECGI/NCI still pending — they need a
+  small normalizer / composite, tracked separately.)
+
 ## [1.9.22] - 2026-09-06
 
 ### Added
