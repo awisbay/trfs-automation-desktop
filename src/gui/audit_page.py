@@ -741,6 +741,20 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"EN-DC external check failed: {exc}")
 
+            # Reference-chain traceability: Cell/GsmSector → Carrier/Trx →
+            # SectorEquipmentFunction → Radio. Flags any broken hop.
+            try:
+                ch = audit_core.audit_chain_trace(
+                    records, nodes=nodes, log=self._log)
+                if ch:
+                    results += ch
+                    chc = Counter(r.status for r in ch)
+                    self._log(
+                        f"Ref chain: {chc.get('Match',0)} resolve, "
+                        f"{chc.get('Mismatch',0)} broken.")
+            except Exception as exc:
+                self._log(f"chain trace check failed: {exc}")
+
             # Cell inventory → its OWN sheet (per-cell CDD vs node), not mixed
             # into the parameter Detail.
             cell_rows = []

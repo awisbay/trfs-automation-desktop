@@ -780,6 +780,124 @@ def audit_endc_external(records: Dict[str, Dict[str, str]],
     return out
 
 
+def audit_chain_trace(records: Dict[str, Dict[str, str]],
+                      nodes=None, log=lambda m: None) -> List[AuditResult]:
+    """End-to-end MO reference-chain traceability, per cell/sector:
+
+        Cell / GsmSector
+          → SectorCarrier / NRSectorCarrier / Trx
+            → SectorEquipmentFunction
+              → Radio (rfBranchRef → FieldReplaceableUnit[/Transceiver] or RfBranch)
+
+    Each hop is a reference attribute; if any is unset or points to an MO that is
+    not in the dump, the chain is broken and the cell can't carry traffic. This
+    walks the chain and reports, per cell, whether it fully resolves (Match) or
+    the first hop that breaks (Mismatch). Pure internal — no CDD/expected and no
+    live state, valid pre-integration. On AAS radios the chain ends at the radio
+    FRU/Transceiver (there is no separate RfBranch MO), which counts as resolved."""
+    def _below(l):
+        return re.sub(r"^.*?ManagedElement=[^,]+,", "", l)
+
+    def _n(x):
+        return "" if x is None else str(x).strip()
+
+    # Resolver maps (built once): a ref may be a full FDN or omit ManagedElement.
+    by_full = records
+    by_below = {}
+    for k, v in records.items():
+        by_below.setdefault(_below(k), v)
+
+    def resolve(ref):
+        r = _n(ref)
+        if not r:
+            return None
+        return by_full.get(r) or by_below.get(_below(r))
+
+    def exists(ref):
+        return resolve(ref) is not None
+
+    # Trx per GsmSector (GSM chain starts GsmSector → Trx → SEF).
+    import collections
+    trx_by_sector = collections.defaultdict(list)
+    for l, a in records.items():
+        if l.split(",")[-1].split("=", 1)[0] == "Trx":
+            m = re.search(r"((?:.*,)?GsmSector=[^,]+)", _below(l))
+            if m:
+                trx_by_sector[m.group(1)].append(a)
+
+    def _radio_name(ref):
+        s = _n(ref)
+        m = re.search(r"FieldReplaceableUnit=([^,;]+)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"AntennaUnitGroup=([^,;]+)", s)
+        if m:
+            return m.group(1)                     # classic radio (RfBranch list)
+        return _below(s.split(";")[0]).split(",")[-1]
+
+    out: List[AuditResult] = []
+    target = set(nodes) if nodes else None
+    for l, a in records.items():
+        leaf = l.split(",")[-1].split("=", 1)[0]
+        mn = re.search(r"ManagedElement=([^,]+)", l)
+        node = mn.group(1) if mn else ""
+        if target is not None and node not in target:
+            continue
+        ref_cell = l.split(",")[-1]
+
+        # Resolve hop 1 (cell → carrier / sector → Trx) and the carrier attrs
+        # that carry the SEF reference.
+        if leaf in ("EUtranCellFDD", "EUtranCellTDD"):
+            carrier_ref = a.get("sectorCarrierRef")
+            carrier = resolve(carrier_ref)
+            sef_ref = carrier.get("sectorFunctionRef") if carrier else None
+            hop1_label, hop1_val = "SectorCarrier", carrier_ref
+        elif leaf == "NRCellDU":
+            carrier_ref = a.get("nRSectorCarrierRef")
+            carrier = resolve(carrier_ref)
+            sef_ref = (carrier.get("sectorEquipmentFunctionRef")
+                       if carrier else None)
+            hop1_label, hop1_val = "NRSectorCarrier", carrier_ref
+        elif leaf == "GsmSector":
+            trxs = trx_by_sector.get(_below(l), [])
+            carrier = trxs[0] if trxs else None
+            carrier_ref = "Trx" if trxs else ""
+            sef_ref = (carrier.get("sectorEquipmentFunctionRef")
+                       if carrier else None)
+            hop1_label, hop1_val = "Trx", (carrier_ref or "")
+        else:
+            continue
+
+        sef = resolve(sef_ref)
+        radio_ref = sef.get("rfBranchRef") if sef else None
+        # rfBranchRef may be a LIST (';'-separated) on classic radios — one
+        # RfBranch per antenna branch; the chain resolves only if every target
+        # MO is present.
+        radio_targets = [r for r in re.split(r"[;\n]", _n(radio_ref)) if r.strip()]
+        radio_missing = [r for r in radio_targets if not exists(r)]
+
+        if not carrier:
+            status, actual = "Mismatch", \
+                f"broken at {hop1_label}: {hop1_val or '(unset)'}"
+        elif not sef_ref or not sef:
+            status, actual = "Mismatch", \
+                f"broken at SectorEquipmentFunction: {_n(sef_ref) or '(unset)'}"
+        elif not radio_targets:
+            status, actual = "Mismatch", "broken at Radio (rfBranchRef): (unset)"
+        elif radio_missing:
+            status, actual = "Mismatch", (
+                f"broken at Radio (rfBranchRef): "
+                f"{len(radio_missing)}/{len(radio_targets)} target MO(s) missing")
+        else:
+            status, actual = "Match", f"OK -> {_radio_name(radio_ref)}"
+
+        out.append(AuditResult(
+            "chain", node, _below(l), "ref chain (Cell->Carrier->SEF->Radio)",
+            "resolves", actual, status, "MO reference traceability", node,
+            ref_cell=ref_cell))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1518,7 +1636,7 @@ def _banner(name: str) -> str:
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
-                            "consistency", "endc"}
+                            "consistency", "endc", "chain"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

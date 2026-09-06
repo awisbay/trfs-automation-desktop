@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.26] - 2026-09-06
+
+### Added
+- **Reference-chain traceability audit (`chain`).** Walks the end-to-end MO chain
+  per cell/sector — Cell/GsmSector → SectorCarrier/NRSectorCarrier/Trx →
+  SectorEquipmentFunction → Radio (`rfBranchRef`) — and reports, per cell, whether
+  it fully resolves (Match, naming the radio) or the first hop that breaks
+  (Mismatch: unset or a ref to an MO not in the dump). Handles AAS radios (chain
+  ends at the radio FRU/Transceiver, no RfBranch) and classic radios (multi-value
+  `rfBranchRef` list of RfBranch MOs — every target must resolve), across LTE, NR
+  and GSM. Pure internal, no CDD/expected or live state, valid pre-integration.
+
 ## [1.9.25] - 2026-09-06
 
 ### Added
