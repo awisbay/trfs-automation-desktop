@@ -4,6 +4,21 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.29] - 2026-09-07
+
+### Changed
+- **SW level: pick the COMMIT_COMPLETED package when several exist.** A node often
+  carries more than one UpgradePackage (a PREPARE_COMPLETED leftover beside the
+  active one). Both the audit (`sw-level`, from the dump) and the integration
+  "SW Level Check" now compare the **committed** package to the expected id
+  instead of matching against any package present:
+  - Audit reads `UpgradePackage.state` from the dump — matches the label
+    `COMMIT_COMPLETED`, so it covers both modump (`7 (COMMIT_COMPLETED)`) and
+    cmdump (bare `COMMIT_COMPLETED`).
+  - Integration now runs `hgetc UpgradePackage state`, parses each
+    `UpgradePackage=<id>;<state>` row, and checks the COMMIT_COMPLETED one
+    (was `pr …UpgradePackage=` with an "expected in list" match).
+
 ## [1.9.28] - 2026-09-06
 
 ### Changed

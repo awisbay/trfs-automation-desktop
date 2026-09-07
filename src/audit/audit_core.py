@@ -630,14 +630,27 @@ def audit_sw_level(records: Dict[str, Dict[str, str]], expected: str,
             continue                      # no dump for this node — nothing to read
         ups = ups_by_node.get(node, [])
         found = [u for u, _ in ups]
-        committed = [u for u, s in ups if "COMMIT" in s.upper()]
+        # The EFFECTIVE package is the COMMIT_COMPLETED one. modump reports the
+        # state as "7 (COMMIT_COMPLETED)", cmdump as bare "COMMIT_COMPLETED" —
+        # match the label, not the numeric code, so both are covered. When a
+        # node carries several packages (e.g. a PREPARE_COMPLETED leftover next
+        # to the committed one) only the committed one is compared to expected.
+        committed = [u for u, s in ups if "COMMIT_COMPLETED" in s.upper()]
+        if committed:
+            effective = committed[0]
+        elif len(found) == 1:
+            effective = found[0]
+        else:
+            effective = ""
         if not found:
             status, actual = "NotFound", "(none)"
-        elif expected in found:
-            status, actual = "Match", expected
+        elif not effective:
+            status, actual = "NotFound", \
+                "no COMMIT_COMPLETED among: " + ", ".join(sorted(set(found)))
+        elif effective == expected:
+            status, actual = "Match", effective
         else:
-            status = "Mismatch"
-            actual = committed[0] if committed else ", ".join(sorted(set(found)))
+            status, actual = "Mismatch", effective
         out.append(AuditResult(
             "sw-level", node, "SystemFunctions=1,SwM=1,UpgradePackage",
             "UpgradePackage", expected, actual, status,

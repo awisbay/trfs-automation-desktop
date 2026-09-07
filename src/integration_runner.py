@@ -4211,34 +4211,53 @@ def run_sw_check(
     """Check the node's active Upgrade Package against the expected
     version from config.json (``uri_setting.upgrade_package_id``).
 
-    Runs ``pr SystemFunctions=1,SwM=1,UpgradePackage=`` and reads the
-    ``UpgradePackage=<version>`` shown. OK when it matches the expected
-    id (e.g. ``CXP2010174/2-R42J13``).
+    Runs ``hgetc UpgradePackage state`` and reads one ``UpgradePackage=<id>;
+    <state>`` row per package. A node often carries more than one package (a
+    ``PREPARE_COMPLETED`` leftover beside the active one), so the EFFECTIVE
+    package is the one whose state is ``COMMIT_COMPLETED`` — that is what is
+    compared to the expected id (e.g. ``CXP2010174/2-R42J13``).
 
     Returns ``(ok, full_output, detail)`` — detail e.g. ``"OK (CXP.../2-R42J13)"``
-    or ``"Not OK (got R42H05, want R42J13)"``.
+    or ``"Not OK (committed R42H05, want R42J13)"``.
     """
     if expected is None:
         expected = _UPGRADE_PKG_ID
     expected = (expected or "").strip()
 
-    log_cb(f"Checking SW level (expected UpgradePackage: {expected})...")
+    log_cb(f"Checking SW level (expected committed UpgradePackage: {expected})...")
     out = ssh.run_amos_command_safe(
-        "pr SystemFunctions=1,SwM=1,UpgradePackage=", node_name, timeout=60)
+        "hgetc UpgradePackage state", node_name, timeout=60)
     log_cb(f"SW level output:\n{out}")
 
-    # The echoed command ends with a bare 'UpgradePackage=' (no value);
-    # only the result row(s) carry a real value → \S+ skips the empty one.
-    found = [v for v in re.findall(r"UpgradePackage=(\S+)", out) if v]
-    ok = expected in found
-    if not found:
-        detail = f"Not OK (no UpgradePackage found, want {expected})"
-    elif ok:
-        detail = f"OK ({expected})"
-    else:
-        detail = f"Not OK (got {', '.join(found)}, want {expected})"
+    # Parse "SwM=1,UpgradePackage=<id>;<state>" rows → {id: state}. The id holds
+    # '/' and '-' but never a space or ';'.
+    pkgs = {}
+    for line in out.splitlines():
+        m = re.search(r"UpgradePackage=(\S+?)\s*;\s*(.+?)\s*$", line)
+        if m:
+            pkgs[m.group(1)] = m.group(2).strip()
 
-    log_cb(("✓ SW level " if ok else "✗ SW level ") + detail)
+    committed = [pid for pid, st in pkgs.items()
+                 if "COMMIT_COMPLETED" in st.upper()]
+    if committed:
+        effective = committed[0]
+    elif len(pkgs) == 1:
+        effective = next(iter(pkgs))
+    else:
+        effective = ""
+
+    ok = bool(effective) and effective == expected
+    if not pkgs:
+        detail = f"Not OK (no UpgradePackage found, want {expected})"
+    elif not effective:
+        detail = (f"Not OK (no COMMIT_COMPLETED among "
+                  f"{', '.join(sorted(pkgs))}, want {expected})")
+    elif ok:
+        detail = f"OK (committed {effective})"
+    else:
+        detail = f"Not OK (committed {effective}, want {expected})"
+
+    log_cb(("[OK] SW level " if ok else "[X] SW level ") + detail)
     return ok, out, detail
 
 
