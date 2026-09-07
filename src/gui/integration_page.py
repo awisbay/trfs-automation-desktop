@@ -3655,6 +3655,31 @@ class IntegrationRunPage:
                                         return False
 
                                 parse_sources = list(downloaded)
+
+                                # The baseline .mos writes its OWN full run log
+                                # to /home/shared/<user>/<node>..._baseline_*.log
+                                # (the app's wrapper caught only the echo). Grab
+                                # the newest, drop it into MOSHELL/ replacing the
+                                # tiny wrapper, delete the server copies, and use
+                                # it as the primary parse source.
+                                try:
+                                    _safe = re.sub(r"[^A-Za-z0-9._-]", "_",
+                                                   node_name)
+                                    _raw = os.path.join(
+                                        self.log_dir, "MOSHELL",
+                                        f"BASELINE_{_safe}.log")
+                                    _got = ssh.fetch_and_purge_baseline_logs(
+                                        node_name, _raw)
+                                    if _got:
+                                        ui_cb("Baseline raw log retrieved from "
+                                              "server and server copies removed.")
+                                        parse_sources = (
+                                            [_got] + [p for p in parse_sources
+                                                      if p != _got])
+                                except Exception as _bx:
+                                    ui_cb(f"(baseline raw-log fetch skipped: "
+                                          f"{_bx})")
+
                                 use_fallback = (
                                     not parse_sources
                                     or not any(

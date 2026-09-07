@@ -4,6 +4,21 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.30] - 2026-09-07
+
+### Fixed
+- **Baseline: capture the .mos full run log and clean up the server.** The
+  baseline `.mos` writes its own full log to `/home/shared/<user>/<node>…_baseline_
+  <ts>.log` (the real name often contains a literal backslash), which NodeCraft
+  never tracked — so those piled up on the server while the app's own MOSHELL
+  wrapper had captured only the script echo (~8 KB). At the end of the baseline
+  step NodeCraft now lists the home dir (glob-free, so the backslash is
+  harmless), downloads the NEWEST such log into `LOG/<node>/MOSHELL/BASELINE_
+  <node>.log` — replacing the near-empty wrapper and feeding the parser the full
+  content — then deletes every matching server copy for that node. Verified the
+  session log already equalled this file, so no content is lost; this just
+  puts the rich raw log in MOSHELL/ and stops the server accumulating leftovers.
+
 ## [1.9.29] - 2026-09-07
 
 ### Changed

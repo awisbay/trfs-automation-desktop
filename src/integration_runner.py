@@ -547,6 +547,66 @@ class IntegrationSSH:
             self._log(f"SFTP remove failed for {remote_path}: {exc}")
             return False
 
+    def fetch_and_purge_baseline_logs(self, node_name: str,
+                                      local_path: str) -> Optional[str]:
+        """The baseline ``.mos`` writes its OWN full run log to
+        ``/home/shared/<user>/<node>..._baseline_<ts>.log`` (note: the real name
+        often has a literal backslash, e.g. ``<node>\\_baseline_...``). NodeCraft
+        never tracked these, so they pile up while our own MOSHELL wrapper caught
+        only the script echo. This finds them by listing the home dir (glob-free,
+        so the backslash is harmless), downloads the NEWEST into ``local_path``
+        (replacing the near-empty wrapper), then DELETES every matching file from
+        the server. Returns the local path, or None if none were found.
+
+        Best-effort: any failure is logged and returns None without raising."""
+        home = f"/home/shared/{self.username}"
+        try:
+            sftp = self.client.open_sftp()
+        except Exception as exc:
+            self._log(f"[baseline-logs] cannot open SFTP: {exc}")
+            return None
+        try:
+            try:
+                entries = sftp.listdir_attr(home)
+            except Exception as exc:
+                self._log(f"[baseline-logs] cannot list {home}: {exc}")
+                return None
+            matches = [e for e in entries
+                       if e.filename.startswith(node_name)
+                       and "_baseline_" in e.filename
+                       and e.filename.endswith(".log")]
+            if not matches:
+                return None
+            newest = max(matches, key=lambda e: getattr(e, "st_mtime", 0) or 0)
+            ldir = os.path.dirname(local_path)
+            if ldir and not os.path.exists(ldir):
+                os.makedirs(ldir, exist_ok=True)
+            remote_newest = f"{home}/{newest.filename}"
+            try:
+                sftp.get(remote_newest, local_path)
+                self._log(f"[baseline-logs] downloaded {newest.filename} "
+                          f"({(getattr(newest,'st_size',0) or 0)//1024} KB) "
+                          f"-> {os.path.basename(local_path)}")
+            except Exception as exc:
+                self._log(f"[baseline-logs] download failed for "
+                          f"{newest.filename}: {exc}")
+                return None
+            removed = 0
+            for e in matches:
+                try:
+                    sftp.remove(f"{home}/{e.filename}")
+                    removed += 1
+                except Exception:
+                    pass
+            self._log(f"[baseline-logs] removed {removed} server file(s) "
+                      f"for {node_name}")
+            return local_path
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
     def reconnect(self, timeout: int = 30):
         """Disconnect and re-establish the SSH session."""
         self._log("Reconnecting SSH session...")
