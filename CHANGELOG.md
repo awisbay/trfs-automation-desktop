@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.33] - 2026-09-08
+
+### Changed
+- **Feature audit rows now explain WHY and WHICH feature.** Each row carries the
+  config it belongs to — a should-be-deactivated feature reads `Non <config>`
+  (e.g. `Non AAS TDD`, `Non AAS FDD`, `Non EN-DC/NR`) in the Reference column and
+  expected/actual text, and the feature's own description (e.g. "Basic AAS for
+  TDD", read from the node's `FeatureState.description`) is shown in the Source
+  column. AAS TDD (B41) and AAS FDD (B1/B3) are labelled distinctly.
+
 ## [1.9.32] - 2026-09-08
 
 ### Changed

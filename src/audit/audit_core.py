@@ -988,16 +988,17 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
 
 
 def _feature_state(node, feat, records):
-    """(featureState, licenseState) strings for ``FeatureState=<feat>`` on
-    ``node``, or (None, None) if the MO is absent."""
+    """(featureState, licenseState, description) for ``FeatureState=<feat>`` on
+    ``node``, or (None, None, "") if the MO is absent."""
     for ldn, a in records.items():
         if ldn.split(",")[-1] != f"FeatureState={feat}":
             continue
         m = re.search(r"ManagedElement=([^,]+)", ldn)
         if m and m.group(1) != node:
             continue
-        return (a.get("featureState"), a.get("licenseState"))
-    return (None, None)
+        return (a.get("featureState"), a.get("licenseState"),
+                (a.get("description") or "").strip())
+    return (None, None, "")
 
 
 def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
@@ -1030,6 +1031,21 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
         s = str(v or "").strip().upper()
         return s.startswith("1") or "ACTIVATED" in s or "ENABLED" in s
 
+    # Friendly label per detect condition — so a row explains WHICH config it
+    # belongs to (e.g. "AAS FDD", "AAS TDD", "EN-DC/NR").
+    _LABEL = {"8t8r": "8T8R", "4t4r": "4T4R", "nr": "EN-DC/NR",
+              "aas_b41_lte": "AAS TDD", "aas_b41_nr": "AAS TDD",
+              "aas_b1b3": "AAS FDD", "lte": "LTE", "ess": "ESS"}
+
+    def _labels(conds_set):
+        seen, out_l = set(), []
+        for c in sorted(conds_set):
+            lab = _LABEL.get(c, c)
+            if lab not in seen:
+                seen.add(lab)
+                out_l.append(lab)
+        return "/".join(out_l)
+
     # nodes that actually appear in the dump
     node_set = set()
     for ldn in records:
@@ -1046,9 +1062,11 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
             gov = feat_conds[feat]
             active_conds = sorted(gov & conds)
             expect_active = bool(active_conds)
-            fstate, lstate = _feature_state(node, feat, records)
+            fstate, lstate, fdesc = _feature_state(node, feat, records)
             mo = f"SystemFunctions=1,Lm=1,FeatureState={feat}"
-            ref = ",".join(active_conds) or "no matching config"
+            src = fdesc or "feature compliance"       # feature name (description)
+            gov_label = _labels(gov)                  # config this feature needs
+            ref = _labels(active_conds) if active_conds else gov_label
             if fstate is None:
                 # MO absent: an issue only when the feature was expected active
                 # (missing/unlicensed); when it should be off, absent == off = OK.
@@ -1058,13 +1076,13 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 if expect_active and feat not in baseline_feats:
                     out.append(AuditResult(
                         "feature", node, mo, "featureState",
-                        f"ACTIVATED ({','.join(active_conds)})",
+                        f"ACTIVATED ({ref})",
                         "(FeatureState MO not found)", "NotFound",
-                        "feature compliance", node, ref_cell=ref))
+                        src, node, ref_cell=ref))
                 continue
             f_on, l_on = _is1(fstate), _is1(lstate)
             if expect_active:
-                exp = f"ACTIVATED ({','.join(active_conds)})"
+                exp = f"ACTIVATED ({ref})"
                 if f_on and l_on:
                     continue                      # OK → hidden (only issues shown)
                 remarks = []
@@ -1079,12 +1097,16 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
             else:
                 if not f_on:
                     continue                      # correctly deactivated → hidden
-                exp = "DEACTIVATED (no matching config)"
-                act = "ACTIVATED (Should be Deactivated)"
+                # Remark names the config this feature belongs to, prefixed
+                # "Non " because the node does NOT have it (e.g. "Non AAS TDD").
+                reason = f"Non {gov_label}"
+                exp = f"DEACTIVATED ({reason})"
+                act = f"ACTIVATED (Should be Deactivated: {reason})"
                 status = "Mismatch"
+                ref = reason
             out.append(AuditResult(
                 "feature", node, mo, "featureState", exp, act, status,
-                "feature compliance", node, ref_cell=ref))
+                src, node, ref_cell=ref))
     return out
 
 
