@@ -75,7 +75,8 @@ class IntegrationQueue:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"updated_at": _now(), "jobs": [asdict(j) for j in self.jobs]},
                       fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, self._path)
+        from relation_journal import replace_with_retry
+        replace_with_retry(tmp, self._path)   # tolerate OneDrive/AV locks
 
     # ── mutations ───────────────────────────────────────────────
     def add(self, shortcode: str, form: dict, selected_per_node: dict,

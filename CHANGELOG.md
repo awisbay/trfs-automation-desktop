@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.34] - 2026-09-08
+
+### Fixed
+- **"WinError 5 Access is denied" on the relation journal (OneDrive folders).**
+  The journal's atomic save renamed a `.tmp` onto the final `.json` with
+  `os.replace`, which fails on Windows when a OneDrive/cloud sync client, search
+  indexer, or antivirus holds the destination for a moment — aborting "Load
+  Neighbour Relation Scripts". `replace_with_retry()` now retries the rename with
+  a short backoff and, as a last resort, falls back to a non-atomic in-place copy
+  so the data is still written. Applied to the relation journal (save + archive)
+  and the same pattern in cutover checkpoint and integration-queue writers.
+
 ## [1.9.33] - 2026-09-08
 
 ### Changed

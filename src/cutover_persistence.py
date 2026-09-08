@@ -127,7 +127,8 @@ def write_json_atomic(path: str, data: dict) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, path)
+    from relation_journal import replace_with_retry
+    replace_with_retry(temp, path)   # tolerate OneDrive/AV transient locks
 
 
 def load(path: str) -> dict:

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -12,6 +13,39 @@ from datetime import datetime
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def replace_with_retry(src: str, dst: str, attempts: int = 12,
+                       delay: float = 0.15) -> None:
+    """``os.replace`` that tolerates the transient locks common on OneDrive /
+    OneDrive-synced / antivirus-scanned folders. On Windows a sync client or the
+    search indexer can hold the destination for a few hundred ms exactly when we
+    rename, raising ``PermissionError`` (WinError 5). Retry a few times with a
+    short backoff; if it still fails, fall back to a non-atomic in-place copy
+    (loses atomicity but keeps the data), and only then re-raise."""
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last = exc
+            time.sleep(delay * (i + 1))
+        except OSError as exc:
+            last = exc
+            time.sleep(delay * (i + 1))
+    # Last resort: overwrite the destination in place, then drop the temp.
+    try:
+        shutil.copyfile(src, dst)
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+        return
+    except Exception:
+        if last is not None:
+            raise last
+        raise
 
 
 def sha256_file(path: str) -> str:
@@ -46,7 +80,7 @@ def save(path: str, data: dict) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, path)
+    replace_with_retry(temp, path)
 
 
 def _archive(path: str, data: dict) -> None:
@@ -56,7 +90,7 @@ def _archive(path: str, data: dict) -> None:
     os.makedirs(archive_dir, exist_ok=True)
     run_id = _safe(str(data.get("run_id", int(time.time()))))
     target = os.path.join(archive_dir, f"{run_id}_{os.path.basename(path)}")
-    os.replace(path, target)
+    replace_with_retry(path, target)
 
 
 def open_or_create(log_dir: str, node_name: str, shortcode: str,
