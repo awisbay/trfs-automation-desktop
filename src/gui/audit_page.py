@@ -741,6 +741,31 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"EN-DC external check failed: {exc}")
 
+            # Feature compliance: condition (8T8R/4T4R/NR/AAS/LTE/ESS) → the
+            # CXC features that must be ACTIVATED+ENABLED, else DEACTIVATED.
+            try:
+                frules = audit_map.get("feature_rules") or {}
+                cdd_tx = {}
+                for it in items:
+                    if it.parameter == "noOfTxAntennas":
+                        try:
+                            cdd_tx.setdefault(it.node or site, set()).add(
+                                int(str(it.expected).strip()))
+                        except (ValueError, TypeError):
+                            pass
+                fr = audit_core.audit_features(
+                    records, frules, cdd_tx_by_node=cdd_tx, nodes=nodes,
+                    log=self._log)
+                if fr:
+                    results += fr
+                    frc = Counter(r.status for r in fr)
+                    self._log(
+                        f"Feature compliance: {frc.get('Match',0)} ok, "
+                        f"{frc.get('Mismatch',0)} mismatch, "
+                        f"{frc.get('NotFound',0)} not found.")
+            except Exception as exc:
+                self._log(f"feature compliance check failed: {exc}")
+
             # Reference-chain traceability: Cell/GsmSector → Carrier/Trx →
             # SectorEquipmentFunction → Radio. Flags any broken hop.
             try:

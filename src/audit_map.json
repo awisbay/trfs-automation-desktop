@@ -1,6 +1,6 @@
 {
   "gsm_fdn_prefix": "SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T7,SubNetwork=BSC,MeContext={bsc},ManagedElement={bsc},BscFunction=1,BscM=1,GeranCellM=1",
-  "_note": "CDD Audit mapping. Each profile maps a CDD sheet to a node MO. 'mo_fdn'/'mo' are templates: {ColumnHeader} is replaced with the row value. 'attr' = the MO attribute name in the modump/cmdump (calibrate against a real dump). node_key_column filters rows to the audited node. Add params/sheets by editing this file — no rebuild.",
+  "_note": "CDD Audit mapping. Each profile maps a CDD sheet to a node MO. 'mo_fdn'/'mo' are templates: {ColumnHeader} is replaced with the row value. 'attr' = the MO attribute name in the modump/cmdump (calibrate against a real dump). node_key_column filters rows to the audited node. Add params/sheets by editing this file \u00e2\u20ac\u201d no rebuild.",
   "profiles": [
     {
       "name": "LTE Node (ManagedElement)",
@@ -218,7 +218,7 @@
       ]
     },
     {
-      "name": "GSM Cell (BSC — via live cmedit, not dump)",
+      "name": "GSM Cell (BSC \u00e2\u20ac\u201d via live cmedit, not dump)",
       "tech": "gsm",
       "category": "cell",
       "source": "cmedit",
@@ -348,5 +348,227 @@
         }
       ]
     }
-  ]
+  ],
+  "_comment_feature_rules": "Conditional feature compliance. detect => when that config is present on the node the listed CXC features MUST be featureState=ACTIVATED & licenseState=ENABLED; when the config is ABSENT they must be DEACTIVATED. Editable, no rebuild.",
+  "feature_rules": {
+    "lte": {
+      "detect": "lte",
+      "features": [
+        "CXC4040002",
+        "CXC4040007",
+        "CXC4040008",
+        "CXC4040009",
+        "CXC4040010",
+        "CXC4012104",
+        "CXC4040019",
+        "CXC4012344",
+        "CXC4012271",
+        "CXC4012349",
+        "CXC4012018",
+        "CXC4010320",
+        "CXC4010620",
+        "CXC4011422",
+        "CXC4011373",
+        "CXC4011376",
+        "CXC4012123",
+        "CXC4011370",
+        "CXC4011476",
+        "CXC4011922",
+        "CXC4011378",
+        "CXC4012097",
+        "CXC4011698",
+        "CXC4011910",
+        "CXC4010956",
+        "CXC4012383",
+        "CXC4012129",
+        "CXC4011064",
+        "CXC4011969",
+        "CXC4011913",
+        "CXC4011255",
+        "CXC4012326",
+        "CXC4010912",
+        "CXC4010609",
+        "CXC4011262",
+        "CXC4011060",
+        "CXC4011955",
+        "CXC4011061",
+        "CXC4011937",
+        "CXC4011559",
+        "CXC4011940",
+        "CXC4011245",
+        "CXC4011482",
+        "CXC4012316",
+        "CXC4011930",
+        "CXC4011981",
+        "CXC4011980",
+        "CXC4012111",
+        "CXC4010618",
+        "CXC4011157",
+        "CXC4040018",
+        "CXC4011554",
+        "CXC4012454",
+        "CXC4011983",
+        "CXC4010770",
+        "CXC4011319",
+        "CXC4010974",
+        "CXC4011443",
+        "CXC4010613",
+        "CXC4010319",
+        "CXC4012273",
+        "CXC4011966",
+        "CXC4011055",
+        "CXC4011999",
+        "CXC4012015",
+        "CXC4011018",
+        "CXC4011345",
+        "CXC4010723",
+        "CXC4011485",
+        "CXC4011815",
+        "CXC4011366",
+        "CXC4011163",
+        "CXC4012485",
+        "CXC4012563",
+        "CXC4011813",
+        "CXC4012131",
+        "CXC4011183",
+        "CXC4011515",
+        "CXC4011033",
+        "CXC4010717",
+        "CXC4011715",
+        "CXC4011938",
+        "CXC4010980",
+        "CXC4011252",
+        "CXC4010959",
+        "CXC4011710",
+        "CXC4010856",
+        "CXC4010973",
+        "CXC4012412",
+        "CXC4011939",
+        "CXC4012261",
+        "CXC4010961",
+        "CXC4012240",
+        "CXC4010990",
+        "CXC4011251",
+        "CXC4011075",
+        "CXC4011346",
+        "CXC4011736",
+        "CXC4012070",
+        "CXC4011918",
+        "CXC4012346",
+        "CXC4011479",
+        "CXC4011264",
+        "CXC4012345",
+        "CXC4040016",
+        "CXC4011050",
+        "CXC4011714",
+        "CXC4011326",
+        "CXC4011996",
+        "CXC4012022",
+        "CXC4011253",
+        "CXC4011911",
+        "CXC4011946",
+        "CXC4011444",
+        "CXC4012036",
+        "CXC4011074",
+        "CXC4011820",
+        "CXC4012003",
+        "CXC4011973",
+        "CXC4012370",
+        "CXC4011258",
+        "CXC4011914",
+        "CXC4012024",
+        "CXC4012411",
+        "CXC4011666",
+        "CXC4012392",
+        "CXC4012396",
+        "CXC4012601",
+        "CXC4012352",
+        "CXC4011929",
+        "CXC4012286",
+        "CXC4012791"
+      ]
+    },
+    "nr_baseline": {
+      "detect": "nr",
+      "features": [
+        "CXC4012492",
+        "CXC4012589",
+        "CXC4012558",
+        "CXC4012375",
+        "CXC4012681",
+        "CXC4012673",
+        "CXC4012652",
+        "CXC4012635",
+        "CXC4012634",
+        "CXC4012610",
+        "CXC4012347",
+        "CXC4012555",
+        "CXC4012500",
+        "CXC4012562",
+        "CXC4012832",
+        "CXC4012790",
+        "CXC4012745",
+        "CXC4012547",
+        "CXC4011929"
+      ]
+    },
+    "ess": {
+      "detect": "ess",
+      "features": [
+        "CXC4012554",
+        "CXC4012583",
+        "CXC4012581",
+        "CXC4012507",
+        "CXC4012528"
+      ]
+    },
+    "8t8r": {
+      "detect": "8t8r",
+      "features": [
+        "CXC4011254",
+        "CXC4011840",
+        "CXC4012198"
+      ]
+    },
+    "4t4r": {
+      "detect": "4t4r",
+      "features": [
+        "CXC4011427",
+        "CXC4011667",
+        "CXC4011056"
+      ]
+    },
+    "nr_endc": {
+      "detect": "nr",
+      "features": [
+        "CXC4012218",
+        "CXC4012371",
+        "CXC4012504",
+        "CXC4012381"
+      ]
+    },
+    "aas_b41_lte": {
+      "detect": "aas_b41_lte",
+      "features": [
+        "CXC4012257"
+      ]
+    },
+    "aas_b41_nr": {
+      "detect": "aas_b41_nr",
+      "features": [
+        "CXC4012590",
+        "CXC4012510",
+        "CXC4012406",
+        "CXC4012272",
+        "CXC4012330"
+      ]
+    },
+    "aas_b1b3": {
+      "detect": "aas_b1b3",
+      "features": [
+        "CXC4012254",
+        "CXC4012369"
+      ]
+    }
+  }
 }

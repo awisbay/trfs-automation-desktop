@@ -8,6 +8,7 @@ enp-generator ``services/audit_engine.py`` / ``services/node_audit.py``.
 from __future__ import annotations
 
 import os
+import collections
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -923,6 +924,164 @@ def audit_chain_trace(records: Dict[str, Dict[str, str]],
     return out
 
 
+def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
+    """Return the set of config conditions present on ``node`` — the vocabulary
+    used by ``feature_rules`` detect keys:
+      lte, nr, ess, 8t8r, 4t4r, aas_b41_lte, aas_b41_nr, aas_b1b3.
+
+    8T8R/4T4R detection priority (per spec): CDD MIMO Tx count first (reliable
+    even pre-integration), then node ``noOfTxAntennas`` on (NR)SectorCarrier
+    (skipping 0/-1 which mean "not set"), then the number of ``RfBranch`` MOs
+    under a radio (8 → 8x8, 4 → 4x4)."""
+    conds = set()
+    nl = node
+    fru_ids = []
+    tx_counts = set()
+    rfbranch_by_radio = collections.defaultdict(set)
+    for ldn, a in records.items():
+        m = re.search(r"ManagedElement=([^,]+)", ldn)
+        if not m or m.group(1) != nl:
+            continue
+        leaf = ldn.split(",")[-1].split("=", 1)[0]
+        if leaf in ("EUtranCellFDD", "EUtranCellTDD"):
+            conds.add("lte")
+        elif leaf == "NRCellDU":
+            conds.add("nr")
+        elif leaf == "FieldReplaceableUnit":
+            fid = ldn.split(",")[-1].split("=", 1)[1]
+            fru_ids.append(fid)
+        elif leaf in ("SectorCarrier", "NRSectorCarrier"):
+            v = a.get("noOfTxAntennas")
+            try:
+                iv = int(str(v).strip())
+                if iv > 0:
+                    tx_counts.add(iv)
+            except (ValueError, TypeError):
+                pass
+        elif leaf == "RfBranch":
+            mg = re.search(r"(AntennaUnitGroup=[^,]+)", ldn)
+            if mg:
+                rfbranch_by_radio[mg.group(1)].add(ldn.split(",")[-1])
+        if "SpectrumSharingFunction=" in ldn:
+            conds.add("ess")
+
+    # 8T8R / 4T4R — CDD first, then node noOf*, then RfBranch count.
+    tx = set(cdd_tx_by_node.get(node, set())) if cdd_tx_by_node else set()
+    tx |= tx_counts
+    tx |= {len(v) for v in rfbranch_by_radio.values()}
+    if 8 in tx:
+        conds.add("8t8r")
+    if 4 in tx:
+        conds.add("4t4r")
+
+    # AAS/AIR radios by band (FieldReplaceableUnit id, e.g. AAS_B41_RRU1, AIR…B1B3)
+    up = [f.upper() for f in fru_ids]
+    aas_b41 = any(("AAS" in f or "AIR" in f) and "B41" in f for f in up)
+    aas_b1b3 = any(("AAS" in f or "AIR" in f) and "B1B3" in f for f in up)
+    if aas_b41 and "lte" in conds:
+        conds.add("aas_b41_lte")
+    if aas_b41 and "nr" in conds:
+        conds.add("aas_b41_nr")
+    if aas_b1b3:
+        conds.add("aas_b1b3")
+    return conds
+
+
+def _feature_state(node, feat, records):
+    """(featureState, licenseState) strings for ``FeatureState=<feat>`` on
+    ``node``, or (None, None) if the MO is absent."""
+    for ldn, a in records.items():
+        if ldn.split(",")[-1] != f"FeatureState={feat}":
+            continue
+        m = re.search(r"ManagedElement=([^,]+)", ldn)
+        if m and m.group(1) != node:
+            continue
+        return (a.get("featureState"), a.get("licenseState"))
+    return (None, None)
+
+
+def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
+                   cdd_tx_by_node=None, nodes=None,
+                   log=lambda m: None) -> List[AuditResult]:
+    """Conditional feature-compliance audit.
+
+    ``feature_rules`` (from audit_map.json) maps a rule key → {detect, features}.
+    A feature is expected ACTIVATED when ANY of its governing conditions is
+    present on the node, else DEACTIVATED. When active it must also have
+    ``licenseState = ENABLED``. Emits one row per (node, feature):
+      * active & OK   → featureState ACTIVATED and licenseState ENABLED
+      * active & bad  → Mismatch, remark "Feature Deactivated" / "License Missing"
+      * inactive & bad→ Mismatch, remark "Should be Deactivated"
+    ``ExternalGNodeBFunction``-style specifics already override baseline lists in
+    the config, so each feature's condition set is exactly what should gate it."""
+    if not feature_rules:
+        return []
+    # feature → set(conditions) that would activate it.
+    feat_conds = collections.defaultdict(set)
+    for r in feature_rules.values():
+        cond = r.get("detect")
+        for f in r.get("features", []):
+            feat_conds[f].add(cond)
+
+    def _is1(v):
+        s = str(v or "").strip().upper()
+        return s.startswith("1") or "ACTIVATED" in s or "ENABLED" in s
+
+    # nodes that actually appear in the dump
+    node_set = set()
+    for ldn in records:
+        m = re.search(r"ManagedElement=([^,]+)", ldn)
+        if m:
+            node_set.add(m.group(1))
+    target = [n for n in (nodes or sorted(node_set)) if n in node_set]
+
+    out: List[AuditResult] = []
+    for node in target:
+        conds = _detect_feature_conditions(node, records, cdd_tx_by_node)
+        log(f"[audit/feature] {node}: conditions {sorted(conds) or '(none)'}")
+        for feat in sorted(feat_conds):
+            gov = feat_conds[feat]
+            active_conds = sorted(gov & conds)
+            expect_active = bool(active_conds)
+            fstate, lstate = _feature_state(node, feat, records)
+            mo = f"SystemFunctions=1,Lm=1,FeatureState={feat}"
+            ref = ",".join(active_conds) or "no matching config"
+            if fstate is None:
+                # MO absent: an issue only when the feature was expected active
+                # (missing/unlicensed); when it should be off, absent == off = OK.
+                if expect_active:
+                    out.append(AuditResult(
+                        "feature", node, mo, "featureState",
+                        f"ACTIVATED ({','.join(active_conds)})",
+                        "(FeatureState MO not found)", "NotFound",
+                        "feature compliance", node, ref_cell=ref))
+                continue
+            f_on, l_on = _is1(fstate), _is1(lstate)
+            if expect_active:
+                exp = f"ACTIVATED ({','.join(active_conds)})"
+                if f_on and l_on:
+                    continue                      # OK → hidden (only issues shown)
+                remarks = []
+                if not f_on:
+                    remarks.append("Feature Deactivated")
+                if not l_on:
+                    remarks.append("License Missing")
+                act = (f"{'ACTIVATED' if f_on else 'DEACTIVATED'} / "
+                       f"{'ENABLED' if l_on else 'DISABLED'} "
+                       f"({'; '.join(remarks)})")
+                status = "Mismatch"
+            else:
+                if not f_on:
+                    continue                      # correctly deactivated → hidden
+                exp = "DEACTIVATED (no matching config)"
+                act = "ACTIVATED (Should be Deactivated)"
+                status = "Mismatch"
+            out.append(AuditResult(
+                "feature", node, mo, "featureState", exp, act, status,
+                "feature compliance", node, ref_cell=ref))
+    return out
+
+
 def aggregate_trx(records: Dict[str, Dict[str, str]]) -> None:
     """Fold each ``GsmSector``'s ``Trx`` children (from a RadioNode dump) up
     onto the ``GsmSector`` record so the audit can read them without a live
@@ -1661,7 +1820,7 @@ def _banner(name: str) -> str:
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
-                            "consistency", "endc", "chain"}
+                            "consistency", "endc", "chain", "feature"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

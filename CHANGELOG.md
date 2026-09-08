@@ -4,6 +4,24 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.31] - 2026-09-08
+
+### Added
+- **Conditional feature-compliance audit (`feature`).** Config-driven from
+  `audit_map.json` → `feature_rules`: each rule maps a detected config condition
+  (`8t8r`, `4t4r`, `nr`, `aas_b41_lte`, `aas_b41_nr`, `aas_b1b3`, `lte`, `nr`
+  baseline, `ess`) to the CXC features that must then be **ACTIVATED + license
+  ENABLED**; when none of a feature's conditions are present it must be
+  **DEACTIVATED**. Detection priority for 8T8R/4T4R: CDD MIMO Tx count → node
+  `noOfTxAntennas` (skipping 0/-1) → `RfBranch` count (8→8x8, 4→4x4). AAS/AIR by
+  band from `FieldReplaceableUnit` id. Baseline LTE/NR/ESS feature sets were
+  seeded from the adaptive baseline; antenna/AAS/EN-DC rules override the coarse
+  baseline for any shared CXC so `else-deactivate` gating works. Two checks per
+  feature — `featureState` and `licenseState` — with remarks "Feature
+  Deactivated" / "License Missing" / "Should be Deactivated". Report-only shows
+  **only the mismatches** (OK rows hidden); a correctly-deactivated feature
+  (license enabled but featureState off) counts as OK.
+
 ## [1.9.30] - 2026-09-07
 
 ### Fixed
