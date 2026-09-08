@@ -4,6 +4,19 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.32] - 2026-09-08
+
+### Changed
+- **Feature audit: AAS-FDD moved out of the LTE baseline; NotFound baseline
+  hidden.** The AAS-FDD features `CXC4012286` (IRC for AAS FDD) and `CXC4012791`
+  (Digital Sectorization Extension AAS FDD) were in the broad LTE baseline, which
+  flagged them "License Missing" on non-AAS nodes; they now belong to the
+  `aas_b1b3` (FDD) rule so they are only required when a B1/B3 AAS radio is
+  present (AAS FDD and AAS TDD/B41 are kept as distinct conditions). Baseline
+  (LTE/NR/ESS) rules are tagged `baseline`, and a baseline feature whose
+  FeatureState MO is absent from the node is no longer reported as NotFound —
+  only config-specific features are.
+
 ## [1.9.31] - 2026-09-08
 
 ### Added

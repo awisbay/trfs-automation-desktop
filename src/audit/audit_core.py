@@ -1018,10 +1018,13 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
         return []
     # feature → set(conditions) that would activate it.
     feat_conds = collections.defaultdict(set)
+    baseline_feats = set()          # from broad LTE/NR/ESS baseline lists
     for r in feature_rules.values():
         cond = r.get("detect")
         for f in r.get("features", []):
             feat_conds[f].add(cond)
+            if r.get("baseline"):
+                baseline_feats.add(f)
 
     def _is1(v):
         s = str(v or "").strip().upper()
@@ -1049,7 +1052,10 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
             if fstate is None:
                 # MO absent: an issue only when the feature was expected active
                 # (missing/unlicensed); when it should be off, absent == off = OK.
-                if expect_active:
+                # Baseline (broad LTE/NR/ESS) features whose MO isn't on the node
+                # are NOT flagged — a missing broad feature is not actionable the
+                # way a config-specific one is.
+                if expect_active and feat not in baseline_feats:
                     out.append(AuditResult(
                         "feature", node, mo, "featureState",
                         f"ACTIVATED ({','.join(active_conds)})",

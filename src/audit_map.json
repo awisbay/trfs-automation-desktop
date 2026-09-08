@@ -483,10 +483,9 @@
         "CXC4012396",
         "CXC4012601",
         "CXC4012352",
-        "CXC4011929",
-        "CXC4012286",
-        "CXC4012791"
-      ]
+        "CXC4011929"
+      ],
+      "baseline": true
     },
     "nr_baseline": {
       "detect": "nr",
@@ -510,7 +509,8 @@
         "CXC4012745",
         "CXC4012547",
         "CXC4011929"
-      ]
+      ],
+      "baseline": true
     },
     "ess": {
       "detect": "ess",
@@ -520,7 +520,8 @@
         "CXC4012581",
         "CXC4012507",
         "CXC4012528"
-      ]
+      ],
+      "baseline": true
     },
     "8t8r": {
       "detect": "8t8r",
@@ -567,7 +568,9 @@
       "detect": "aas_b1b3",
       "features": [
         "CXC4012254",
-        "CXC4012369"
+        "CXC4012286",
+        "CXC4012369",
+        "CXC4012791"
       ]
     }
   }
