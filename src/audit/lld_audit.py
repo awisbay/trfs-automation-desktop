@@ -287,18 +287,32 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
     pool = {port: (fru, dport) for port, (_rid, fru, dport) in idx.items()}
 
     def _pair(p):
-        """Pick this planned row's node link: same BB port first, else the first
-        unpaired node link whose radio band matches (AAS wired on a different
-        port than planned). Returns (node_port, fru, dport) or None."""
+        """Pick this planned row's node link. The radio BAND is the identity, so
+        match on band FIRST (a radio wired to a different BB port than planned is
+        still the same radio — only the port differs); prefer the same port when
+        the band also matches there. Only if no band match exists anywhere do we
+        fall back to whatever sits on the planned port (a genuinely wrong radio).
+        Returns (node_port, fru, dport) or None.
+
+        Without band-first, a planned AAS/AIR radio would greedily grab whatever
+        classic radio happens to occupy its planned port, leaving the real
+        same-band radio unpaired and mis-reported as Unplanned."""
         up = p["port"].upper()
+        rt = p["radio_type"]
+        # 1. same band on the same port (ideal — nothing moved).
+        if up in pool and (not rt or _radio_type_matches(rt, pool[up][0])):
+            fru, dport = pool.pop(up)
+            return up, fru, dport
+        # 2. same band on ANY port (the radio was wired to a different port).
+        if rt:
+            for np in sorted(pool):
+                if _radio_type_matches(rt, pool[np][0]):
+                    fru, dport = pool.pop(np)
+                    return np, fru, dport
+        # 3. fallback: the planned port carries a different-band radio.
         if up in pool:
             fru, dport = pool.pop(up)
             return up, fru, dport
-        for np in sorted(pool):
-            fru, dport = pool[np]
-            if p["radio_type"] and _radio_type_matches(p["radio_type"], fru):
-                del pool[np]
-                return np, fru, dport
         return None
 
     out: List[LldResult] = []

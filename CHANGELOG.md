@@ -4,6 +4,21 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.36] - 2026-09-09
+
+### Fixed
+- **LLD RiLink: match radios by band first, so a port-swapped radio is not
+  mis-reported as Unplanned.** The planned↔node pairing tried the same BB RI
+  port first, so a planned AAS/AIR radio greedily grabbed whatever classic radio
+  occupied its planned port — leaving the real same-band radio unpaired and
+  wrongly flagged "Unplanned". Pairing now matches on radio band/type first
+  (band = the radio's identity), preferring the same port when the band also
+  matches there, and only falls back to the planned port for a genuinely
+  wrong-band radio. Result on MIN5077: the `AAS_B41_RRU1..3` radios now match the
+  planned `AIR 3265 B41` rows with only the BB port flagged (not Unplanned), and
+  the extra 3rd `B0B28_RRU3` (LLD plans 2) is correctly the Unplanned one.
+  Regression: nodes wired per plan stay all-Match.
+
 ## [1.9.35] - 2026-09-09
 
 ### Fixed
