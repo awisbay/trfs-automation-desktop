@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.42] - 2026-09-09
+
+### Fixed
+- **Feature audit: 8T8R/4T4R gated on LTE presence.** The quad/octal antenna
+  features are LTE features, but 8T8R/4T4R was detected purely from antenna
+  count (CDD MIMO / noOfTxAntennas / RfBranch ports). A GSM-only node whose
+  shared radio exposes 4 RfBranch ports therefore wrongly demanded the LTE quad
+  features be activated. 8T8R/4T4R are now only detected when the node actually
+  has LTE cells. Verified on MIN5077: the GSM-only B02 now yields no feature
+  recommendations, while the LTE B01 is unchanged.
+
 ## [1.9.41] - 2026-09-09
 
 ### Added

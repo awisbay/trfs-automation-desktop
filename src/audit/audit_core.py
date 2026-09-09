@@ -984,14 +984,19 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
         if "SpectrumSharingFunction=" in ldn:
             conds.add("ess")
 
-    # 8T8R / 4T4R — CDD first, then node noOf*, then RfBranch count.
-    tx = set(cdd_tx_by_node.get(node, set())) if cdd_tx_by_node else set()
-    tx |= tx_counts
-    tx |= {len(v) for v in rfbranch_by_radio.values()}
-    if 8 in tx:
-        conds.add("8t8r")
-    if 4 in tx:
-        conds.add("4t4r")
+    # 8T8R / 4T4R — CDD first, then node noOf*, then RfBranch count. These gate
+    # LTE antenna features (4x4/8x8 Quad/Octal Antenna Downlink etc.), so they
+    # only count when the node actually has LTE — otherwise a GSM-only node whose
+    # shared radio happens to expose 4 RfBranch ports would wrongly demand the
+    # LTE quad features.
+    if "lte" in conds:
+        tx = set(cdd_tx_by_node.get(node, set())) if cdd_tx_by_node else set()
+        tx |= tx_counts
+        tx |= {len(v) for v in rfbranch_by_radio.values()}
+        if 8 in tx:
+            conds.add("8t8r")
+        if 4 in tx:
+            conds.add("4t4r")
 
     # AAS/AIR radios by band (FieldReplaceableUnit id, e.g. AAS_B41_RRU1, AIR…B1B3)
     up = [f.upper() for f in fru_ids]
