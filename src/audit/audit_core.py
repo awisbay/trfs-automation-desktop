@@ -1650,13 +1650,13 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
         """Plain-language reason for the row's status — so the reader sees WHAT
         differs (BB RiPort / HW Type / Radio DATA Port), not just 'Mismatch'."""
         if r.status == "Unplanned":
-            return "Unplanned HW (on node, not in LLD)"
+            return "Unplanned HW on BBU"
         if r.status == "NotFound":
             return "Missing HW (in LLD, not on node)"
         if r.status != "Mismatch":
             return ""
         if (r.ref_cell or "").startswith("count"):
-            return "Mismatch: Radio count"
+            return "Number of Radio Mismatch"
         if "duplicate" in (r.source or "").lower():
             return "Duplicate BB RiPort"
         if "shared" in (r.source or "").lower():

@@ -4,6 +4,11 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.38] - 2026-09-09
+
+### Changed
+- **LLD Remark wording.** "Mismatch: Radio count" -> "Number of Radio Mismatch"; "Unplanned HW (on node, not in LLD)" -> "Unplanned HW on BBU".
+
 ## [1.9.37] - 2026-09-09
 
 ### Added
