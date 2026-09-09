@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.35] - 2026-09-09
+
+### Fixed
+- **Feature audit falsely flagged DEACTIVATED features as active.** The state
+  test matched the substring "ACTIVATED" — which also appears inside
+  "DE**ACTIVATED**" — so every deactivated feature read as ON and produced a
+  bogus "Should be Deactivated" row (whole pages of them). It now reads the
+  leading state code (`1 (ACTIVATED)` → on, `0 (DEACTIVATED)` → off). Verified on
+  MIN5077: hundreds of false rows collapse to the genuine 4 (a Basic-AAS-TDD and
+  three 4T4R quad features that are licensed but left deactivated).
+
 ## [1.9.34] - 2026-09-08
 
 ### Fixed

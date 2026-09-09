@@ -1028,8 +1028,16 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 baseline_feats.add(f)
 
     def _is1(v):
-        s = str(v or "").strip().upper()
-        return s.startswith("1") or "ACTIVATED" in s or "ENABLED" in s
+        # Values look like "1 (ACTIVATED)" / "0 (DEACTIVATED)" /
+        # "1 (ENABLED)" / "0 (DISABLED)". Read the LEADING CODE — a naive
+        # substring test is wrong because "DEACTIVATED" CONTAINS "ACTIVATED".
+        s = str(v or "").strip()
+        m = re.match(r"\s*(\d+)", s)
+        if m:
+            return m.group(1) == "1"
+        u = s.upper()
+        return (("ACTIVATED" in u or "ENABLED" in u)
+                and "DEACTIVATED" not in u and "DISABLED" not in u)
 
     # Friendly label per detect condition — so a row explains WHICH config it
     # belongs to (e.g. "AAS FDD", "AAS TDD", "EN-DC/NR").
