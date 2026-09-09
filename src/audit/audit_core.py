@@ -418,6 +418,13 @@ def compare(items: List[AuditItem],
             match = (norm(prim) == exp_n or _bool_equal(it.expected, prim)
                      or (it.attr_alt and (norm(alt) == exp_n
                                           or _bool_equal(it.expected, alt))))
+            # AAS massive-MIMO reports 32T/32R on the (NR)SectorCarrier, which
+            # the CDD MIMO column can't be planned/verified against reliably —
+            # treat a node value of 32 as OK for the antenna-count params.
+            if (not match
+                    and it.parameter in ("noOfTxAntennas", "noOfRxAntennas")
+                    and ("32" in (prim.strip(), alt.strip()))):
+                match = True
             status = "Match" if match else "Mismatch"
         results.append(AuditResult(
             it.category, it.key, eff_mo, it.parameter,

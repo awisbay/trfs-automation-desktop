@@ -4,6 +4,15 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.39] - 2026-09-09
+
+### Changed
+- **MIMO audit: node 32T/32R treated as OK.** AAS massive-MIMO reports 32
+  antennas on the (NR)SectorCarrier, which the CDD MIMO column can't be planned
+  or verified against reliably, so `noOfTxAntennas`/`noOfRxAntennas` = 32 on the
+  node now counts as Match regardless of the CDD value. Other antenna counts
+  still compare normally.
+
 ## [1.9.38] - 2026-09-09
 
 ### Changed
