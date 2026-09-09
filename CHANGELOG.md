@@ -4,6 +4,15 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.37] - 2026-09-09
+
+### Added
+- **LLD sheet: "Remark" column explaining each finding.** Instead of a bare
+  "Mismatch", every row now says what differs — e.g. `Mismatch: BB RiPort`,
+  `Mismatch: HW Type`, `Mismatch: Radio DATA Port` (combined when several differ),
+  `Mismatch: Radio count`, `Duplicate BB RiPort`, `Unplanned HW (on node, not in
+  LLD)`, `Missing HW (in LLD, not on node)`.
+
 ## [1.9.36] - 2026-09-09
 
 ### Fixed

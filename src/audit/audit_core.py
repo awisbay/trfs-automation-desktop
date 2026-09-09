@@ -1632,11 +1632,12 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
     ws.merge_cells("F1:G1"); ws["F1"] = "HW Type"
     ws.merge_cells("H1:I1"); ws["H1"] = "Radio DATA Port"
     ws.merge_cells("J1:J2"); ws["J1"] = "Status"
+    ws.merge_cells("K1:K2"); ws["K1"] = "Remark"
     subs = {4: "LLD", 5: "Node", 6: "LLD", 7: "Node", 8: "LLD", 9: "Node"}
     for c, txt in subs.items():
         ws.cell(2, c, txt)
     for row in (1, 2):
-        for c in range(1, 11):
+        for c in range(1, 12):
             cell = ws.cell(row, c)
             cell.fill = _FILL_HEADER
             cell.font = _HEADER_FONT
@@ -1644,6 +1645,30 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
             cell.border = _BORDER
 
     status_col = 10
+
+    def _remark(r) -> str:
+        """Plain-language reason for the row's status — so the reader sees WHAT
+        differs (BB RiPort / HW Type / Radio DATA Port), not just 'Mismatch'."""
+        if r.status == "Unplanned":
+            return "Unplanned HW (on node, not in LLD)"
+        if r.status == "NotFound":
+            return "Missing HW (in LLD, not on node)"
+        if r.status != "Mismatch":
+            return ""
+        if (r.ref_cell or "").startswith("count"):
+            return "Mismatch: Radio count"
+        if "duplicate" in (r.source or "").lower():
+            return "Duplicate BB RiPort"
+        if "shared" in (r.source or "").lower():
+            return "Mismatch: Radio Shared between BB"
+        parts = []
+        if not r.bb_ok:
+            parts.append("BB RiPort")
+        if not r.hw_ok:
+            parts.append("HW Type")
+        if not r.data_ok:
+            parts.append("Radio DATA Port")
+        return "Mismatch: " + (", ".join(parts) if parts else "see values")
 
     def _sort_key(r):
         # baseband row (no port) first per node, then by planned/actual port
@@ -1654,7 +1679,7 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
         ws.append([r.node, r.bbid, r.ref_cell,
                    r.bb_port_lld, r.bb_port_node,
                    r.hw_type_lld, r.hw_type_node,
-                   r.data_port_lld, r.data_port_node, r.status])
+                   r.data_port_lld, r.data_port_node, r.status, _remark(r)])
         row = ws.max_row
         fill = _STATUS_FILL.get(r.status)
         if fill:
@@ -1665,12 +1690,12 @@ def _write_lld_sheet(ws, lld_results: List["LldResult"]) -> None:
             if not ok:
                 for c in cols:
                     ws.cell(row, c).fill = _FILL_NOTFOUND
-        for c in range(1, 11):
+        for c in range(1, 12):
             ws.cell(row, c).border = _BORDER
 
     ws.freeze_panes = "A3"
     widths = {"A": 34, "B": 6, "C": 12, "D": 8, "E": 8, "F": 20,
-              "G": 22, "H": 10, "I": 10, "J": 10}
+              "G": 22, "H": 10, "I": 10, "J": 10, "K": 34}
     for col, wdt in widths.items():
         ws.column_dimensions[col].width = wdt
 
