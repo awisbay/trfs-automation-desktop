@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.40] - 2026-09-09
+
+### Changed
+- **MIMO audit keyed on the USED antenna count (supersedes 1.9.39's naive "32 =
+  OK").** `noOfTxAntennas`/`noOfRxAntennas` are now audited against the node's
+  `noOfUsedTxAntennas`/`noOfUsedRxAntennas`: a radio reports the used count only
+  once detected, so while it isn't up (used = -1, 0, or absent) the row is not
+  auditable and is skipped (we don't set noOfTx/Rx ourselves). When a real used
+  value is present — e.g. AAS 32T32R after the radio comes up — it is compared
+  strictly to the CDD and a difference is a Mismatch.
+
 ## [1.9.39] - 2026-09-09
 
 ### Changed

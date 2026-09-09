@@ -415,16 +415,28 @@ def compare(items: List[AuditItem],
             actual_str = (alt if prim in ("", "0") and alt not in ("", "0")
                           else prim)
             exp_n = norm(it.expected)
+            # noOfTx/Rx antennas: the authoritative value is the USED count
+            # (noOfUsedTxAntennas / noOfUsedRxAntennas). A radio only reports it
+            # once detected; while it isn't up the used value is -1 (or 0 /
+            # absent) and noOfTxAntennas/noOfRxAntennas is not something we set —
+            # so the row is NOT auditable and is skipped. When a real used value
+            # is present (e.g. AAS 32T32R once the radio is up) it is audited
+            # strictly against the CDD: a difference is a Mismatch.
+            if it.parameter in ("noOfTxAntennas", "noOfRxAntennas") \
+                    and it.attr_alt:
+                used = alt.strip()
+                if not (used.lstrip("-").isdigit() and int(used) > 0):
+                    continue                       # radio not detected → skip
+                actual_str = used
+                status = "Match" if norm(used) == exp_n else "Mismatch"
+                results.append(AuditResult(
+                    it.category, it.key, eff_mo, it.parameter,
+                    it.expected, actual_str, status, it.source, it.node,
+                    ref_cell, it.norm, it.from_cmedit))
+                continue
             match = (norm(prim) == exp_n or _bool_equal(it.expected, prim)
                      or (it.attr_alt and (norm(alt) == exp_n
                                           or _bool_equal(it.expected, alt))))
-            # AAS massive-MIMO reports 32T/32R on the (NR)SectorCarrier, which
-            # the CDD MIMO column can't be planned/verified against reliably —
-            # treat a node value of 32 as OK for the antenna-count params.
-            if (not match
-                    and it.parameter in ("noOfTxAntennas", "noOfRxAntennas")
-                    and ("32" in (prim.strip(), alt.strip()))):
-                match = True
             status = "Match" if match else "Mismatch"
         results.append(AuditResult(
             it.category, it.key, eff_mo, it.parameter,
