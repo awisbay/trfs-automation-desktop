@@ -1942,8 +1942,28 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
         by_node.setdefault(node, {}).setdefault(_mo_group(r.mo), []).append(
             (r.mo, r.parameter, r.expected, r.norm, r.actual))
 
+    # Feature-compliance rows get their OWN block: the set value is 1/0
+    # (ACTIVATE/DEACTIVATE), not the descriptive expected string, so they can't
+    # go through the normal MO-value path. One `set …FeatureState=CXC..
+    # featureState 0|1` per mismatched feature per node.
+    feat_by_node: Dict[str, list] = {}
+    feat_seen = set()
+    for r in results:
+        if r.category != "feature" or r.status not in statuses:
+            continue
+        node = r.node or r.key or site
+        cxc_mo = r.mo                     # SystemFunctions=1,Lm=1,FeatureState=CXC..
+        if (node, cxc_mo) in feat_seen:
+            continue
+        feat_seen.add((node, cxc_mo))
+        val = "1" if str(r.expected).strip().upper().startswith("ACTIVATED") else "0"
+        feat_by_node.setdefault(node, []).append((cxc_mo, val))
+
     written: List[str] = []
-    for node, groups in by_node.items():
+    all_nodes = list(by_node.keys()) + [n for n in feat_by_node
+                                        if n not in by_node]
+    for node in all_nodes:
+        groups = by_node.get(node, {})
         lines = [
             "# " + "-" * 60,
             f"# Generate by: {generated_by or 'NodeCraft'}",
@@ -1972,6 +1992,13 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
                     groups[g], key=lambda x: (x[1], x[0])):
                 lines.append(
                     f"set {mo}$ {param} {_format_set_value(val, norm, actual)}")
+        # Dedicated FEATURE block: activate (1) / deactivate (0) per the audit.
+        feats = feat_by_node.get(node, [])
+        if feats:
+            lines.append("")
+            lines.append(_banner("FEATURE"))
+            for cxc_mo, val in sorted(feats):
+                lines.append(f"set {cxc_mo} featureState {val}")
         # Close the log opened with l+ at the top.
         lines.append("")
         lines.append("l-")

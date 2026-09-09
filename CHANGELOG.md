@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.9.41] - 2026-09-09
+
+### Added
+- **Generated .mos: dedicated FEATURE block.** Feature-compliance mismatches now
+  produce set lines in their own `# FEATURE` block —
+  `set SystemFunctions=1,Lm=1,FeatureState=CXC.. featureState 1` to activate (the
+  config requires it) or `0` to deactivate (config absent). One line per
+  mismatched feature per node; a node whose only mismatches are features still
+  gets its `_SetParameter_*.mos`.
+
 ## [1.9.40] - 2026-09-09
 
 ### Changed
