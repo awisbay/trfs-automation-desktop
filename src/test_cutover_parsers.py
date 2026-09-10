@@ -25,6 +25,15 @@ from cutover_parsers import (
     parse_barred_state,
     parse_cells_from_hgetc,
     parse_radio_status,
+    parse_nr_sector_carrier_refs,
+    parse_sdir_vswr,
+    parse_gerancell,
+    parse_gerancell_states,
+    parse_tss,
+    parse_gsmsector_list,
+    gsm_sector_suffix,
+    gsm_band_of,
+    gsm_cell_belongs,
     sector_of,
     parse_st_cell_rows,
     parse_stzrc,
@@ -367,9 +376,134 @@ check("band_prefix_for inverts the prefix map",
       f"{band_prefix_for('L1800')}/{band_prefix_for('NR2600')}")
 check("unknown band has no prefix", band_prefix_for("L9999") == "")
 
+print("\n[11] parse_sdir_vswr — per-RF-port VSWR from sdirc")
+_vswr_sample = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "testdata", "sdirc_vswr_sample.txt")
+with open(_vswr_sample, "r", encoding="utf-8") as _fh:
+    _vswr_out = _fh.read()
+vres = parse_sdir_vswr(_vswr_out)
+check("sdirc VSWR parses ok", vres.ok, vres.warning)
+rru1 = vres.by_cell.get("CMPBAHIANMALAYBBUKL-171", [])
+check("cell 171 mapped to its 4 RF ports (A-D)",
+      sorted(p["port"] for p in rru1) == ["A", "B", "C", "D"],
+      str([p["port"] for p in rru1]))
+check("cell 171 port A VSWR = 1.13",
+      any(p["port"] == "A" and abs(p["vswr"] - 1.13) < 1e-9 for p in rru1),
+      str(rru1))
+check("cell 171 worst VSWR is the 1.30 on port D",
+      abs(max(p["vswr"] for p in rru1) - 1.30) < 1e-9, str(rru1))
+check("NR cell 501 (NRC= in sdirc) is mapped by DN",
+      len(vres.by_cell.get("CMPBAHIANMALAYBBUKP-501", [])) == 4)
+check("AAS radio with '-' VSWR yields None values, not a guess",
+      all(p["vswr"] is None
+          for p in vres.by_cell.get("CMPBAHIANMALAYBBUKG-L1", [])),
+      str(vres.by_cell.get("CMPBAHIANMALAYBBUKG-L1")))
+check("empty output fails loudly", parse_sdir_vswr("").ok is False)
+
+_gsm_vswr = """
+FRU ;LNH ;BOARD ;RF ;BP ;TX (W/dBm) ;VSWR (RL) ;RX (dBm) ;UEs/gUEs ;Sector/AntennaGroup/Cells (State:CellIds:PCIs)
+RRU1 ;BXP_1 ;RADIO ;A ;11 ;41.8 (46.2) ;1.10 (26.5) ;-83.9 ;-/- ;SE=X GT=GINGOO-L1/0 GT=GINGOO-L1/1 (1,1)
+RRU2 ;BXP_2 ;RADIO ;B ;11 ;40.5 (46.1) ;1.08 (28.0) ;-78.0 ;-/- ;SE=Y GT=GINGOO-2/2 GT=GINGOO-2/3 (1,1)
+-----
+"""
+gsm_vres = parse_sdir_vswr(_gsm_vswr)
+check("GSM GT layer token maps to VSWR port",
+      gsm_vres.by_gsm_token["L1"][0]["vswr"] == 1.10,
+      str(gsm_vres.by_gsm_token))
+check("GSM numeric GT sector token maps to VSWR port",
+      gsm_vres.by_gsm_token["2"][0]["port"] == "B",
+      str(gsm_vres.by_gsm_token))
+
+print("\n[12] GSM — GeranCell states, tss, lst gsmsector, sector linkage")
+_geran_active = (
+    "NodeId  BscFunctionId   BscMId  GeranCellMId    GeranCellId     geranCellId     state\n"
+    "MINBS00 1       1       1       M2839S3 M2839S3 ACTIVE\n"
+    "MINBS00 1       1       1       M2839S2 M2839S2 ACTIVE\n"
+    "MINBS00 1       1       1       M2839S1 M2839S1 ACTIVE\n")
+gstates = parse_gerancell_states(_geran_active, "MIN283")
+check("gerancell states: 3 site cells parsed",
+      len(gstates) == 3 and gstates.get("M2839S1") == "ACTIVE", str(gstates))
+
+_geran_halted = (
+    "NodeId  BscFunctionId   BscMId  GeranCellMId    GeranCellId     geranCellId     state\n"
+    "MINVBS02        1       1       1       M33479S1        M33479S1        HALTED\n"
+    "MINVBS02        1       1       1       M33479S3        M33479S3        HALTED\n")
+hstates = parse_gerancell_states(_geran_halted, "MIN3347")
+check("gerancell HALTED parsed, header ignored",
+      hstates.get("M33479S1") == "HALTED" and "GERANCELLID" not in hstates,
+      str(hstates))
+check("foreign site cell is filtered out",
+      parse_gerancell_states(_geran_active, "MIN999") == {})
+
+_geran_verbose = (
+    "FDN : SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T7,SubNetwork=BSC,MeContext=MINBS01,"
+    "ManagedElement=MINBS01,BscFunction=1,BscM=1,GeranCellM=1,GeranCell=M8239R3\n"
+    "geranCellId : M8239R3\n"
+    "state : HALTED\n\n"
+    "FDN : SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T7,SubNetwork=BSC,MeContext=MINBS01,"
+    "ManagedElement=MINBS01,BscFunction=1,BscM=1,GeranCellM=1,GeranCell=M8239S2\n"
+    "geranCellId : M8239S2\n"
+    "state : HALTED\n")
+gv = parse_gerancell(_geran_verbose, "MIN823")
+check("verbose get captures FDN + state",
+      gv["M8239R3"]["state"] == "HALTED"
+      and gv["M8239R3"]["fdn"].endswith("GeranCell=M8239R3"),
+      str(gv.get("M8239R3")))
+check("verbose FDN is the full BSC path (needed for cmedit set)",
+      gv["M8239R3"]["fdn"].startswith("SubNetwork=ONRM_ROOT_MO_R"))
+
+check("sector suffix: M2839S1 -> 1 (GSM900)",
+      gsm_sector_suffix("M2839S1", "MIN283") == "1"
+      and gsm_band_of("M2839S1", "MIN283") == "GSM900")
+check("sector suffix: M8239R3 -> 3",
+      gsm_sector_suffix("M8239R3", "MIN823") == "3")
+check("GSM layer letters collapse into physical sectors",
+      {gsm_sector_suffix(cell, "MIN823")
+       for cell in ("M8239L1", "M8239R1", "M8239S1")} == {"1"})
+check("gsm_cell_belongs rejects a longer foreign digit run",
+      gsm_cell_belongs("M2839S1", "MIN283") and not gsm_cell_belongs("M28399S1", "MIN283"))
+
+_tss = (
+    "GsmSector=CMPBAHIANMALAYBBUK-1,Trx=0  abisTsState  i[8] = 2 2 2 2 2 2 2 2 "
+    "(ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED)\n"
+    "GsmSector=CMPBAHIANMALAYBBUK-1,Trx=1  abisTsState  i[8] = 2 2 2 2 2 2 2 2 "
+    "(ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED ENABLED)\n"
+    "GsmSector=CMPBAHIANMALAYBBUK-R3,Trx=0 abisTsState  i[8] = 2 2 0 2 2 2 2 2 "
+    "(ENABLED ENABLED DISABLED ENABLED ENABLED ENABLED ENABLED ENABLED)\n")
+tss = parse_tss(_tss)
+check("tss sector 1 all enabled", tss["1"]["all_enabled"] is True, str(tss.get("1")))
+check("tss sector R3 normalises to sector 3",
+      tss["3"]["all_enabled"] is False, str(tss.get("3")))
+
+_lst = (
+    "    4  1 (UNLOCKED)  1 (ENABLED)   BtsFunction=1,GsmSector=CMPBAHIANMALAYBBUK-1,Trx=0\n"
+    "    5  1 (UNLOCKED)  0 (DISABLED)  BtsFunction=1,GsmSector=CMPBAHIANMALAYBBUK-1,Trx=1\n"
+    "    3  1 (UNLOCKED)  1 (ENABLED)   BtsFunction=1,GsmSector=CMPBAHIANMALAYBBUK-1,AbisIp=1\n")
+lst = parse_gsmsector_list(_lst)
+check("lst gsmsector keeps Trx rows, skips AbisIp",
+      set(lst.get("1", {}).keys()) == {"0", "1"}, str(lst))
+check("lst gsmsector Trx1 op DISABLED captured",
+      lst["1"]["1"]["op"] == "DISABLED" and lst["1"]["0"]["op"] == "ENABLED",
+      str(lst.get("1")))
+
 # ──────────────────────────────────────────────────────────────────
 print()
 if _failures:
     print(f"FAILED: {len(_failures)} check(s): {_failures}")
     sys.exit(1)
+print("\n[13] NRCellDU sectorCarrierRef")
+_nr_carriers = """
+NRCellDU=GINGOON-401 nRSectorCarrierRef [1] =
+ >>> nRSectorCarrierRef = GNBDUFunction=1,NRSectorCarrier=N41_S1
+NRCellDU=GINGOON-402 nRSectorCarrierRef [1] =
+ >>> nRSectorCarrierRef = GNBDUFunction=1,NRSectorCarrier=N41_S2
+NRCellDU=GINGOON-403 nRSectorCarrierRef [1] =
+ >>> nRSectorCarrierRef = GNBDUFunction=1,NRSectorCarrier=N41_S3
+"""
+nr_refs = parse_nr_sector_carrier_refs(_nr_carriers)
+check("all three live carrier references parsed", len(nr_refs) == 3, str(nr_refs))
+check("NRCellDU 401 maps to the node-provided N41_S1 reference",
+      nr_refs.get("GINGOON-401") ==
+      "GNBDUFunction=1,NRSectorCarrier=N41_S1", str(nr_refs))
+
 print("All cut-over parser checks passed.")

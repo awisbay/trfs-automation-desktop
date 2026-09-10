@@ -20,6 +20,7 @@ from cutover_model import (
     GroupStatus,
     RunPhase,
 )
+from cutover_parsers import gsm_sector_suffix
 
 SCHEMA_VERSION = 1
 
@@ -47,12 +48,16 @@ def _cell_dict(cell: CutoverCell) -> dict:
         "band_key": cell.band_key,
         "extra_band_numbers": list(cell.extra_band_numbers),
         "group": cell.group,
+        "nr_sector_carrier_ref": cell.nr_sector_carrier_ref,
         "admin_state": cell.admin_state,
         "op_state": cell.op_state,
         "avail_status": cell.avail_status,
         "ue_count": cell.ue_count,
         "ue_peak": cell.ue_peak,
         "flags": cell.flags,
+        "gsm_sector_mo": cell.gsm_sector_mo,
+        "gsm_fdn": cell.gsm_fdn,
+        "geran_state": cell.geran_state,
         "was_unlocked_before": cell.was_unlocked_before,
         "already_in_service": cell.already_in_service,
         "was_unlocked_by_run": cell.was_unlocked_by_run,
@@ -177,9 +182,15 @@ def restore(run, data: dict) -> None:
             extra_band_numbers=list(raw.get("extra_band_numbers", [])),
             group=raw.get("group", UNMAPPED),
         )
+        # Checkpoints created before sector normalisation may contain L1/R1/S1.
+        # Re-derive GSM sectors so a resumed run exposes only S1/S2/S3 controls.
+        if cell.rat == "GSM":
+            cell.sector = (gsm_sector_suffix(cell.cell_dn, run.shortcode)
+                           or cell.sector)
         for name in (
             "admin_state", "op_state", "avail_status", "ue_count", "ue_peak",
-            "flags", "was_unlocked_before", "already_in_service",
+            "flags", "nr_sector_carrier_ref", "gsm_sector_mo", "gsm_fdn", "geran_state",
+            "was_unlocked_before", "already_in_service",
             "cell_barred", "dependency_locked", "traffic_samples", "attempts",
             "last_error", "unlock_command", "status_detail",
         ):

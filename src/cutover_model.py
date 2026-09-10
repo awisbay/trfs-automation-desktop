@@ -123,6 +123,12 @@ class GroupStatus(str, Enum):
 #: are shown in the UI but are structurally unreachable from any Unlock button.
 UNMAPPED = "UNMAPPED"
 
+#: Group key for GSM (GeranCell) cells. GSM has its own unlock path — BSC
+#: ``cmedit set … state=ACTIVE`` plus node ``ldeb GsmSector=…,Trx`` — and its
+#: "enabled" is a combination of GeranCell state and GsmSector/Trx TS state, so
+#: it is kept in its own group rather than mixed into the LB/MB/HB radio bands.
+GSM = "GSM"
+
 
 # ──────────────────────────────────────────────────────────────────
 # Cells
@@ -146,6 +152,9 @@ class CutoverCell:
     extra_band_numbers: list = field(default_factory=list)
     group: str = UNMAPPED        # LB | MB | HB | UNMAPPED
     raw_band_line: str = ""      # verbatim source line, for troubleshooting
+    #: NR only — live ``nRSectorCarrierRef`` read from the NRCellDU. Kept as
+    #: the complete MO reference, e.g. ``GNBDUFunction=1,NRSectorCarrier=N41_S1``.
+    nr_sector_carrier_ref: str = ""
 
     # ── live node state (rewritten on every poll) ────────────────
     admin_state: str = ""        # UNLOCKED | LOCKED | SHUTTING_DOWN | ""
@@ -155,6 +164,21 @@ class CutoverCell:
     ue_peak: int = 0                 # max ever seen — latches traffic evidence
     alarm_count: Optional[int] = None
     flags: str = ""              # stzrc TABREMDF column, verbatim
+    #: Per-RF-port VSWR from ``sdirc``, e.g.
+    #: ``[{"port": "A", "vswr": 1.13, "rl": 24.5, "fru": "B0B28_RRU1"}, …]``.
+    #: Empty until an sdirc capture attributes ports to this cell. NOT persisted
+    #: — it is a live radio reading, re-derived on the next capture.
+    vswr_ports: list = field(default_factory=list)
+    #: GSM only — the full ``GsmSector`` RDN on the node this GeranCell maps to
+    #: (e.g. ``CMPBAHIANMALAYBBUK-1``), captured at discovery. Empty for a
+    #: GeranCell whose sector was not found on the node. Used to target
+    #: ``ldeb GsmSector=…,Trx`` and to read ``tss`` for the combined state.
+    gsm_sector_mo: str = ""
+    #: GSM only — the full BSC GeranCell FDN (``SubNetwork=…,GeranCell=M8239R3``),
+    #: captured at discovery. ``cmedit set`` needs the FDN, not a filter.
+    gsm_fdn: str = ""
+    #: GSM only — the BSC GeranCell state (``ACTIVE`` / ``HALTED`` / …).
+    geran_state: str = ""
 
     # ── pre-state (captured before we send anything) ─────────────
     #: True if this cell was ALREADY unlocked when the run started. Such a cell
@@ -203,12 +227,14 @@ class CutoverCell:
 
     @property
     def is_unlockable(self) -> bool:
-        """UNMAPPED cells are never unlocked by any button, and a cell that
-        was already in service before we started is not ours to touch."""
+        """A cell that still needs unlocking: not UNMAPPED, not already in
+        service, and not currently up. A previous attempt does not permanently
+        suppress Unlock: if live polling later confirms LOCKED, the operator
+        must be able to retry it."""
         return (
             self.group != UNMAPPED
             and not self.already_in_service
-            and not self.was_unlocked_by_run
+            and not self.is_lockable
         )
 
     @property
@@ -223,8 +249,65 @@ class CutoverCell:
             self.was_unlocked_by_run
             and not self.was_unlocked_before
             and not self.already_in_service
+            and (self.admin_state or "").upper() != "LOCKED"
             and self.status not in (CellStatus.SKIPPED, CellStatus.RELOCKED)
         )
+
+    @property
+    def vswr_worst(self) -> Optional[float]:
+        """The highest (worst) VSWR across this cell's RF ports, or None when
+        no numeric VSWR is available (e.g. an AAS/AIR radio reports ``-``)."""
+        vals = [p.get("vswr") for p in self.vswr_ports
+                if isinstance(p.get("vswr"), (int, float))]
+        return max(vals) if vals else None
+
+    @property
+    def is_live_enabled(self) -> bool:
+        """Whether the latest live read says this LTE/NR cell is in service."""
+        if self.rat == "GSM":
+            return (self.geran_state or "").upper() == "ACTIVE"
+        return ((self.admin_state or "").upper() == "UNLOCKED"
+                and (self.op_state or "").upper() == "ENABLED")
+
+    @property
+    def is_carrying_traffic(self) -> bool:
+        """Current (not historical peak) UE evidence on an enabled LTE/NR cell."""
+        return self.rat != "GSM" and self.is_live_enabled and (self.ue_count or 0) > 0
+
+    @property
+    def is_lockable(self) -> bool:
+        """True when the cell is currently up (unlocked / enabled) and could be
+        locked now — regardless of whether *this* run unlocked it. This drives
+        the Unlock↔Lock button toggle: a group that is already fully unlocked
+        offers Lock instead of a dead Unlock button. (Rollback safety —
+        :attr:`is_relockable` — is separate and unchanged: it only ever covers
+        cells this run unlocked.)"""
+        if self.group == UNMAPPED:
+            return False
+        if self.rat == "GSM":
+            # A live GeranCell read is authoritative.  In particular, do not
+            # leave the Lock button enabled from a stale ENABLED status after a
+            # later poll has confirmed HALTED.
+            geran = (self.geran_state or "").upper()
+            if geran:
+                return geran == "ACTIVE"
+            return (self.status == CellStatus.ENABLED
+                    and self.status != CellStatus.RELOCKED)
+        if self.status in (CellStatus.RELOCKED, CellStatus.SKIPPED):
+            return False
+        admin = (self.admin_state or "").upper()
+        # A fresh live LOCKED read is authoritative. Ownership records that an
+        # earlier write was attempted; it does not mean the cell is still up.
+        if admin == "LOCKED":
+            return False
+        if admin == "UNLOCKED":
+            return True
+        # A cell this run unlocked can always be locked back, even if it never
+        # reached ENABLED (unlocked but DISABLED / enable-timeout).
+        if self.was_unlocked_by_run:
+            return True
+        return self.status in (CellStatus.ENABLED, CellStatus.WAITING_TRAFFIC,
+                               CellStatus.TRAFFIC_OK)
 
     def short_label(self) -> str:
         return f"{self.mo_ref} [{self.band_key or '?'}]"
@@ -244,6 +327,19 @@ class NodeSession:
 
     node_name: str
     ssh: object = None                     # IntegrationSSH (not imported here)
+    #: Second AMOS session for fast, read-only STATUS polling (hgetc admin/op),
+    #: so the status monitor never contends with unlock on the single-writer
+    #: primary PTY. ``None`` → fall back to ``ssh`` under the action lock.
+    read_ssh: object = None
+    #: Third AMOS session for the SLOW background reads (stzrc traffic + sdirc
+    #: VSWR), so they run in parallel without ever holding up the fast status
+    #: poll. Opened lazily; ``None`` (or ``bg_failed``) → share ``read_ssh``
+    #: under ``read_lock``.
+    bg_ssh: object = None
+    bg_failed: bool = False
+    #: Serialises use of ``read_ssh`` between the status monitor and any
+    #: background reader that had to fall back to it.
+    read_lock: threading.Lock = field(default_factory=threading.Lock)
     lock: threading.Lock = field(default_factory=threading.Lock)
     in_amos: bool = False
     connected: bool = False
@@ -420,6 +516,12 @@ class CutoverRun:
         """Only cells this session unlocked — see :attr:`CutoverCell.is_relockable`."""
         return [c for c in self.cells_of(group, sector) if c.is_relockable]
 
+    def lockable_cells_of(self, group: str,
+                          sector: Optional[str] = None) -> list:
+        """Cells currently up that could be locked now — see
+        :attr:`CutoverCell.is_lockable`. Drives the Unlock↔Lock button toggle."""
+        return [c for c in self.cells_of(group, sector) if c.is_lockable]
+
     def sectors_of(self, group: str) -> list:
         """Sorted, de-duplicated sector tokens present in a group's cells —
         drives the per-(band group × sector) unlock buttons. Only sectors that
@@ -439,7 +541,7 @@ class CutoverRun:
         return {
             "total": len(cells),
             "enabled": enabled,
-            "traffic_ok": sum(1 for c in cells if c.status == CellStatus.TRAFFIC_OK),
+            "traffic_ok": sum(1 for c in cells if c.is_carrying_traffic),
             "failed": sum(1 for c in cells if c.status in TERMINAL_FAIL),
         }
 

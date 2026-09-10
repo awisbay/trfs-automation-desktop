@@ -4,6 +4,201 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.10.0] - 2026-09-10
+
+### Added
+- **TRFS Log button (Cut Over).** Independent of Pre HC — connects the nodes
+  itself and identifies each baseband's techs with `pv $rats` (G=2G, L=4G,
+  N=5G; one letter = standalone, several = combination). Runs `LABEL.mos` once
+  (first click), then the per-node TRFS script — 2G+4G(±5G) → all-tech, 2G-only
+  → GSM-only, 4G/5G (no 2G) → 4G&5G — waits ~20 s for moshell to go idle so the
+  log is complete, then downloads each node's newest `<node>_<YYMMDD_HHMM>`
+  folder from `/home/shared/common/INTEGRATION_TEAM/TRFS` into `LOG/<site>/TRFS/`.
+  Configurable under `cutover.trfs`.
+- **Post HC button (Cut Over).** The post-cutover counterpart of Pre HC, and
+  independent of it: creates a `Post_CutOver_DDMMYYYY_HHMM` CV per node, runs
+  the postHC script (`cutover.preparation.posthc.script_path`), then re-reads
+  cell status. Skips the slow modump. Its CV output, command logs, and
+  downloaded `Post_HC` logfiles are kept in a persistent, timestamped
+  `LOG/<site>/POST/` folder (every run retained, not overwritten).
+- **HC moshell logfile is now downloaded.** Both Pre HC and Post HC pull the
+  moshell logfile the `run` produces (`~/Logfile/<date>/*_Pre_HC.log` /
+  `*_Post_HC.log`, newest per node) — Pre HC into its run folder, Post HC into
+  `LOG/<site>/POST/`. Previously only the captured command echo was saved.
+- **Completion popups for TRFS Log and Post HC.** When each finishes, a dialog
+  shows the per-node result and the exact laptop folder, with an **Open folder**
+  button — TRFS → `LOG/<site>/TRFS/`, Post HC → `LOG/<site>/POST/`.
+
+### Changed
+- **"Start HC" is now "Pre HC".** Same action (CV + preHC + discovery); clearer
+  pairing with the new Post HC button.
+
+## [1.9.52] - 2026-09-10
+
+### Added
+- **Cut Over re-enables FM alarm supervision automatically.** As soon as a node
+  has at least one enabled cell, the background reader runs the ENM CLI
+  `alarm enable <node>` once for that node (the counterpart to the integration
+  Backup CV's `fmalarmsupervision active=false`), on the separate background
+  session so it never holds up status. Configurable under `cutover.alarm`
+  (`activate_enabled`, `activate_command`, `activate_success_patterns`).
+
+## [1.9.51] - 2026-09-10
+
+### Changed
+- **Cell row is one clean line.** State now shows the plain
+  `UNLOCKED/DISABLED` / `UNLOCKED/ENABLED` / `LOCKED/DISABLED` (no verbose
+  "unlocked but still DISABLED after Ns …"), and Node / Cell / State are capped
+  to a single line with ellipsis so a long DN no longer wraps the trailing
+  digit onto a new line. The Cell column is widened to fit typical DNs.
+
+### Fixed
+- **A cell that is UNLOCKED can be locked again.** A cell this run unlocked is
+  now lockable even if it never reached ENABLED (unlocked-but-DISABLED /
+  enable-timeout), so the per-sector / group button offers **Lock** for it once
+  the action settles. A cell read as LOCKED is never offered Lock.
+
+## [1.9.50] - 2026-09-10
+
+### Changed
+- **Cut Over cell row: Traffic + VSWR moved next to the cell, with headers.**
+  The Traffic (UE) and VSWR columns now sit right after the cell/state instead
+  of being pushed to the far right, under a thin column header (Node · Cell ·
+  State · Traffic · VSWR). VSWR is formatted `A=1.32, B=1.35, C=1.40`, left-
+  aligned with no fixed width so it adapts to any port count (rows stay ragged
+  on the right), and turns red when any port exceeds 1.40 (was 1.5; the engine's
+  `cutover.vswr.warn_threshold` default now matches at 1.40).
+
+## [1.9.49] - 2026-09-10
+
+### Changed
+- **Status stays fast while traffic/VSWR run in parallel.** The fast status
+  poll (hgetc admin/op, ~2s) and the slow background reads (stzrc traffic ~65s,
+  sdirc VSWR) now run on **separate threads and separate AMOS sessions**, so a
+  slow stzrc/sdirc never delays a status refresh. Each node gets up to three
+  sessions: primary (unlock), a fast status session, and a lazily-opened
+  background session for traffic + VSWR. If the background session can't be
+  opened it falls back to sharing the status session under a lock (status just
+  waits occasionally). Traffic and VSWR keep their own intervals.
+
+## [1.9.48] - 2026-09-10
+
+### Changed
+- **Cell status is read first, from a fast hgetc — not stzrc.** Right after
+  discovery the tool now reads each cell's `administrativeState` /
+  `operationalState` via
+  `hgetc EUtranCellFDD|EUtranCellTDD|NRCellDU administrativeState|operationalState`
+  (~2s on a real node) and shows `UNLOCKED/ENABLED` or `LOCKED/DISABLED` per
+  cell. Only after status is known do `stzrc` (traffic/UE) and `sdirc` (VSWR)
+  run in the background, on the separate read session and on their own
+  intervals. This removes the slow/fragile "`stzrc` had no cell table" path from
+  the status step entirely (validated against MIN889_…B01: status 18/18
+  UNLOCKED/ENABLED in ~1.7s; stzrc still parses, just slower at ~65s).
+  `enable_poll.source` now defaults to `st` with the hgetc admin/op command.
+- **No more "already in service".** Cells that are already up simply show
+  ENABLED and are lockable; the special "already in service — not touched"
+  state is gone, matching the Unlock↔Lock model.
+
+### Fixed
+- **Lock button label now really changes to "Lock".** The group and per-sector
+  buttons draw their label from a live `Icon`+`Text` in the button's `content`
+  (Flet 0.84 doesn't reliably re-render a button's `text`/`icon` shorthand after
+  construction), so text, icon and colour all flip together.
+- **stzrc traffic timeout raised to 300s** (it loads the full MO tree first).
+
+## [1.9.47] - 2026-09-10
+
+### Fixed
+- **Lock button label now flips to "Lock".** When a group/sector toggled to lock
+  mode the colour and icon changed but the text still read "Unlock" — Flet did
+  not re-render the label on an in-place style mutation. The button now gets a
+  fresh `ButtonStyle` on each toggle, so text, icon and colour update together.
+- **`stzrc` "no cell table" diagnosis + timeout.** The stzrc command timeout is
+  raised to 300s (it loads the whole MO tree before the cell tables print; on a
+  large node 120s truncated the output before the tables). When the tables still
+  can't be parsed, the log now says why (truncated vs no header vs unparsable)
+  and shows the output tail, instead of a bare "falling back" line.
+
+## [1.9.46] - 2026-09-10
+
+### Added
+- **Unlock ↔ Lock toggle per group and sector.** Once a group (or sector) has
+  nothing left to unlock — every cell is already up — its button automatically
+  becomes a red **Lock** button that locks the cells that are unlocked, instead
+  of a dead Unlock button. Works for LB/MB/HB (`bl`) and GSM (GeranCell set
+  `HALTED`). This lock targets any currently-unlocked cell (not only ones this
+  run unlocked), so a site that was already unlocked can be taken back down;
+  rollback / Re-lock (this-run-only, shown mid-cutover) is unchanged. A cell
+  that is up now counts as "lockable" rather than "unlockable"
+  (`CutoverCell.is_lockable`), which is what flips the button.
+
+## [1.9.45] - 2026-09-10
+
+### Changed
+- **Cut Over shows live status without an unlock click.** A site that is already
+  unlocked and carrying traffic now reflects that immediately: at READY the tool
+  reads each node's status once and starts an always-on background monitor that
+  flips already-enabled cells to ENABLED (with their UE count) and refreshes
+  VSWR — instead of leaving every row grey/"pending".
+- **Pre-state is no longer a hard gate.** A failed or partial pre-state read
+  (e.g. `stzrc` returned no cell table) previously blocked the whole Cut Over
+  ("Pre-state incomplete … blocked"). It is now best-effort: the run continues
+  with a warning, and rollback ownership is simply limited for any unmatched
+  cell. (`cutover.prestate.required` now defaults to `false`.)
+- **Start HC skips the modump.** Start HC now runs CV backup + preHC and cell
+  discovery but not the slow modump capture; Start Unlock still skips all
+  preparation.
+
+### Added
+- **Separate read-only SSH session for polling.** Status/traffic (`stzrc`) and
+  VSWR (`sdirc`) polling now run on a second AMOS session per node, so the
+  background monitor never contends with unlock on the single-writer PTY
+  (`cutover.separate_read_session`, default `true`; falls back to the primary
+  session under the action lock if the second connection can't be opened).
+
+### Fixed
+- **`stzrc` "no cell table" false negative.** The LTECell/NRCell table header is
+  now matched case-insensitively, so a header that differs only in case/spacing
+  across node SW loads still parses instead of falling back and reporting no
+  cells.
+
+## [1.9.44] - 2026-09-10
+
+### Added
+- **Cut Over: GSM (GeranCell) unlock + status.** GSM cells now appear as their
+  own "GSM (GeranCell)" group with per-sector unlock buttons. Discovery lists
+  the site's GeranCells from the BSC
+  (`cmedit get * GeranCell.(GeranCellid==<site>*,state) -t`, site id derived like
+  the integration GSM step and precise-filtered so foreign sites are excluded)
+  and binds each to its GsmSector on the node via sector number
+  (`M2839S1`→`…-1`, `M8239R3`→`…-R3`). The GeranCell get is verbose so the full
+  BSC FDN is captured — `cmedit set` needs the FDN, not a filter. Unlock runs in
+  both places: BSC `cmedit set <FDN> state=ACTIVE`, then node
+  `ldeb GsmSector=…,Trx` for any sector whose Trx aren't all enabled. A cell is shown **Enabled** only when its
+  GeranCell is `ACTIVE` **and** every timeslot of its GsmSector reads `ENABLED`
+  (`get . tss`); if a sector is still disabled after `cutover.gsm.enable_timeout_s`
+  (default 180s) a diagnostic pop-up names the `GsmSector`. Rollback sets the
+  GeranCell back to `HALTED`. The row shows the GeranCell name only (standing in
+  for both the GeranCell and its GsmSector); UE/VSWR don't apply to GSM. New
+  `parse_gerancell_states` / `parse_tss` / `parse_gsmsector_list` parsers,
+  GSM primitives, and a `cutover.gsm` config block (all templates configurable).
+
+## [1.9.43] - 2026-09-10
+
+### Added
+- **Cut Over: per-RF-port VSWR shown next to each cell.** After a cell enables,
+  the background monitor already refreshes its status and UE (traffic) count via
+  `stzrc`; it now also runs `sdirc` on its own longer interval
+  (`cutover.vswr.interval_s`, default 300s — `sdirc` takes minutes) and shows the
+  VSWR of each RF port carrying the cell, e.g. `A1.13 B1.15 C1.12 D1.30`,
+  coloured red when any port is at/above `cutover.vswr.warn_threshold` (1.5),
+  with a per-port RL tooltip. The cell↔port mapping comes straight from the
+  `sdirc` FRU/RF/VSWR table's own cells column, so no extra topology lookup is
+  needed; NR cells (`NRC=` in sdirc vs `DU=` in stzrc) match by DN, and AAS/AIR
+  radios that report `-` show `VSWR n/a` rather than a fabricated value.
+  New `parse_sdir_vswr` parser (fails loudly when the table is absent),
+  `run_cutover_vswr` primitive, and `cutover.vswr` config block.
+
 ## [1.9.42] - 2026-09-09
 
 ### Fixed

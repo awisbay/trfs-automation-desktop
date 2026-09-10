@@ -45,6 +45,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from cutover_model import (
+    GSM,
     TERMINAL_FAIL,
     UNMAPPED,
     CellStatus,
@@ -59,14 +60,21 @@ from cutover_model import (
 )
 from cutover_parsers import (
     diff_alarms,
+    gsm_band_of,
+    gsm_sector_suffix,
     looks_like_unknown_command,
     match_row,
     parse_alarm_summary,
     parse_barred_state,
     parse_cells_from_hgetc,
+    parse_gerancell,
+    parse_gsmsector_list,
     parse_radio_status,
+    parse_nr_sector_carrier_refs,
+    parse_sdir_vswr,
     parse_st_cell_rows,
     parse_stzrc,
+    parse_tss,
     parse_ue_counts,
     st_rows_from_stzrc,
     strip_ansi,
@@ -88,6 +96,11 @@ _render_lock = threading.Lock()
 _DEFAULTS = {
     "enabled": True,
     "dry_run": False,
+    # Open a second, read-only AMOS session per node for status/traffic/VSWR
+    # polling so the background monitor never shares the single-writer PTY with
+    # unlock. Falls back to the primary session (guarded by the action lock) if
+    # the second connection cannot be established.
+    "separate_read_session": True,
     "require_confirmation": True,
     "max_cells_per_unlock": 0,
     "discovery": {
@@ -109,6 +122,16 @@ _DEFAULTS = {
     "stop_on_group_failure": False,
     "unlock": {
         "command_template": "ldeb {mo_type}={cell_dn}",
+        # NRCellDU depends on its sector carrier. For band 41 sector 1 this
+        # resolves to GNBDUFunction=1,NRSectorCarrier=N41_S1 and is unlocked
+        # once, before any related NRCellDU command.
+        "nr_carrier_enabled": True,
+        "nr_carrier_mo_template": (
+            "GNBDUFunction=1,NRSectorCarrier=N{band_number}_S{sector}"
+        ),
+        "nr_carrier_unlock_template": "ldeb {mo_ref}",
+        "nr_carrier_lookup_command": "get nrcelldu sectorcarrier",
+        "nr_carrier_allow_name_fallback": False,
         "lock_command_template": "bl {mo_type}={cell_dn}",
         "graceful_lock": False,
         "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
@@ -122,8 +145,12 @@ _DEFAULTS = {
                            "Syntax error", "failed"],
     },
     "prestate": {
+        # Pre-state records which cells were already unlocked before this run so
+        # rollback never re-locks a live cell. It is best-effort, NOT a gate:
+        # a node that already has everything unlocked and carrying traffic must
+        # still be workable, so a failed/partial read no longer blocks Cut Over.
         "enabled": True,
-        "required": True,
+        "required": False,
         "skip_already_in_service": True,
     },
     "preparation": {
@@ -132,6 +159,10 @@ _DEFAULTS = {
         "create_cv": {
             "enabled": True,
             "name_template": "PreCutover_{node}_{timestamp}",
+        },
+        "post_create_cv": {
+            "enabled": True,
+            "name_template": "Post_CutOver_{timestamp}",
         },
         "modump": {
             "enabled": True,
@@ -142,10 +173,35 @@ _DEFAULTS = {
             "command_template": "run {script_path}",
             "timeout_s": 900,
         },
+        "posthc": {
+            "enabled": True,
+            "script_path": "/home/shared/common/INTEGRATION_TEAM/script/PostHC.txt",
+            "command_template": "run {script_path}",
+            "timeout_s": 900,
+        },
+    },
+    "trfs": {
+        "enabled": True,
+        "label_script": "/home/shared/ms260229/INOC/SCRIPTS/DM/LABEL.mos",
+        "command_template": "run {script_path}",
+        "scripts": {
+            "all": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_2G4G5G_allTech_cmd.mos",
+            "no2g": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_4Gand5G_only_cmd.mos",
+            "gsm_only": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_2G_cmd_only.mos",
+        },
+        "remote_log_dir": "/home/shared/common/INTEGRATION_TEAM/TRFS",
+        "rats_command": "pv $rats",
+        "rats_timeout_s": 60,
+        "idle_wait_s": 20,
+        "timeout_s": 1800,
     },
     "persistence": {
         "enabled": True,
         "checkpoint_interval_s": 0.5,
+        # Effective config changes are warned about during recovery, but live
+        # state is still reconciled and no write is replayed automatically.
+        # Set true for environments that require byte-equivalent run config.
+        "require_config_match": False,
     },
     "diagnosis": {
         "enabled": True,
@@ -159,8 +215,15 @@ _DEFAULTS = {
         "lte_before_nr": True,
     },
     "enable_poll": {
-        "source": "stzrc",
-        "commands": ["st cell"],
+        # Status (administrativeState / operationalState) comes from a fast
+        # hgetc, NOT stzrc: stzrc loads the whole MO tree first and is slow, and
+        # the cut-over only needs UNLOCKED/ENABLED vs LOCKED/DISABLED here.
+        # Traffic (UE via stzrc) and VSWR (sdirc) are read separately in the
+        # background. Set source="stzrc" to fold state out of the traffic table.
+        "source": "st",
+        "commands": [
+            "hgetc EUtranCellFDD|EUtranCellTDD|NRCellDU administrativeState|operationalState"
+        ],
         "command_timeout_s": 90,
         "interval_s": 15,
         "interval_max_s": 60,
@@ -177,7 +240,10 @@ _DEFAULTS = {
     },
     "traffic": {
         "command": "stzrc",
-        "command_timeout_s": 120,
+        # stzrc loads the whole MO tree before printing the cell tables; on a
+        # large node that alone can exceed two minutes, so give it room or the
+        # output gets truncated before the tables ("no cell table").
+        "command_timeout_s": 300,
         "interval_s": 20,
         "timeout_s": 600,
         "ue_column_names": ["UE", "UEs", "NoOfUsers", "nrOfRrcConnected",
@@ -195,6 +261,54 @@ _DEFAULTS = {
         "command_timeout_s": 120,
         "baseline_before_unlock": True,
         "no_alarm_patterns": ["No Active alarms"],
+        # Once a node has at least one enabled cell, re-enable FM alarm
+        # supervision in the background (once per node) — counterpart to the
+        # integration Backup CV's fmalarmsupervision=false. {cli}=ENM CLI helper,
+        # {node}=NetworkElement.
+        "activate_enabled": True,
+        "activate_check_command": (
+            '!python {cli} "cmedit get {shortcode}* '
+            'fmalarmsupervision.active -t"'),
+        "activate_command": (
+            '!python {cli} "cmedit set {node} fmalarmsupervision active=true"'),
+        "activate_timeout_s": 60,
+    },
+    "vswr": {
+        # After a cell enables, sdirc reads the VSWR of every RF port and the
+        # cells each port carries, shown next to the cell alongside its UE
+        # count. sdirc is slow (minutes), so it refreshes on its own long
+        # interval rather than every status poll.
+        "enabled": True,
+        "command": "sdirc",
+        "command_timeout_s": 600,
+        "interval_s": 300,
+        "warn_threshold": 1.40,   # a port VSWR above this reads as a problem
+    },
+    "gsm": {
+        # GSM cells (GeranCell) unlock in two places: the BSC (cmedit set
+        # state=ACTIVE) and the node (ldeb GsmSector=…,Trx). "Enabled" is the
+        # combination of GeranCell=ACTIVE and every Trx timeslot ENABLED (tss).
+        "enabled": True,
+        "cli_py": "",   # blank → reuse integration_runner.CLI_PY
+        # {cli}=python cmedit client, {site}=M<digits> site id, {fdn}=full GeranCell
+        # FDN (cmedit set needs the FDN, not a filter), {state}=ACTIVE|HALTED.
+        # The get is verbose (no -t) so the FDN is captured for the set.
+        "state_get_template": '!python {cli} "cmedit get * GeranCell.(GeranCellid=={site}*,state)"',
+        "state_set_template": '!python {cli} "cmedit set {fdn} state={state}"',
+        "active_value": "ACTIVE",
+        "locked_value": "HALTED",
+        "set_success_patterns": ["SUCCESS"],
+        "cmedit_timeout_s": 120,
+        "tss_command": "get . tss",
+        "gsmsector_list_command": "lst gsmsector",
+        # {sector_mo}=full GsmSector RDN, e.g. CMPBAHIANMALAYBBUK-1.
+        "trx_unlock_template": "ldeb GsmSector={sector_mo},Trx",
+        "trx_unlock_confirm": True,
+        "trx_confirm_answer": "y",
+        "command_timeout_s": 120,
+        "enable_timeout_s": 30,      # max 30s; operator can Lock meanwhile
+        "poll_interval_s": 5,
+        "band_groups": {"GSM900": "GSM", "GSM1800": "GSM"},
     },
     "report": {
         "screenshot_subdir": "CUTOVER",
@@ -223,6 +337,29 @@ _DEFAULTS = {
     },
     "final_verification": {"enabled": True, "stop_on_failure": False, "steps": []},
 }
+
+
+def _nr_carrier_ref(cell, cfg: dict) -> str:
+    """Related NRSectorCarrier MO for an NRCellDU, or ``""`` when disabled."""
+    unlock = cfg.get("unlock", {})
+    if cell.rat != "NR" or not unlock.get("nr_carrier_enabled", True):
+        return ""
+    live_ref = str(getattr(cell, "nr_sector_carrier_ref", "") or "").strip()
+    if live_ref:
+        return live_ref
+    if not unlock.get("nr_carrier_allow_name_fallback", False):
+        return ""
+    if int(cell.band_number) < 0 or not str(cell.sector).strip():
+        return ""
+    return str(unlock.get(
+        "nr_carrier_mo_template",
+        "GNBDUFunction=1,NRSectorCarrier=N{band_number}_S{sector}",
+    )).format(
+        band_number=cell.band_number,
+        sector=cell.sector,
+        node=cell.node_name,
+        cell_dn=cell.cell_dn,
+    )
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -315,10 +452,68 @@ def run_cutover_unlock(ssh, node_name: str, cells: list,
     err_pats = [p for p in unlock.get("error_patterns", []) if p]
     combined = ""
     any_ok = False
+    carrier_done: dict = {}
 
     for cell in cells:
         if cancel_event is not None and cancel_event.is_set():
             return any_ok, combined
+
+        # NRSectorCarrier is an administrative dependency of NRCellDU. Unlock
+        # it first and only once when multiple NR cells share band + sector.
+        carrier_ref = _nr_carrier_ref(cell, cfg)
+        if cell.rat == "NR" and unlock.get("nr_carrier_enabled", True):
+            if not carrier_ref:
+                msg = (f"cannot derive NRSectorCarrier for {cell.mo_ref} "
+                       f"(band={cell.band_number}, sector={cell.sector or '?'})")
+                log_cb(f"[{node_name}] ✗ {msg}")
+                if on_cell:
+                    on_cell(cell, False, "", msg)
+                if unlock.get("abort_group_on_first_error") and not any_ok:
+                    return False, combined
+                continue
+            if carrier_ref not in carrier_done:
+                carrier_cmd = str(unlock.get(
+                    "nr_carrier_unlock_template", "ldeb {mo_ref}"
+                )).format(mo_ref=carrier_ref, node=node_name,
+                          band_number=cell.band_number, sector=cell.sector)
+                if dry_run:
+                    log_cb(f"[{node_name}] DRY RUN — would send: {carrier_cmd}")
+                    combined += f"[DRY RUN] {carrier_cmd}\n"
+                    carrier_done[carrier_ref] = True
+                else:
+                    log_cb(f"[{node_name}] {carrier_cmd}")
+                    try:
+                        if unlock.get("expects_confirm"):
+                            carrier_out = ssh.run_amos_set_with_confirm(
+                                carrier_cmd, node_name,
+                                answer=unlock.get("confirm_answer", "y"),
+                                timeout=unlock["command_timeout_s"])
+                        else:
+                            carrier_out = ssh.run_amos_command_safe(
+                                carrier_cmd, node_name,
+                                timeout=unlock["command_timeout_s"])
+                    except Exception as exc:
+                        carrier_out = ""
+                        carrier_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        hit = next((p for p in err_pats if re.search(
+                            re.escape(p), carrier_out, re.IGNORECASE)), None)
+                        carrier_error = f"output matched {hit!r}" if hit else ""
+                    combined += carrier_out + "\n"
+                    carrier_done[carrier_ref] = not carrier_error
+                    if carrier_error:
+                        log_cb(f"[{node_name}] ✗ {carrier_ref}: {carrier_error}")
+                if carrier_done.get(carrier_ref):
+                    delay = unlock.get("inter_command_delay_s") or 0
+                    if delay:
+                        time.sleep(delay)
+            if not carrier_done.get(carrier_ref):
+                msg = f"NRSectorCarrier unlock failed: {carrier_ref}"
+                if on_cell:
+                    on_cell(cell, False, "", msg)
+                if unlock.get("abort_group_on_first_error") and not any_ok:
+                    return False, combined
+                continue
 
         command = template.format(
             mo_type=cell.mo_type, cell_dn=cell.cell_dn,
@@ -374,6 +569,18 @@ def run_cutover_unlock(ssh, node_name: str, cells: list,
     return any_ok, combined
 
 
+def run_cutover_nr_carrier_refs(ssh, node_name: str,
+                                log_cb: Callable[[str], None],
+                                cfg: dict) -> tuple:
+    """Read the authoritative NRCellDU → NRSectorCarrier references."""
+    unlock = cfg["unlock"]
+    command = unlock.get(
+        "nr_carrier_lookup_command", "get nrcelldu sectorcarrier")
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=unlock["command_timeout_s"])
+    return parse_nr_sector_carrier_refs(out), out
+
+
 def run_cutover_st_cell(ssh, node_name: str, log_cb: Callable[[str], None],
                         cfg: dict, wait_for_user=None) -> tuple:
     """Run the status command(s). Returns (ok, output, rows).
@@ -403,9 +610,27 @@ def run_cutover_st_cell(ssh, node_name: str, log_cb: Callable[[str], None],
             for table, (total, up) in sorted(stz.totals.items()):
                 log_cb(f"[{node_name}] {table}: {up}/{total} cell(s) up")
             return True, out, st_rows_from_stzrc(stz)
-        # Not stzrc-shaped after all — fall through to the st commands.
-        log_cb(f"[{node_name}] {command!r} output had no cell table; "
-               f"falling back to the status command(s).")
+        # Not stzrc-shaped after all — fall through to the st commands, but say
+        # WHY so a recurring fallback can be diagnosed. The usual cause is the
+        # command returning before the cell tables printed (stzrc loads the whole
+        # MO tree first, which on a big node can exceed traffic.command_timeout_s)
+        # rather than a genuinely different format.
+        txt = out or ""
+        has_hdr = ("LTECell" in txt) or ("NRCell" in txt)
+        has_total = "Total:" in txt and "Cells" in txt
+        tail = " | ".join(
+            ln.strip() for ln in txt.splitlines() if ln.strip())[-160:]
+        if has_hdr and not has_total:
+            why = ("a cell-table header is present but no 'Total: N Cells' line — "
+                   "the output looks truncated (increase "
+                   "cutover.traffic.command_timeout_s)")
+        elif not has_hdr:
+            why = (f"no LTECell/NRCell header in {len(txt)} char(s) of output — "
+                   f"likely still loading MOs when it returned")
+        else:
+            why = "cell rows could not be parsed"
+        log_cb(f"[{node_name}] {command!r}: {why}; falling back to the status "
+               f"command(s). tail: …{tail}")
 
     commands = poll.get("commands") or ["st cell"]
     if isinstance(commands, str):
@@ -436,12 +661,15 @@ def run_cutover_prestate(ssh, node_name: str, cells: list,
     """
     ok, out, rows = run_cutover_st_cell(ssh, node_name, log_cb, cfg)
     if not ok:
-        log_cb(f"[{node_name}] ✗ could not read pre-state — Cut Over is "
-               f"blocked because rollback ownership cannot be proven.")
+        log_cb(f"[{node_name}] ⚠ pre-state read did not return a cell table — "
+               f"continuing without it (rollback ownership limited for this node).")
         return False, out
 
     mode = cfg["enable_poll"].get("match_mode", "suffix")
-    node_cells = [c for c in cells if c.node_name == node_name]
+    # GSM (GeranCell) cells never appear in the LTE/NR st-cell table — they have
+    # their own state path — so they must not count toward pre-state matching.
+    node_cells = [c for c in cells
+                  if c.node_name == node_name and c.rat != "GSM"]
     staged: dict = {}
     matched_keys: set = set()
     for row in rows:
@@ -457,9 +685,10 @@ def run_cutover_prestate(ssh, node_name: str, cells: list,
         if len(missing) > 8:
             preview += f", … (+{len(missing) - 8} more)"
         log_cb(
-            f"[{node_name}] ✗ pre-state is incomplete: matched "
-            f"{len(matched_keys)}/{len(node_cells)} discovered cell(s). "
-            f"Missing: {preview}. Cut Over is blocked."
+            f"[{node_name}] ⚠ pre-state matched "
+            f"{len(matched_keys)}/{len(node_cells)} discovered cell(s) "
+            f"(missing: {preview}) — continuing; rollback ownership is limited "
+            f"for the unmatched cells."
         )
         return False, out
 
@@ -482,15 +711,28 @@ def run_cutover_prestate(ssh, node_name: str, cells: list,
 
 
 def run_cutover_create_cv(ssh, node_name: str, log_cb: Callable[[str], None],
-                          cfg: dict, wait_for_user=None) -> tuple:
-    """Create the pre-Cut Over CV using the existing SHM backup workflow."""
+                          cfg: dict, wait_for_user=None,
+                          mode: str = "pre") -> tuple:
+    """Create the pre- or post-Cut Over CV using the SHM backup workflow.
+
+    ``mode="post"`` names the CV ``Post_CutOver_DDMMYYYY_HHMM`` (the post-check
+    counterpart of the pre-Cut Over CV), overridable via
+    ``preparation.post_create_cv.name_template``.
+    """
     from integration_runner import run_backup_cv
 
-    step_cfg = cfg["preparation"]["create_cv"]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = step_cfg.get(
-        "name_template", "PreCutover_{node}_{timestamp}"
-    ).format(node=node_name, timestamp=timestamp)
+    if mode == "post":
+        step_cfg = cfg["preparation"].get("post_create_cv", {})
+        timestamp = datetime.now().strftime("%d%m%Y_%H%M")
+        backup_name = step_cfg.get(
+            "name_template", "Post_CutOver_{timestamp}"
+        ).format(node=node_name, timestamp=timestamp)
+    else:
+        step_cfg = cfg["preparation"]["create_cv"]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = step_cfg.get(
+            "name_template", "PreCutover_{node}_{timestamp}"
+        ).format(node=node_name, timestamp=timestamp)
     return run_backup_cv(
         ssh, node_name, log_cb, wait_for_user, backup_name=backup_name,
     )
@@ -510,20 +752,26 @@ def run_cutover_modump(ssh, node_name: str, shortcode: str, log_dir: str,
 
 
 def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
-                      cfg: dict, wait_for_user=None) -> tuple:
-    """Run the configured preHC Moshell script and return its raw output."""
-    step_cfg = cfg["preparation"]["prehc"]
+                      cfg: dict, wait_for_user=None, mode: str = "pre") -> tuple:
+    """Run the configured pre/post HC Moshell script and return its raw output.
+
+    ``mode="post"`` runs ``preparation.posthc.script_path`` instead of
+    ``preparation.prehc.script_path`` — the post-cutover health check.
+    """
+    key = "posthc" if mode == "post" else "prehc"
+    label = "postHC" if mode == "post" else "preHC"
+    step_cfg = cfg["preparation"].get(key, {})
     script_path = str(step_cfg.get("script_path", "")).strip()
     if not script_path:
-        # No preHC script configured → INFO only, never a blocker. Cut Over
+        # No HC script configured → INFO only, never a blocker. Cut Over
         # should still discover and show current cell status.
-        msg = (f"[{node_name}] preHC has no script_path configured — skipped "
+        msg = (f"[{node_name}] {label} has no script_path configured — skipped "
                f"(info only, not blocking). Set "
-               f"cutover.preparation.prehc.script_path to enable it.")
+               f"cutover.preparation.{key}.script_path to enable it.")
         log_cb(f"ℹ {msg}")
         return True, msg
     if "\n" in script_path or "\r" in script_path:
-        msg = f"[{node_name}] preHC script_path contains a newline."
+        msg = f"[{node_name}] {label} script_path contains a newline."
         log_cb(f"✗ {msg}")
         return False, msg
 
@@ -533,14 +781,14 @@ def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
         script_path=script_path,
         node=node_name,
     )
-    log_cb(f"[{node_name}] running preHC script: {script_path}")
+    log_cb(f"[{node_name}] running {label} script: {script_path}")
     try:
         out = ssh.run_amos_command_safe(
             command, node_name,
             timeout=int(step_cfg.get("timeout_s", 900)),
         )
     except Exception as exc:
-        msg = f"preHC failed: {type(exc).__name__}: {exc}"
+        msg = f"{label} failed: {type(exc).__name__}: {exc}"
         log_cb(f"[{node_name}] ✗ {msg}")
         return False, msg
 
@@ -560,26 +808,142 @@ def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
         # the whole cut over. Flag it for review and continue, unless the
         # operator explicitly opts into blocking via preparation.prehc.blocking.
         if bool(step_cfg.get("blocking", False)):
-            log_cb(f"[{node_name}] ✗ preHC output matched error pattern: {matched}")
+            log_cb(f"[{node_name}] ✗ {label} output matched error pattern: {matched}")
             return False, out
-        log_cb(f"[{node_name}] ⚠ preHC output matched '{matched}' — health check "
-               f"flagged something (info only, not blocking). Review the PREHC "
+        log_cb(f"[{node_name}] ⚠ {label} output matched '{matched}' — health check "
+               f"flagged something (info only, not blocking). Review the HC "
                f"log; cell status will still be shown.")
         return True, out
-    log_cb(f"[{node_name}] ✓ preHC completed.")
+    log_cb(f"[{node_name}] ✓ {label} completed.")
     return True, out
+
+
+def run_cutover_download_hc_log(ssh, node_name: str, mode: str,
+                                local_dir: str,
+                                log_cb: Callable[[str], None]) -> str:
+    """Download the moshell HC logfile the ``run`` produced for this node.
+
+    The HC script writes its own logfile to
+    ``~/Logfile/<YYYYMMDD>/<node>_Logfile_<date>_<time>_(Pre|Post)_HC.log``.
+    We list today's ``~/Logfile/<date>/`` and pull the newest file for this
+    node ending in ``_Pre_HC.log`` / ``_Post_HC.log``. Returns the local path
+    or ``""`` (best-effort — a missing HC log never fails the run)."""
+    label = "Post_HC" if mode == "post" else "Pre_HC"
+    date = datetime.now().strftime("%Y%m%d")
+    home = f"/home/shared/{getattr(ssh, 'username', '')}".rstrip("/")
+    remote_dir = f"{home}/Logfile/{date}"
+    # POST is a persistent per-site folder, so retain every button run instead
+    # of replacing an earlier Post HC logfile from the same day.
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    local_name = (f"{node_name}_Logfile_{stamp}_{label}.log"
+                  if mode == "post"
+                  else f"{node_name}_Logfile_{date}_{label}.log")
+    local_path = os.path.join(local_dir, local_name)
+    got = ssh.download_newest_logfile(
+        remote_dir, local_path,
+        name_contains=node_name, name_endswith=f"_{label}.log",
+    )
+    if got:
+        log_cb(f"[{node_name}] {label} logfile downloaded: {got}")
+        return got
+    log_cb(f"[{node_name}] ⚠ no {label} logfile found under {remote_dir} "
+           f"(searched *_{label}.log for {node_name}).")
+    return ""
+
+
+def parse_rats(output: str) -> tuple:
+    """Parse ``pv $rats`` → (has_2g, has_4g, has_5g).
+
+    moshell prints e.g. ``$rats = L`` (LTE only) or ``$rats = GLN`` (a
+    combination). One letter is a standalone baseband, several letters a
+    combination. G=GSM(2G), L=LTE(4G), N=NR(5G). ``$ratsconfig`` on the next
+    line is ignored."""
+    m = re.search(r"\$rats\s*=\s*([A-Za-z]+)", strip_ansi(output or ""))
+    val = (m.group(1).upper() if m else "")
+    return ("G" in val, "L" in val, "N" in val)
+
+
+def run_cutover_rats(ssh, node_name: str, log_cb: Callable[[str], None],
+                     cfg: dict) -> tuple:
+    """Run ``pv $rats`` to identify the baseband's techs. Returns
+    (has_2g, has_4g, has_5g, raw_output)."""
+    trfs = cfg.get("trfs", {})
+    command = str(trfs.get("rats_command", "pv $rats"))
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=int(trfs.get("rats_timeout_s", 60)))
+    has_2g, has_4g, has_5g = parse_rats(out)
+    return has_2g, has_4g, has_5g, out
+
+
+def trfs_script_for_techs(has_2g: bool, has_4g: bool, has_5g: bool,
+                          cfg: dict) -> str:
+    """Pick the TRFS script path for a node's tech mix, or "" if unknown.
+
+    * 2G present with 4G (± 5G)  → the all-tech script.
+    * 2G only                    → the 2G-only script.
+    * no 2G, but 4G and/or 5G    → the 4G/5G-only script.
+    """
+    scripts = cfg.get("trfs", {}).get("scripts", {})
+    if has_2g and has_4g:
+        return str(scripts.get("all", "")).strip()
+    if has_2g and not has_4g and not has_5g:
+        return str(scripts.get("gsm_only", "")).strip()
+    if not has_2g and (has_4g or has_5g):
+        return str(scripts.get("no2g", "")).strip()
+    # 2G+5G without 4G is undocumented; the all-tech script is the safe superset.
+    if has_2g:
+        return str(scripts.get("all", "")).strip()
+    return ""
+
+
+def run_cutover_trfs(ssh, node_name: str, script_path: str,
+                     local_dir: str, log_cb: Callable[[str], None],
+                     cfg: dict) -> tuple:
+    """Run one TRFS script on a node, wait for moshell to go idle, then pull
+    the node's newest TRFS log folder. Returns (ok, local_folder_or_msg)."""
+    trfs = cfg.get("trfs", {})
+    command = str(trfs.get("command_template", "run {script_path}")).format(
+        script_path=script_path, node=node_name)
+    log_cb(f"[{node_name}] TRFS: {command}")
+    try:
+        out = ssh.run_amos_command_safe(
+            command, node_name, timeout=int(trfs.get("timeout_s", 1800)))
+    except Exception as exc:
+        msg = f"TRFS script failed: {type(exc).__name__}: {exc}"
+        log_cb(f"[{node_name}] ✗ {msg}")
+        return False, msg
+
+    # moshell keeps flushing the log after the prompt returns; give it a short
+    # idle window before grabbing the folder so the log is complete.
+    idle = float(trfs.get("idle_wait_s", 20))
+    if idle > 0:
+        log_cb(f"[{node_name}] TRFS script done — waiting {idle:.0f}s for "
+               f"moshell to go idle before downloading the log folder…")
+        time.sleep(idle)
+
+    remote_parent = str(trfs.get(
+        "remote_log_dir", "/home/shared/common/INTEGRATION_TEAM/TRFS"))
+    got = ssh.download_newest_dir(
+        remote_parent, local_dir, name_prefix=f"{node_name}_")
+    if got:
+        return True, got
+    return False, (f"TRFS log folder for {node_name} not found under "
+                   f"{remote_parent}")
 
 
 def run_cutover_relock(ssh, node_name: str, cells: list,
                        log_cb: Callable[[str], None], cfg: dict,
                        wait_for_user=None, dry_run: bool = False,
                        cancel_event: Optional[threading.Event] = None,
-                       on_cell=None) -> tuple:
-    """Roll back: lock the cells **this session** unlocked. Returns (ok, output).
+                       on_cell=None, allow_any: bool = False) -> tuple:
+    """Lock cells. Returns (ok, output).
 
-    The caller is responsible for passing only relockable cells; this function
-    additionally refuses any cell that fails the check, because getting this
-    wrong takes a live cell out of service.
+    For rollback (``allow_any=False``) this refuses any cell that is not
+    :attr:`~cutover_model.CutoverCell.is_relockable`, because re-locking a cell
+    this run did not unlock could take a live cell out of service. When the
+    operator explicitly asks to lock a group that is already up
+    (``allow_any=True``, the Lock button), the guard is lifted and any passed
+    cell is locked.
     """
     unlock = cfg["unlock"]
     template = (unlock.get("graceful_lock_template")
@@ -591,7 +955,7 @@ def run_cutover_relock(ssh, node_name: str, cells: list,
     for cell in cells:
         if cancel_event is not None and cancel_event.is_set():
             break
-        if not cell.is_relockable:
+        if not allow_any and not cell.is_relockable:
             log_cb(f"[{node_name}] refusing to re-lock {cell.mo_ref} — it was "
                    f"not unlocked by this run.")
             continue
@@ -695,6 +1059,131 @@ def run_cutover_traffic(ssh, node_name: str, log_cb: Callable[[str], None],
     return True, out, res
 
 
+def run_cutover_vswr(ssh, node_name: str, log_cb: Callable[[str], None],
+                     cfg: dict, wait_for_user=None) -> tuple:
+    """Run ``sdirc`` and parse per-RF-port VSWR. Returns (ok, output, VswrResult)."""
+    v = cfg.get("vswr", {})
+    command = str(v.get("command", "sdirc")).format(node=node_name)
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=int(v.get("command_timeout_s", 600)))
+    res = parse_sdir_vswr(out)
+    if not res.ok:
+        log_cb(f"[{node_name}] VSWR ({command}): {res.warning}")
+    return res.ok, out, res
+
+
+# ──────────────────────────────────────────────────────────────────
+# GSM primitives
+# ──────────────────────────────────────────────────────────────────
+def _gsm_cli_py(cfg: dict) -> str:
+    cli = str(cfg.get("gsm", {}).get("cli_py", "")).strip()
+    if cli:
+        return cli
+    from integration_runner import CLI_PY
+    return CLI_PY
+
+
+def _gsm_site_id(shortcode: str) -> str:
+    """Shortcode → GSM cell id prefix (MIN2839 → M2839), reusing the
+    integration step's rule."""
+    from integration_runner import _shortcode_to_cell_id
+    return _shortcode_to_cell_id(shortcode)
+
+
+def run_cutover_gsm_states(ssh, node_name: str, shortcode: str,
+                           log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """Read the site's GeranCells from the BSC (verbose, so FDNs are captured).
+    Returns (info, out) where info maps cell_id → ``{"fdn": …, "state": …}``."""
+    g = cfg["gsm"]
+    command = g["state_get_template"].format(
+        cli=_gsm_cli_py(cfg), site=_gsm_site_id(shortcode))
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=int(g.get("cmedit_timeout_s", 120)))
+    return parse_gerancell(out, shortcode), out
+
+
+def run_cutover_gsm_fetch_fdn(ssh, node_name: str, cell_id: str, shortcode: str,
+                              log_cb: Callable[[str], None], cfg: dict) -> str:
+    """Resolve one GeranCell's full FDN via a verbose get (fallback when the
+    FDN was not captured at discovery). Returns "" if not found."""
+    g = cfg["gsm"]
+    command = g["state_get_template"].format(
+        cli=_gsm_cli_py(cfg), site=cell_id)
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=int(g.get("cmedit_timeout_s", 120)))
+    info = parse_gerancell(out, shortcode).get(cell_id.upper(), {})
+    return info.get("fdn", "")
+
+
+def run_cutover_gsm_tss(ssh, node_name: str,
+                        log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """Read GsmSector/Trx timeslot state on the node. Returns (sectors, out)."""
+    g = cfg["gsm"]
+    out = ssh.run_amos_command_safe(
+        g["tss_command"], node_name, timeout=int(g.get("command_timeout_s", 120)))
+    return parse_tss(out), out
+
+
+def run_cutover_gsm_sector_list(ssh, node_name: str,
+                                log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """``lst gsmsector`` → per-Trx adm/op, plus the full sector RDNs. Returns
+    (parsed, full_names, out) where full_names maps sector suffix → RDN."""
+    g = cfg["gsm"]
+    out = ssh.run_amos_command_safe(
+        g["gsmsector_list_command"], node_name,
+        timeout=int(g.get("command_timeout_s", 120)))
+    parsed = parse_gsmsector_list(out)
+    full = {}
+    for m in re.finditer(r"GsmSector=([^,\s]+)", strip_ansi(out)):
+        rdn = m.group(1)
+        raw_suffix = rdn.rsplit("-", 1)[-1] if "-" in rdn else rdn
+        last_digit = re.search(r"(\d)$", raw_suffix)
+        suffix = last_digit.group(1) if last_digit else raw_suffix
+        full[suffix] = rdn
+    return parsed, full, out
+
+
+def run_cutover_gsm_set_state(ssh, node_name: str, fdn: str, state: str,
+                              log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """BSC ``cmedit set <fdn> state=<state>`` for one GeranCell. Returns (ok, out)."""
+    g = cfg["gsm"]
+    if not fdn:
+        return False, "no GeranCell FDN resolved for set"
+    command = g["state_set_template"].format(
+        cli=_gsm_cli_py(cfg), fdn=fdn, state=state)
+    # Do not expose the cli.py path or the complete ENM FDN in the operator
+    # log.  The exact command still goes to SSH; the UI only needs the target
+    # GeranCell and requested state.
+    cell_id = fdn.rsplit("GeranCell=", 1)[-1].split(",", 1)[0].strip()
+    log_cb(f"Set GeranCell={cell_id or '?'} {str(state).upper()}")
+    out = ssh.run_amos_command_safe(
+        command, node_name, timeout=int(g.get("cmedit_timeout_s", 120)))
+    up = out.upper()
+    if "ERROR" in up or "FAIL" in up:
+        return False, out
+    ok = any(p.upper() in up for p in g.get("set_success_patterns", ["SUCCESS"]))
+    return ok, out
+
+
+def run_cutover_gsm_trx_unlock(ssh, node_name: str, sector_mo: str,
+                               log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """Node ``ldeb GsmSector=<sector_mo>,Trx`` — unlock every Trx of a sector.
+    Returns (ok, out)."""
+    g = cfg["gsm"]
+    command = g["trx_unlock_template"].format(sector_mo=sector_mo, node=node_name)
+    log_cb(f"[{node_name}] {command}")
+    if g.get("trx_unlock_confirm", True):
+        out = ssh.run_amos_set_with_confirm(
+            command, node_name, answer=g.get("trx_confirm_answer", "y"),
+            timeout=int(g.get("command_timeout_s", 120)))
+    else:
+        out = ssh.run_amos_command_safe(
+            command, node_name, timeout=int(g.get("command_timeout_s", 120)))
+    up = out.upper()
+    ok = not ("ERROR" in up or "SYNTAX ERROR" in up or "NOT FOUND" in up)
+    return ok, out
+
+
 def run_cutover_alarms(ssh, node_name: str, log_cb: Callable[[str], None],
                        cfg: dict, wait_for_user=None) -> tuple:
     """Run the alarm command. Returns (ok, output, total_alarms)."""
@@ -709,6 +1198,34 @@ def run_cutover_alarms(ssh, node_name: str, log_cb: Callable[[str], None],
         detail = ", ".join(f"{k}={v}" for k, v in sorted(by_sev.items()))
         log_cb(f"[{node_name}] {total} active alarm(s){' — ' + detail if detail else ''}")
     return True, out, total
+
+
+def parse_fm_alarm_supervision(output: str) -> dict:
+    """Parse NetworkElement, supervision id, and active from a cmedit table."""
+    states = {}
+    for line in (output or "").splitlines():
+        match = re.match(r"^\s*(\S+)\s+\d+\s+(true|false)\s*$", line,
+                         re.IGNORECASE)
+        if match:
+            states[match.group(1).upper()] = match.group(2).lower() == "true"
+    return states
+
+
+def run_cutover_activate_alarm(ssh, node_name: str,
+                              log_cb: Callable[[str], None], cfg: dict) -> tuple:
+    """Set FM alarm supervision active for one node. Returns (ok, output)."""
+    a = cfg.get("alarm", {})
+    cmd = a.get("activate_command", (
+        '!python {cli} "cmedit set {node} fmalarmsupervision active=true"'
+    )).format(
+        cli=_gsm_cli_py(cfg), node=node_name)
+    log_cb(f"[{node_name}] setting FM alarm supervision active=true…")
+    out = ssh.run_amos_command_safe(
+        cmd, node_name, timeout=int(a.get("activate_timeout_s", 60)))
+    up = (out or "").upper()
+    ok = not any(pat in up for pat in (
+        "ERROR", "SYNTAX ERROR", "COMMAND NOT FOUND", "FAILED"))
+    return ok, out
 
 
 def run_cutover_final_step(ssh, node_name: str, step: FinalStepState,
@@ -757,12 +1274,18 @@ class CutoverEngine:
         self.log_queue: queue.Queue = queue.Queue()
         self.event_queue: queue.Queue = queue.Queue()
 
-        node_names = [
-            n for n in (
-                str(self.form.get("node_name", "")).strip(),
-                str(self.form.get("node2_name", "")).strip(),
-            ) if n
-        ]
+        # Cut Over may span two LTE/NR BBs plus a dedicated GSM BB. Keep one
+        # AMOS session per distinct node; previously gsm_node_name was omitted,
+        # so GsmSector discovery could only search B01/B02 and silently had no
+        # target for the Trx ldeb on B03.
+        node_names = []
+        seen_nodes = set()
+        for field in ("node_name", "node2_name", "gsm_node_name"):
+            node = str(self.form.get(field, "")).strip()
+            key = node.upper()
+            if node and key not in seen_nodes:
+                node_names.append(node)
+                seen_nodes.add(key)
         self.run = CutoverRun(
             shortcode=str(self.form.get("shortcode", "")).strip(),
             node_names=node_names,
@@ -771,6 +1294,8 @@ class CutoverEngine:
         for name in self.cfg["group_order"]:
             self.run.groups[name] = GroupState(name=name)
         self.run.groups[UNMAPPED] = GroupState(name=UNMAPPED)
+        if self.cfg.get("gsm", {}).get("enabled", True):
+            self.run.groups[GSM] = GroupState(name=GSM)
 
         for raw in (self.cfg.get("final_verification", {}).get("steps") or []):
             self.run.final_steps.append(FinalStepState(
@@ -817,6 +1342,24 @@ class CutoverEngine:
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
         self._monitor_lock = threading.Lock()
+        # Separate thread for the SLOW background reads (stzrc traffic + sdirc
+        # VSWR) so the fast status monitor above stays responsive.
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_stop = threading.Event()
+        self._bg_lock = threading.Lock()
+        # node -> time.monotonic() of the last sdirc VSWR / stzrc traffic read,
+        # so those (heavy) commands run at their own interval rather than every
+        # status poll.
+        self._vswr_last: dict = {}
+        self._traffic_last: dict = {}
+        # Site-wide FM supervision is checked exactly once, immediately before
+        # the first confirmed unlock command.
+        self._alarm_activation_checked = False
+        # HC mode for the current preparation run: "pre" (Pre HC) or "post"
+        # (Post HC — post-cutover check, creates a Post_CutOver CV).
+        self._hc_mode = "pre"
+        # LABEL.mos runs once per session, before the first TRFS script.
+        self._trfs_label_done = False
 
     # ── logging ──────────────────────────────────────────────────
     def _default_log_dir(self) -> str:
@@ -850,13 +1393,30 @@ class CutoverEngine:
     def is_busy(self) -> bool:
         return self._action_lock.locked()
 
-    def start_discovery(self, skip_preparation: bool = False) -> None:
+    def start_discovery(self, skip_preparation: bool = False,
+                        skip_modump: bool = False,
+                        hc_mode: str = "pre") -> None:
         # skip_preparation=True → the "Start Unlock" path: skip CV backup,
         # modump and preHC, and go straight to identifying cells + their live
         # status so the operator can unlock directly.
+        # skip_modump=True → the "Start HC" path: run preparation but skip the
+        # (slow) modump capture — CV backup and preHC still run.
         self._skip_preparation = bool(skip_preparation)
+        self._skip_modump = bool(skip_modump)
+        self._hc_mode = "post" if hc_mode == "post" else "pre"
         self._ensure_persistence_started()
-        self._spawn(self._discovery_worker, "cutover-discovery")
+        self._spawn(self._discovery_worker, f"cutover-{self._hc_mode}hc")
+
+    def start_posthc(self) -> None:
+        """Post HC: the post-cutover counterpart of Pre HC. Creates a
+        Post_CutOver CV, runs the postHC script (and downloads its log), then
+        re-reads cell status. Skips the slow modump, like Pre HC."""
+        self.start_discovery(skip_modump=True, hc_mode="post")
+
+    def run_trfs_log(self) -> None:
+        """Run the TRFS logging scripts on every node (LABEL.mos once first),
+        then download each node's newest TRFS log folder."""
+        self._spawn(self._trfs_worker, "cutover-trfs")
 
     def recover(self, mode: str = "resume") -> None:
         """Reconnect and reconcile an unfinished run before resume/rollback."""
@@ -896,6 +1456,17 @@ class CutoverEngine:
         self._spawn(lambda: self._grouped_action(list(self.cfg["group_order"])),
                     "cutover-all")
 
+    def unlock_sector(self, sector: str) -> None:
+        """Unlock one physical sector across every radio group, including GSM.
+
+        Other sectors are deliberately excluded from the target set.
+        """
+        groups = list(self.cfg["group_order"])
+        if self.cfg.get("gsm", {}).get("enabled", True):
+            groups.append(GSM)
+        self._spawn(lambda: self._grouped_action(groups, str(sector)),
+                    f"cutover-all-S{sector}")
+
     def relock_group(self, group: str, sector: Optional[str] = None) -> None:
         """Roll back one group (optionally one sector) — only cells this
         session unlocked."""
@@ -906,6 +1477,13 @@ class CutoverEngine:
         """Roll back everything this session unlocked, highest band first."""
         order = list(reversed(list(self.cfg["group_order"])))
         self._spawn(lambda: self._relock_action(order), "cutover-relock-all")
+
+    def lock_group(self, group: str, sector: Optional[str] = None) -> None:
+        """Lock a group (optionally one sector) that is already up — the Lock
+        button shown once a group has nothing left to unlock. Unlike rollback,
+        this locks any currently-unlocked cell, not only ones this run unlocked."""
+        tag = f"cutover-lock-{group}" + (f"-S{sector}" if sector else "")
+        self._spawn(lambda: self._lock_action([group], sector), tag)
 
     def run_final_verification(self) -> None:
         self._spawn(self._final_verify_worker, "cutover-verify")
@@ -926,8 +1504,14 @@ class CutoverEngine:
         if not by_node:
             self.log(f"{group}: no cells to build evidence for.")
             return
-        self.log(f"{group}: building WhatsApp evidence (traffic + alarms)…")
-        self._report_phase(group, by_node)
+        self.log(f"{group}: collecting fresh traffic + alarms per node…")
+        previous_phase = run.phase
+        run.set_phase(RunPhase.REPORTING, active_group=group)
+        try:
+            self._report_phase(group, by_node)
+        finally:
+            if run.phase == RunPhase.REPORTING:
+                run.set_phase(previous_phase, active_group="")
 
     def confirm_traffic(self, group: str, ok: bool) -> None:
         """Resolve a manual traffic gate raised by an unparseable UE column."""
@@ -965,6 +1549,14 @@ class CutoverEngine:
                 sess.ssh.disconnect()
             except Exception:
                 pass
+            for extra in ("read_ssh", "bg_ssh"):
+                obj = getattr(sess, extra, None)
+                if obj is not None:
+                    try:
+                        obj.disconnect()
+                    except Exception:
+                        pass
+                    setattr(sess, extra, None)
             sess.connected = False
         self.run.sessions.clear()
 
@@ -1065,19 +1657,21 @@ class CutoverEngine:
     def _force_disconnect(self) -> None:
         """Close channels so threads blocked in recv() unwind immediately."""
         for sess in list(self.run.sessions.values()):
-            ssh = sess.ssh
-            for attr in ("shell", "client"):
-                obj = getattr(ssh, attr, None)
-                if obj is None:
+            for ssh in (sess.ssh, sess.read_ssh, sess.bg_ssh):
+                if ssh is None:
                     continue
-                try:
-                    if attr == "client":
-                        tr = obj.get_transport()
-                        if tr:
-                            tr.close()
-                    obj.close()
-                except Exception:
-                    pass
+                for attr in ("shell", "client"):
+                    obj = getattr(ssh, attr, None)
+                    if obj is None:
+                        continue
+                    try:
+                        if attr == "client":
+                            tr = obj.get_transport()
+                            if tr:
+                                tr.close()
+                        obj.close()
+                    except Exception:
+                        pass
 
     def _wait(self, seconds: float) -> bool:
         """Interruptible sleep. Returns True if cancelled."""
@@ -1088,9 +1682,13 @@ class CutoverEngine:
         """Persist one pre-Cut Over step output under a unique run folder."""
         safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", node_name) or "NODE"
         safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", step) or "STEP"
-        folder = self._run_dir
+        post = getattr(self, "_hc_mode", "pre") == "post"
+        folder = os.path.join(self.log_dir, "POST") if post else self._run_dir
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"{safe_node}_{safe_step}.log")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = (f"{safe_node}_{safe_step}_{stamp}.log"
+                    if post else f"{safe_node}_{safe_step}.log")
+        path = os.path.join(folder, filename)
         with open(path, "w", encoding="utf-8", errors="replace") as handle:
             handle.write(output or "")
             if output and not output.endswith("\n"):
@@ -1112,12 +1710,15 @@ class CutoverEngine:
         # preHC is a health check, not a gate: when no script is configured it
         # is skipped (info) rather than run — so a missing reference file never
         # blocks discovery / showing the current cell status.
-        prehc_cfg = prep.get("prehc", {})
-        prehc_enabled = bool(prehc_cfg.get("enabled", True))
-        if prehc_enabled and not str(prehc_cfg.get("script_path", "")).strip():
-            self.log(f"[{node_name}] ℹ preHC has no script_path — skipped "
+        mode = getattr(self, "_hc_mode", "pre")
+        hc_key = "posthc" if mode == "post" else "prehc"
+        hc_label = "POSTHC" if mode == "post" else "PREHC"
+        hc_cfg = prep.get(hc_key, {})
+        hc_enabled = bool(hc_cfg.get("enabled", True))
+        if hc_enabled and not str(hc_cfg.get("script_path", "")).strip():
+            self.log(f"[{node_name}] ℹ {hc_label} has no script_path — skipped "
                      f"(info only, not blocking).")
-            prehc_enabled = False
+            hc_enabled = False
 
         steps = [
             (
@@ -1125,12 +1726,14 @@ class CutoverEngine:
                 prep.get("create_cv", {}).get("enabled", True),
                 lambda: run_cutover_create_cv(
                     sess.ssh, node_name, self.log, self.cfg,
-                    self._wait_for_user,
+                    self._wait_for_user, mode=mode,
                 ),
             ),
             (
                 "MODUMP",
-                prep.get("modump", {}).get("enabled", True),
+                (prep.get("modump", {}).get("enabled", True)
+                 and not getattr(self, "_skip_modump", False)
+                 and mode != "post"),
                 lambda: run_cutover_modump(
                     sess.ssh, node_name, self.run.shortcode,
                     self._precutover_root,
@@ -1138,11 +1741,11 @@ class CutoverEngine:
                 ),
             ),
             (
-                "PREHC",
-                prehc_enabled,
+                hc_label,
+                hc_enabled,
                 lambda: run_cutover_prehc(
                     sess.ssh, node_name, self.log, self.cfg,
-                    self._wait_for_user,
+                    self._wait_for_user, mode=mode,
                 ),
             ),
         ]
@@ -1154,7 +1757,8 @@ class CutoverEngine:
                 continue
             if self.run.is_cancelled():
                 return False
-            self.log(f"[{node_name}] ── Pre-Cut Over: {label} ──")
+            phase_word = "Post-Cut Over" if mode == "post" else "Pre-Cut Over"
+            self.log(f"[{node_name}] ── {phase_word}: {label} ──")
             try:
                 ok, output = action()
             except Exception as exc:
@@ -1166,6 +1770,23 @@ class CutoverEngine:
             except Exception as exc:
                 ok = False
                 self.log(f"[{node_name}] ✗ could not save {label} log: {exc}")
+            if label == hc_label and ok:
+                # The HC script writes its own moshell logfile to
+                # ~/Logfile/<date>/…_(Pre|Post)_HC.log — download it too, not
+                # just our capture of the command echo. Best-effort.
+                try:
+                    hc_dir = (os.path.join(self.log_dir, "POST")
+                              if mode == "post" else self._run_dir)
+                    os.makedirs(hc_dir, exist_ok=True)
+                    got = run_cutover_download_hc_log(
+                        sess.ssh, node_name, mode, hc_dir, self.log)
+                    if got:
+                        with self.run.lock:
+                            self.run.artifacts[f"{node_name}:{hc_label}_LOG"] = got
+                            self.run.touch()
+                except Exception as exc:
+                    self.log(f"[{node_name}] ⚠ HC logfile download failed: "
+                             f"{type(exc).__name__}: {exc}")
             if label == "MODUMP" and ok:
                 match = re.search(r"\[SFTP\]\s+Downloaded\s+→\s+(.+)", output or "")
                 if match:
@@ -1183,6 +1804,105 @@ class CutoverEngine:
                     break
         return all_ok
 
+    # ── TRFS logging ─────────────────────────────────────────────
+    def _trfs_worker(self) -> None:
+        """Run LABEL.mos once, then the per-node TRFS script, and download each
+        node's newest TRFS log folder.
+
+        Independent of Pre HC: connects the nodes itself and identifies each
+        baseband's techs with ``pv $rats`` (G=2G, L=4G, N=5G), so it never
+        needs prior discovery."""
+        run = self.run
+        trfs = self.cfg.get("trfs", {})
+        if not trfs.get("enabled", True):
+            self.log("TRFS logging is disabled in config.")
+            return
+        run.cancel_event.clear()
+        missing = self._ensure_sessions()
+        if missing:
+            self.log(f"✗ TRFS: could not connect to {', '.join(missing)}.")
+        if not run.sessions:
+            self.log("✗ TRFS: no node session available.")
+            return
+
+        local_dir = os.path.join(self.log_dir, "TRFS")
+        os.makedirs(local_dir, exist_ok=True)
+        cmd_tmpl = str(trfs.get("command_template", "run {script_path}"))
+        label_script = str(trfs.get(
+            "label_script",
+            "/home/shared/ms260229/INOC/SCRIPTS/DM/LABEL.mos")).strip()
+        results_lock = threading.Lock()
+        results: dict = {}
+
+        def _worker(node_name, sess):
+            if run.is_cancelled():
+                return
+            try:
+                has_2g, has_4g, has_5g, _rats_out = run_cutover_rats(
+                    sess.ssh, node_name, self.log, self.cfg)
+            except Exception as exc:
+                self.log(f"[{node_name}] ✗ TRFS: 'pv $rats' failed "
+                         f"({type(exc).__name__}: {exc}) — skipped.")
+                return
+            script = trfs_script_for_techs(has_2g, has_4g, has_5g, self.cfg)
+            techs = "+".join(t for t, on in
+                             (("2G", has_2g), ("4G", has_4g), ("5G", has_5g))
+                             if on) or "none"
+            if not script:
+                self.log(f"[{node_name}] ⚠ TRFS: no script for techs {techs} — "
+                         f"skipped. Check cutover.trfs.scripts in config.json.")
+                return
+
+            # LABEL.mos runs once per session, before the first TRFS script.
+            if label_script:
+                run_label = False
+                with results_lock:
+                    if not self._trfs_label_done:
+                        self._trfs_label_done = True
+                        run_label = True
+                if run_label:
+                    lbl_cmd = cmd_tmpl.format(script_path=label_script,
+                                              node=node_name)
+                    self.log(f"[{node_name}] TRFS: {lbl_cmd} (LABEL, first run)")
+                    try:
+                        sess.ssh.run_amos_command_safe(
+                            lbl_cmd, node_name,
+                            timeout=int(trfs.get("timeout_s", 1800)))
+                    except Exception as exc:
+                        self.log(f"[{node_name}] ⚠ LABEL.mos failed: "
+                                 f"{type(exc).__name__}: {exc} — continuing "
+                                 f"with the TRFS script.")
+
+            self.log(f"[{node_name}] TRFS techs {techs} → {script}")
+            ok, detail = run_cutover_trfs(
+                sess.ssh, node_name, script, local_dir, self.log, self.cfg)
+            with results_lock:
+                results[node_name] = (ok, detail)
+                if ok:
+                    with run.lock:
+                        run.artifacts[f"{node_name}:TRFS_LOG"] = detail
+                        run.touch()
+
+        self.log(f"TRFS logging starting on {len(run.sessions)} node(s)…")
+        self._run_per_node(dict(run.sessions), _worker)
+
+        done = sum(1 for ok, _ in results.values() if ok)
+        self.log(f"TRFS logging finished: {done}/{len(results)} node folder(s) "
+                 f"downloaded to {local_dir}")
+        # Per-node lines for the completion popup: node → folder, or the reason
+        # it did not download.
+        lines = []
+        for node_name, (ok, detail) in sorted(results.items()):
+            if ok:
+                lines.append(f"✓ {node_name} → {os.path.basename(detail)}")
+            else:
+                lines.append(f"✗ {node_name}: {detail}")
+        self.emit(CutoverEvent(
+            kind="trfs_done",
+            png_path=local_dir,
+            message=(f"TRFS logs: {done}/{len(results)} node folder(s) saved.\n"
+                     + "\n".join(lines))))
+
     # ── recovery ─────────────────────────────────────────────────
     def _recovery_worker(self, checkpoint: str, mode: str) -> None:
         run = self.run
@@ -1197,12 +1917,46 @@ class CutoverEngine:
         expected_hash = str(data.get("config_sha256", ""))
         current_hash = cutover_persistence.config_hash(self.cfg)
         if expected_hash and expected_hash != current_hash:
-            run.error = (
-                "Recovery blocked: config.json differs from the unfinished "
-                "run. Restore the same Cut Over config before resuming."
+            if self.cfg.get("persistence", {}).get(
+                    "require_config_match", False):
+                run.error = (
+                    "Recovery blocked: Cut Over configuration differs from "
+                    "the unfinished run. Restore the same configuration "
+                    "before resuming."
+                )
+                run.set_phase(RunPhase.FAILED)
+                self.log(f"✗ {run.error}")
+                return
+            self.log(
+                "⚠ Cut Over configuration changed since this checkpoint. "
+                "Continuing with live reconciliation; no previous write will "
+                "be replayed automatically. Review every confirmation before "
+                "sending a new Lock/Unlock command."
             )
-            run.set_phase(RunPhase.FAILED)
-            self.log(f"✗ {run.error}")
+
+        # A checkpoint written before discovery contains no recoverable cell
+        # ownership or progress. Treating it as a successful resume used to
+        # produce READY with zero rows, leaving every action disabled. Retire
+        # the empty record and return to IDLE so the operator can run Start HC
+        # or Start Unlock and perform fresh discovery.
+        if not data.get("cells"):
+            try:
+                manifest = cutover_persistence.finalize(
+                    checkpoint, data, "INCOMPLETE_EMPTY")
+                self.log(f"Empty recovery checkpoint retired: {manifest}")
+            except Exception as exc:
+                self.log(f"Could not retire empty recovery checkpoint: {exc}")
+                run.error = "Recovery checkpoint contains no discovered cells."
+                run.set_phase(RunPhase.FAILED)
+                return
+            self.recovery_checkpoint = None
+            run.error = ""
+            run.set_phase(RunPhase.IDLE, active_group="")
+            self.log(
+                "No discovered cells were saved in the unfinished run. "
+                "Start again with Start HC, or use Start Unlock to skip "
+                "preparation and rediscover live state."
+            )
             return
 
         self._preparation_started_at = str(data.get(
@@ -1222,10 +1976,14 @@ class CutoverEngine:
             f"in {mode} mode. No write will be replayed before live readback."
         )
 
-        for node_name in run.node_names:
+        def _recover_connect(node_name, _unused):
             sess = self._connect_node(node_name)
             if sess is not None:
-                run.sessions[node_name] = sess
+                with run.lock:
+                    run.sessions[node_name] = sess
+
+        self._run_per_node({n: None for n in run.node_names},
+                           _recover_connect)
         missing_sessions = [n for n in run.node_names if n not in run.sessions]
         if missing_sessions:
             run.error = "Recovery connection failed: " + ", ".join(missing_sessions)
@@ -1263,12 +2021,18 @@ class CutoverEngine:
                 self._finalize_manifest("ROLLED_BACK")
             return
 
-        self._assure_recovered_cells()
+        # Recovery must finish after authoritative live state reconciliation.
+        # Traffic and sdirc/VSWR are slow read-only assurance and must never
+        # hold the UI in RECOVERING (which disables every operator action).
+        # Resume them on the background sessions after READY instead.
         run.error = ""
         run.set_phase(RunPhase.READY, active_group="")
+        self._ensure_monitor()
+        self._ensure_bg_monitor()
         self.log(
             "✓ Recovery reconciliation complete. Previously attempted cells "
-            "were not replayed; remaining untouched cells may be continued."
+            "were not replayed; remaining untouched cells may be continued. "
+            "Traffic and VSWR assurance is continuing in the background."
         )
 
     def _reconcile_recovered_cells(self) -> bool:
@@ -1276,31 +2040,49 @@ class CutoverEngine:
         run = self.run
         mode = self.cfg["enable_poll"].get("match_mode", "suffix")
         for node_name, sess in run.sessions.items():
-            try:
-                ok, _out, rows = run_cutover_st_cell(
-                    sess.ssh, node_name, self.log, self.cfg,
-                )
-            except Exception as exc:
-                ok, rows = False, []
-                self.log(f"[{node_name}] recovery readback failed: {exc}")
             node_cells = [c for c in run.cells if c.node_name == node_name]
+            radio_cells = [c for c in node_cells if c.rat != "GSM"]
+            gsm_cells = [c for c in node_cells if c.rat == "GSM"]
             staged = {}
-            if ok:
-                for row in rows:
-                    cell = match_row(node_cells, node_name, row, mode=mode)
-                    if cell is not None:
-                        staged[cell.key] = row
-            missing = [c.mo_ref for c in node_cells if c.key not in staged]
+            if radio_cells:
+                nr_cells = [c for c in radio_cells if c.rat == "NR"]
+                if (nr_cells and self.cfg["unlock"].get(
+                        "nr_carrier_enabled", True)):
+                    try:
+                        refs, _ = run_cutover_nr_carrier_refs(
+                            sess.ssh, node_name, self.log, self.cfg)
+                        for cell in nr_cells:
+                            ref = refs.get(cell.cell_dn.upper(), "")
+                            if ref:
+                                run.set_cell(cell, nr_sector_carrier_ref=ref)
+                    except Exception as exc:
+                        self.log(f"[{node_name}] recovery sectorCarrierRef "
+                                 f"lookup failed: {type(exc).__name__}: {exc}")
+                try:
+                    ok, _out, rows = run_cutover_st_cell(
+                        sess.ssh, node_name, self.log, self.cfg,
+                    )
+                except Exception as exc:
+                    ok, rows = False, []
+                    self.log(f"[{node_name}] recovery readback failed: {exc}")
+                if ok:
+                    for row in rows:
+                        cell = match_row(
+                            radio_cells, node_name, row, mode=mode)
+                        if cell is not None:
+                            staged[cell.key] = row
+            missing = [c.mo_ref for c in radio_cells if c.key not in staged]
             if missing:
                 run.error = (
                     f"Recovery blocked: live state matched "
-                    f"{len(staged)}/{len(node_cells)} cells on {node_name}."
+                    f"{len(staged)}/{len(radio_cells)} LTE/NR cells on "
+                    f"{node_name}."
                 )
                 run.set_phase(RunPhase.FAILED)
                 self.log(f"✗ {run.error} Missing: {', '.join(missing[:8])}")
                 return False
 
-            for cell in node_cells:
+            for cell in radio_cells:
                 row = staged[cell.key]
                 admin = (row.admin_state or "").upper()
                 op = (row.op_state or "").upper()
@@ -1355,6 +2137,66 @@ class CutoverEngine:
                         cell, CellStatus.PENDING,
                         status_detail="reconciled: untouched", **common,
                     )
+
+            # GeranCell is an ENM/BSC object and never appears in the radio
+            # node's hgetc administrativeState/operationalState output.  The
+            # old recovery code nevertheless demanded it there, which made a
+            # GSM-only node fail with "live state matched 0/N cells" and left
+            # every action disabled. Reconcile it through its own BSC query.
+            if gsm_cells:
+                try:
+                    info, _out = run_cutover_gsm_states(
+                        sess.ssh, node_name, run.shortcode, self.log, self.cfg)
+                except Exception as exc:
+                    info = {}
+                    self.log(f"[{node_name}] GSM recovery readback failed: {exc}")
+                gsm_missing = [c.mo_ref for c in gsm_cells
+                               if c.cell_dn.upper() not in info]
+                if gsm_missing:
+                    matched = len(gsm_cells) - len(gsm_missing)
+                    run.error = (
+                        f"Recovery blocked: live state matched "
+                        f"{matched}/{len(gsm_cells)} GSM cells on {node_name}."
+                    )
+                    run.set_phase(RunPhase.FAILED)
+                    self.log(f"✗ {run.error} Missing: "
+                             f"{', '.join(gsm_missing[:8])}")
+                    return False
+
+                active = str(self.cfg["gsm"].get(
+                    "active_value", "ACTIVE")).upper()
+                for cell in gsm_cells:
+                    rec = info[cell.cell_dn.upper()]
+                    state = str(rec.get("state", "")).upper()
+                    common = {
+                        "geran_state": state,
+                        "gsm_fdn": rec.get("fdn") or cell.gsm_fdn,
+                    }
+                    if cell.was_unlocked_before or cell.already_in_service:
+                        run.set_cell(
+                            cell, CellStatus.ALREADY_IN_SERVICE,
+                            status_detail=state,
+                            **common)
+                    elif cell.was_unlocked_by_run:
+                        if state == active:
+                            run.set_cell(
+                                cell, CellStatus.ENABLED,
+                                status_detail=state,
+                                **common)
+                        else:
+                            run.set_cell(
+                                cell, CellStatus.RELOCKED,
+                                status_detail=state,
+                                **common)
+                    elif state == active:
+                        run.set_cell(
+                            cell, CellStatus.ALREADY_IN_SERVICE,
+                            status_detail=state,
+                            already_in_service=True, **common)
+                    else:
+                        run.set_cell(
+                            cell, CellStatus.PENDING,
+                            status_detail=state, **common)
         self._persist_checkpoint()
         return True
 
@@ -1412,7 +2254,51 @@ class CutoverEngine:
             sess.last_error = f"{type(exc).__name__}: {exc}"
             self.log(f"[{node_name}] ✗ connection failed: {sess.last_error}")
             return None
+
+        # Second, read-only session for background status/traffic/VSWR polling,
+        # so the monitor never shares the primary PTY with unlock. Best-effort:
+        # on any failure the monitor falls back to the primary (action-locked).
+        if self.cfg.get("separate_read_session", True):
+            try:
+                r = IntegrationSSH(
+                    host=str(form.get("host", "")).strip(),
+                    port=int(form.get("port", 5023) or 5023),
+                    username=str(form.get("username", "")).strip(),
+                    password=str(form.get("password", "")),
+                    log_callback=lambda m: logger.debug("[%s:read] %s",
+                                                        node_name, m),
+                )
+                r.connect(timeout=30)
+                r.enter_amos(node_name,
+                             timeout=self.cfg["discovery"]["amos_timeout_s"])
+                sess.read_ssh = r
+                self.log(f"[{node_name}] read-only status session ready "
+                         f"(unlock and polling won't contend).")
+            except Exception as exc:
+                self.log(f"[{node_name}] ⚠ no separate read session "
+                         f"({type(exc).__name__}: {exc}) — polling will share "
+                         f"the primary session.")
+                sess.read_ssh = None
         return sess
+
+    def _ensure_sessions(self) -> list:
+        """Connect any node that has no live session yet. Returns the list of
+        nodes still missing a session. Used by actions (TRFS) that can run
+        without the full Pre HC / discovery flow."""
+        run = self.run
+
+        def _connect(node_name, _unused):
+            if run.is_cancelled() or node_name in run.sessions:
+                return
+            sess = self._connect_node(node_name)
+            if sess is not None:
+                with run.lock:
+                    run.sessions[node_name] = sess
+
+        todo = {n: None for n in run.node_names if n not in run.sessions}
+        if todo:
+            self._run_per_node(todo, _connect)
+        return [n for n in run.node_names if n not in run.sessions]
 
     def _discovery_worker(self) -> None:
         run = self.run
@@ -1424,13 +2310,15 @@ class CutoverEngine:
 
         # Connect first because every intended node must complete the three
         # pre-Cut Over safeguards before discovery can become READY.
-        for node_name in run.node_names:
+        def _connect(node_name, _unused):
             if run.is_cancelled():
-                break
+                return
             sess = self._connect_node(node_name)
-            if sess is None:
-                continue
-            run.sessions[node_name] = sess
+            if sess is not None:
+                with run.lock:
+                    run.sessions[node_name] = sess
+
+        self._run_per_node({n: None for n in run.node_names}, _connect)
 
         missing_sessions = [
             node for node in run.node_names if node not in run.sessions
@@ -1450,9 +2338,14 @@ class CutoverEngine:
                      "and preHC) — going straight to cell discovery.")
         else:
             preparation_failed = []
-            for node_name, sess in run.sessions.items():
+            prep_lock = threading.Lock()
+
+            def _prepare(node_name, sess):
                 if not self._run_preparation_for_node(node_name, sess):
-                    preparation_failed.append(node_name)
+                    with prep_lock:
+                        preparation_failed.append(node_name)
+
+            self._run_per_node(dict(run.sessions), _prepare)
             if preparation_failed:
                 run.error = (
                     "Pre-Cut Over blocked: preparation failed for "
@@ -1466,16 +2359,50 @@ class CutoverEngine:
         run.set_phase(RunPhase.DISCOVERING)
 
         all_cells: list = []
-        for node_name, sess in run.sessions.items():
+        cells_lock = threading.Lock()
+
+        def _discover(node_name, sess):
             if run.is_cancelled():
-                break
+                return
             try:
                 ok, _out, cells = run_cutover_discovery(
                     sess.ssh, node_name, self.log, self.cfg)
                 if ok:
-                    all_cells.extend(cells)
+                    nr_cells = [c for c in cells if c.rat == "NR"]
+                    if (nr_cells and self.cfg["unlock"].get(
+                            "nr_carrier_enabled", True)):
+                        try:
+                            refs, _ref_out = run_cutover_nr_carrier_refs(
+                                sess.ssh, node_name, self.log, self.cfg)
+                        except Exception as exc:
+                            refs = {}
+                            self.log(
+                                f"[{node_name}] NR sector-carrier lookup failed: "
+                                f"{type(exc).__name__}: {exc}")
+                        matched = 0
+                        for cell in nr_cells:
+                            ref = refs.get(cell.cell_dn.upper(), "")
+                            if ref:
+                                cell.nr_sector_carrier_ref = ref
+                                matched += 1
+                        if matched != len(nr_cells):
+                            self.log(
+                                f"[{node_name}] ⚠ sectorCarrierRef matched "
+                                f"{matched}/{len(nr_cells)} NRCellDU(s); unmatched "
+                                f"NR cells will be blocked from unlock.")
+                    with cells_lock:
+                        all_cells.extend(cells)
             except Exception as exc:
                 self.log(f"[{node_name}] ✗ discovery failed: "
+                         f"{type(exc).__name__}: {exc}")
+
+        self._run_per_node(dict(run.sessions), _discover)
+
+        if self.cfg.get("gsm", {}).get("enabled", True):
+            try:
+                all_cells.extend(self._discover_gsm())
+            except Exception as exc:
+                self.log(f"✗ GSM discovery failed: "
                          f"{type(exc).__name__}: {exc}")
 
         if not all_cells:
@@ -1502,63 +2429,48 @@ class CutoverEngine:
                     c.status_detail = "band not mapped to a group"
             run.touch()
 
-        # Pre-state, BEFORE anything is sent. This is what lets rollback be
-        # safe later: cells already in service are not ours to unlock, and
-        # above all not ours to re-lock.
-        prestate_cfg = self.cfg.get("prestate", {})
-        prestate_required = prestate_cfg.get("required", True)
-        if not prestate_cfg.get("enabled", True) and prestate_required:
-            run.error = (
-                "Pre-state is required but disabled in config.json. "
-                "Cut Over is blocked."
-            )
-            self.log(f"✗ {run.error}")
-            run.set_phase(RunPhase.FAILED)
-            self.emit(CutoverEvent(kind="discovery_done", message=run.error))
-            return
-
-        prestate_failed = []
-        if prestate_cfg.get("enabled", True):
-            for node_name, sess in run.sessions.items():
-                if run.is_cancelled():
-                    break
-                try:
-                    ok, _out = run_cutover_prestate(
-                        sess.ssh, node_name, run.cells, self.log, self.cfg,
-                    )
-                    if not ok:
-                        prestate_failed.append(node_name)
-                except Exception as exc:
-                    self.log(f"[{node_name}] pre-state check failed: "
-                             f"{type(exc).__name__}: {exc}")
-                    prestate_failed.append(node_name)
-
-            if prestate_failed and prestate_required:
-                run.error = (
-                    "Pre-state incomplete for "
-                    + ", ".join(sorted(set(prestate_failed)))
-                    + ". Cut Over is blocked."
-                )
-                self.log(f"✗ {run.error}")
-                run.set_phase(RunPhase.FAILED)
-                self.emit(CutoverEvent(
-                    kind="discovery_done", message=run.error,
-                ))
+        # Read each cell's current status right after discovery — the fast
+        # ``hgetc … administrativeState|operationalState`` (NOT stzrc) — so the
+        # operator immediately sees UNLOCKED/ENABLED vs LOCKED/DISABLED per cell.
+        # Traffic (stzrc) and VSWR (sdirc) are read afterwards, in the
+        # background, off the separate read session. No "already in service"
+        # concept: a cell that is up simply shows ENABLED and can be locked.
+        poll = self.cfg["enable_poll"]
+        def _initial_status(node_name, sess):
+            if run.is_cancelled():
                 return
+            try:
+                rssh = sess.read_ssh or sess.ssh
+                _ok, _out, rows = run_cutover_st_cell(
+                    rssh, node_name, self.log, self.cfg)
+                self._apply_st_rows(node_name, rows, poll)
+                tot = [c for c in run.cells
+                       if c.node_name == node_name and c.rat != "GSM"]
+                if tot:
+                    up = sum(1 for c in tot if c.status == CellStatus.ENABLED)
+                    self.log(f"[{node_name}] cell status: {up}/{len(tot)} "
+                             f"UNLOCKED/ENABLED")
+            except Exception as exc:
+                self.log(f"[{node_name}] status read failed: "
+                         f"{type(exc).__name__}: {exc}")
 
-            with run.lock:
-                for c in run.cells:
-                    if c.already_in_service:
-                        c.status = CellStatus.ALREADY_IN_SERVICE
-                        c.status_detail = "already in service — not touched"
-                run.touch()
+        self._run_per_node(dict(run.sessions), _initial_status)
+        # GSM status (GeranCell + tss) for any node hosting GSM cells.
+        for node_name in {c.node_name for c in run.cells if c.rat == "GSM"}:
+            if run.is_cancelled():
+                break
+            try:
+                self._gsm_combine_status(node_name)
+            except Exception as exc:
+                self.log(f"[{node_name}] GSM status read failed: "
+                         f"{type(exc).__name__}: {exc}")
 
         # Alarm baseline, so the evidence can distinguish alarms this cut over
         # caused from ones the site already had.
         if self.cfg["alarm"].get("baseline_before_unlock", True):
-            for node_name, sess in run.sessions.items():
+            def _alarm_baseline(node_name, sess):
                 if run.is_cancelled():
-                    break
+                    return
                 try:
                     _ok, out, total = run_cutover_alarms(
                         sess.ssh, node_name, self.log, self.cfg)
@@ -1572,6 +2484,8 @@ class CutoverEngine:
                     self.log(f"[{node_name}] alarm baseline failed: "
                              f"{type(exc).__name__}: {exc}")
 
+            self._run_per_node(dict(run.sessions), _alarm_baseline)
+
         unmapped = len(run.cells_of(UNMAPPED))
         in_service = sum(1 for c in run.cells if c.already_in_service)
         msg = f"Discovered {len(all_cells)} cell(s) across {len(run.sessions)} node(s)."
@@ -1583,6 +2497,432 @@ class CutoverEngine:
         self.log(msg)
         run.set_phase(RunPhase.READY)
         self.emit(CutoverEvent(kind="discovery_done", message=msg))
+        if getattr(self, "_hc_mode", "pre") == "post":
+            post_dir = os.path.join(self.log_dir, "POST")
+            self.emit(CutoverEvent(
+                kind="posthc_done",
+                png_path=post_dir,
+                message=(f"Post HC completed on {len(run.sessions)} node(s). "
+                         "CV output, Post HC command logs, and downloaded "
+                         "Post_HC logfiles were saved."),
+            ))
+
+        # A site can already be fully unlocked and carrying traffic before this
+        # run (nothing to unlock). Read live status now so those cells show
+        # ENABLED + UE straight away instead of sitting "pending", then keep the
+        # background monitor refreshing status/traffic/VSWR without waiting for
+        # an unlock click. This belongs to the non-blocking (background) flow.
+        if self.cfg["enable_poll"].get("background_monitor", True):
+            try:
+                self._initial_status_sweep()
+            except Exception as exc:
+                self.log(f"initial status read failed: "
+                         f"{type(exc).__name__}: {exc}")
+            self._ensure_monitor()       # fast status poll
+            self._ensure_bg_monitor()    # slow traffic + VSWR, in parallel
+
+    def _initial_status_sweep(self) -> None:
+        """One immediate status read per node at READY, so already-enabled cells
+        are reflected without an unlock action."""
+        run = self.run
+        poll = self.cfg["enable_poll"]
+        for node_name in list(run.sessions.keys()):
+            if run.is_cancelled():
+                break
+            sess = run.sessions.get(node_name)
+            if sess is None or sess.degraded:
+                continue
+            try:
+                _ok, _out, rows = run_cutover_st_cell(
+                    sess.ssh, node_name, self.log, self.cfg)
+                self._apply_st_rows(node_name, rows, poll)
+            except Exception as exc:
+                self.log(f"[{node_name}] status read failed: "
+                         f"{type(exc).__name__}: {exc}")
+
+    # ── GSM (GeranCell) discovery + unlock ───────────────────────
+    def _discover_gsm(self) -> list:
+        """List the site's GeranCells (BSC) and bind each to its GsmSector on
+        the node, so GSM cells can be unlocked and their combined state read."""
+        run = self.run
+        cfg = self.cfg
+        shortcode = run.shortcode
+        if not shortcode:
+            self.log("GSM discovery skipped — the run has no site shortcode.")
+            return []
+
+        info: dict = {}
+        for node_name, sess in run.sessions.items():
+            try:
+                info, _out = run_cutover_gsm_states(
+                    sess.ssh, node_name, shortcode, self.log, cfg)
+            except Exception as exc:
+                self.log(f"[{node_name}] GeranCell state read failed: "
+                         f"{type(exc).__name__}: {exc}")
+                continue
+            if info:
+                break
+        if not info:
+            self.log(f"No GeranCell found for site {shortcode} — no GSM to track.")
+            return []
+
+        gsm_node, sector_full = None, {}
+        for node_name, sess in run.sessions.items():
+            try:
+                _parsed, full, _out = run_cutover_gsm_sector_list(
+                    sess.ssh, node_name, self.log, cfg)
+            except Exception:
+                full = {}
+            if full:
+                gsm_node, sector_full = node_name, full
+                break
+        if gsm_node is None:
+            gsm_node = next(iter(run.sessions), "")
+            self.log("No GsmSector MO on any node — GSM cells will show BSC "
+                     "state only (Trx/tss checks unavailable).")
+
+        cells = []
+        for cell_id, rec in sorted(info.items()):
+            state = rec.get("state", "")
+            suffix = gsm_sector_suffix(cell_id, shortcode)
+            c = CutoverCell(
+                node_name=gsm_node, mo_type="GeranCell", cell_dn=cell_id,
+                rat="GSM", band_key=gsm_band_of(cell_id, shortcode) or "GSM900",
+                group=GSM, sector=suffix, geran_state=state,
+                gsm_fdn=rec.get("fdn", ""),
+                gsm_sector_mo=sector_full.get(suffix, ""))
+            c.status = CellStatus.PENDING
+            c.status_detail = f"GeranCell {state}"
+            cells.append(c)
+        self.log(f"GSM: {len(cells)} GeranCell(s) for {shortcode} on "
+                 f"{gsm_node or '(no node)'}.")
+        return cells
+
+    def _run_gsm_group(self, sector: Optional[str] = None,
+                       skip_confirmation: bool = False) -> None:
+        run = self.run
+        cfg = self.cfg
+        g = cfg["gsm"]
+        cells = run.unlockable_cells_of(GSM, sector)
+        if not cells:
+            self.log("No GSM cells to unlock.")
+            return
+
+        if (not skip_confirmation and self.cfg.get("require_confirmation")
+                and self._confirm_cb):
+            lines = [f"cmedit set GeranCell={c.cell_dn} state={g['active_value']}"
+                     f"    ({c.node_name}, {c.band_key})" for c in cells]
+            if not self._confirm_cb(GSM, lines):
+                self.log("GSM unlock cancelled at confirmation — nothing sent.")
+                return
+
+        node_name = cells[0].node_name
+        sess = run.sessions.get(node_name)
+        run.set_group(GSM, GroupStatus.RUNNING, started_at=time.monotonic(),
+                      message="")
+        run.set_phase(RunPhase.UNLOCKING, active_group=GSM)
+        where = f" S{sector}" if sector else ""
+        self.log(f"── GSM{where}: unlocking {len(cells)} GeranCell(s) ──")
+        if sess is None:
+            self.log(f"✗ GSM node {node_name} has no session.")
+            run.set_group(GSM, GroupStatus.FAILED, message="no session")
+            run.set_phase(RunPhase.READY, active_group="")
+            return
+
+        dry = bool(cfg.get("dry_run"))
+        self._start_group_logs(GSM, [node_name])
+        try:
+            for c in cells:
+                c.was_unlocked_by_run = True
+                run.touch(c)
+            self._persist_checkpoint()
+
+            # 1) BSC: set each GeranCell ACTIVE.
+            for c in cells:
+                if run.is_cancelled():
+                    break
+                if dry:
+                    run.set_cell(c, CellStatus.UNLOCK_SENT,
+                                 status_detail="[dry run] set ACTIVE",
+                                 t_unlock_sent=time.monotonic())
+                    continue
+                try:
+                    fdn = c.gsm_fdn or run_cutover_gsm_fetch_fdn(
+                        sess.ssh, node_name, c.cell_dn, run.shortcode,
+                        self.log, cfg)
+                    if fdn and not c.gsm_fdn:
+                        run.set_cell(c, gsm_fdn=fdn)
+                    ok, out = run_cutover_gsm_set_state(
+                        sess.ssh, node_name, fdn, g["active_value"],
+                        self.log, cfg)
+                except Exception as exc:
+                    ok, out = False, f"{type(exc).__name__}: {exc}"
+                if ok:
+                    run.set_cell(c, CellStatus.UNLOCK_SENT,
+                                 status_detail="GeranCell set ACTIVE",
+                                 t_unlock_sent=time.monotonic(),
+                                 geran_state=g["active_value"])
+                else:
+                    run.set_cell(c, CellStatus.UNLOCK_FAILED,
+                                 status_detail="cmedit set failed",
+                                 last_error=(out or "")[-200:])
+
+            # 2) Node: unlock the Trx of each sector that isn't fully enabled.
+            if not dry and not run.is_cancelled():
+                try:
+                    lst, _full, _out = run_cutover_gsm_sector_list(
+                        sess.ssh, node_name, self.log, cfg)
+                except Exception:
+                    lst = {}
+                need = {c.gsm_sector_mo for c in cells
+                        if c.gsm_sector_mo and c.status == CellStatus.UNLOCK_SENT}
+                for sector_mo in sorted(need):
+                    if run.is_cancelled():
+                        break
+                    suffix = sector_mo.rsplit("-", 1)[-1]
+                    trx = lst.get(suffix, {})
+                    if trx and all(t.get("op") == "ENABLED" for t in trx.values()):
+                        continue     # already all enabled — no ldeb needed
+                    try:
+                        run_cutover_gsm_trx_unlock(
+                            sess.ssh, node_name, sector_mo, self.log, cfg)
+                    except Exception as exc:
+                        self.log(f"[{node_name}] ✗ Trx unlock {sector_mo}: "
+                                 f"{type(exc).__name__}: {exc}")
+
+            # 3) Assurance continues in the background. Do not hold the global
+            # action lock for the full GSM enable timeout: the operator must be
+            # able to Lock/Re-lock an ACTIVE GeranCell immediately when its Trx
+            # stays disabled.
+            self._start_gsm_assurance(cells, node_name)
+        finally:
+            self._stop_group_logs([node_name])
+        run.set_phase(
+            RunPhase.CANCELLED if run.is_cancelled() else RunPhase.READY,
+            active_group="")
+
+    def _start_gsm_assurance(self, cells: list, node_name: str) -> None:
+        targets = list(cells)
+
+        def _worker():
+            self._gsm_wait_enable(targets, node_name)
+            # A Lock/Re-lock action may finish while assurance is polling. Do
+            # not overwrite its CANCELLED group result afterward.
+            if any(c.status != CellStatus.RELOCKED for c in targets):
+                self._finish_gsm_group()
+
+        t = threading.Thread(target=_worker, name=f"cutover-gsm-{node_name}",
+                             daemon=True)
+        self._threads.append(t)
+        t.start()
+
+    def _gsm_wait_enable(self, cells: list, node_name: str) -> None:
+        run = self.run
+        cfg = self.cfg
+        g = cfg["gsm"]
+        if cfg.get("dry_run"):
+            for c in cells:
+                if c.status == CellStatus.UNLOCK_SENT:
+                    run.set_cell(c, CellStatus.ENABLED,
+                                 status_detail="[dry run] enabled",
+                                 t_enabled=time.monotonic())
+            return
+
+        targets = [c for c in cells if c.status == CellStatus.UNLOCK_SENT]
+        for c in targets:
+            run.set_cell(c, CellStatus.WAITING_ENABLE,
+                         status_detail="waiting for GeranCell + Trx…")
+        if not targets:
+            return
+
+        started = time.monotonic()
+        deadline = started + float(g.get("enable_timeout_s", 180))
+        while True:
+            if run.is_cancelled():
+                self._mark_remaining(targets, CellStatus.CANCELLED, "cancelled")
+                return
+            self._gsm_combine_status(node_name)
+            pending = [c for c in targets
+                       if c.status in (CellStatus.UNLOCK_SENT,
+                                       CellStatus.WAITING_ENABLE)]
+            if not pending:
+                enabled = sum(1 for c in targets
+                              if c.status == CellStatus.ENABLED)
+                self.log(f"GSM assurance finished: {enabled}/{len(targets)} "
+                         f"GeranCell(s) enabled.")
+                return
+            if time.monotonic() >= deadline:
+                stuck = sorted({(c.gsm_sector_mo or c.sector) for c in pending})
+                for c in pending:
+                    run.set_cell(
+                        c, CellStatus.ENABLE_TIMEOUT,
+                        status_detail=(f"still disabled after "
+                                       f"{int(time.monotonic() - started)}s"))
+                msg = (f"GSM still disabled after "
+                       f"{int(g.get('enable_timeout_s', 180))}s: "
+                       + ", ".join(f"GsmSector={s}" for s in stuck if s))
+                self.log(f"✗ {msg}")
+                self.emit(CutoverEvent(kind="diagnostic", group=GSM, message=msg))
+                return
+            if self._wait(float(g.get("poll_interval_s", 15))):
+                self._mark_remaining(targets, CellStatus.CANCELLED, "cancelled")
+                return
+
+    def _gsm_combine_status(self, node_name: str) -> None:
+        """Fold GeranCell state (BSC) + GsmSector/Trx TS state (tss) onto the
+        node's GSM cells. A cell is ENABLED only when its GeranCell is ACTIVE
+        **and** every timeslot of its GsmSector reads ENABLED."""
+        run = self.run
+        cfg = self.cfg
+        sess = run.sessions.get(node_name)
+        if sess is None or sess.degraded:
+            return
+        active_val = str(cfg["gsm"].get("active_value", "ACTIVE")).upper()
+        status_ssh = sess.read_ssh or sess.ssh
+        # The read session has its own PTY but is shared by background readers.
+        # Without one, briefly borrow the action lock before touching primary.
+        fallback_action_lock = sess.read_ssh is None
+        acquired = False
+        if fallback_action_lock:
+            acquired = self._action_lock.acquire(blocking=False)
+            if not acquired:
+                return
+        try:
+            with sess.read_lock:
+                try:
+                    info, _ = run_cutover_gsm_states(
+                        status_ssh, node_name, run.shortcode, self.log, cfg)
+                except Exception:
+                    info = {}
+                try:
+                    tss, _ = run_cutover_gsm_tss(
+                        status_ssh, node_name, self.log, cfg)
+                except Exception:
+                    tss = {}
+                try:
+                    trx_by_sector, _full, _ = run_cutover_gsm_sector_list(
+                        status_ssh, node_name, self.log, cfg)
+                except Exception:
+                    trx_by_sector = {}
+        finally:
+            if acquired:
+                self._action_lock.release()
+
+        for c in run.cells:
+            if c.rat != "GSM" or c.node_name != node_name:
+                continue
+            rec = info.get(c.cell_dn.upper(), {})
+            st = rec.get("state", c.geran_state)
+            if rec.get("fdn") and not c.gsm_fdn:
+                c.gsm_fdn = rec["fdn"]
+            sec = tss.get(c.sector)
+            trx = trx_by_sector.get(c.sector, {})
+            geran_ok = (st or "").upper() == active_val
+            trx_total = len(trx)
+            trx_enabled = sum(
+                1 for row in trx.values()
+                if (row.get("adm") or "").upper() == "UNLOCKED"
+                and (row.get("op") or "").upper() == "ENABLED"
+            )
+            trx_ok = bool(trx_total and trx_enabled == trx_total)
+            # tss is the most granular assurance.  Some locked/starting nodes
+            # return no timeslots, so use the direct Trx adm/op table then.
+            radio_ok = (bool(sec and sec.get("all_enabled"))
+                        if sec and sec.get("total", 0) else trx_ok)
+            detail = f"GeranCell {st or '?'}"
+            if trx_total:
+                detail += f" · TRX {trx_enabled}/{trx_total}"
+            if sec is not None:
+                detail += f" · TS {sec['enabled']}/{sec['total']}"
+            elif not c.gsm_sector_mo:
+                detail += " · no GsmSector"
+            if geran_ok and radio_ok:
+                if c.status != CellStatus.ENABLED:
+                    run.set_cell(c, CellStatus.ENABLED, status_detail=detail,
+                                 t_enabled=time.monotonic(),
+                                 geran_state=st or c.geran_state)
+                else:
+                    run.set_cell(c, status_detail=detail,
+                                 geran_state=st or c.geran_state)
+            else:
+                # Always publish the latest readback, including after Lock or
+                # Re-lock.  Previously those rows retained the write result
+                # ("GeranCell set HALTED") forever because only pending/unlock
+                # states were refreshed here.
+                run.set_cell(c, status_detail=detail,
+                             geran_state=st or c.geran_state)
+
+    def _finish_gsm_group(self) -> None:
+        run = self.run
+        cells = run.cells_of(GSM)
+        ok = sum(1 for c in cells if c.status == CellStatus.ENABLED)
+        failed = sum(1 for c in cells if c.status in TERMINAL_FAIL)
+        if run.is_cancelled():
+            status = GroupStatus.CANCELLED
+        elif ok and not failed:
+            status = GroupStatus.DONE
+        elif ok:
+            status = GroupStatus.DONE_WITH_FAILURES
+        else:
+            status = GroupStatus.FAILED
+        msg = f"{ok}/{len(cells)} GeranCell(s) enabled"
+        if failed:
+            msg += f", {failed} not OK"
+        run.set_group(GSM, status, finished_at=time.monotonic(), message=msg)
+        self.log(f"── GSM: {status.value} — {msg} ──")
+        self.emit(CutoverEvent(kind="group_done", group=GSM, message=msg))
+
+    def _relock_gsm(self, sector: Optional[str] = None) -> None:
+        run = self.run
+        cfg = self.cfg
+        g = cfg["gsm"]
+        cells = run.relockable_cells_of(GSM, sector)
+        if not cells:
+            self.log("Nothing to roll back for GSM.")
+            return
+        node_name = cells[0].node_name
+        sess = run.sessions.get(node_name)
+        if self.cfg.get("require_confirmation") and self._confirm_cb:
+            lines = [f"cmedit set GeranCell={c.cell_dn} state={g['locked_value']}"
+                     f"    ({c.node_name})" for c in cells]
+            if not self._confirm_cb("ROLL BACK GSM", lines):
+                self.log("GSM rollback cancelled — nothing sent.")
+                return
+        run.set_phase(RunPhase.UNLOCKING, active_group=GSM)
+        dry = bool(cfg.get("dry_run"))
+        self.log(f"── Rolling back {len(cells)} GeranCell(s) (set "
+                 f"{g['locked_value']}) ──")
+        for c in cells:
+            if run.is_cancelled():
+                break
+            if dry:
+                run.set_cell(c, CellStatus.RELOCKED,
+                             status_detail=f"[dry run] set {g['locked_value']}",
+                             admin_state="LOCKED")
+                continue
+            if sess is None:
+                break
+            try:
+                fdn = c.gsm_fdn or run_cutover_gsm_fetch_fdn(
+                    sess.ssh, node_name, c.cell_dn, run.shortcode, self.log, cfg)
+                ok, out = run_cutover_gsm_set_state(
+                    sess.ssh, node_name, fdn, g["locked_value"], self.log, cfg)
+            except Exception as exc:
+                ok, out = False, f"{type(exc).__name__}: {exc}"
+            if ok:
+                run.set_cell(c, CellStatus.RELOCKED,
+                             status_detail=f"GeranCell set {g['locked_value']}",
+                             geran_state=g["locked_value"])
+            else:
+                run.set_cell(c, CellStatus.ERROR,
+                             status_detail="set state failed",
+                             last_error=(out or "")[-200:])
+        done = sum(1 for c in cells if c.status == CellStatus.RELOCKED)
+        run.set_group(GSM, GroupStatus.CANCELLED,
+                      message=f"rolled back {done}/{len(cells)}")
+        run.set_phase(RunPhase.READY, active_group="")
+        self.emit(CutoverEvent(kind="group_done", group=GSM,
+                               message=f"Rolled back {done} GeranCell(s)."))
 
     # ── group orchestration ──────────────────────────────────────
     def _grouped_action(self, groups: list,
@@ -1606,13 +2946,32 @@ class CutoverEngine:
         # One confirmation covering everything this click will do.
         if self.cfg.get("require_confirmation") and self._confirm_cb:
             lines = []
+            shown_nr_carriers = set()
             for g in targets:
                 for c in run.unlockable_cells_of(g, sector):
-                    lines.append(
-                        self.cfg["unlock"]["command_template"].format(
-                            mo_type=c.mo_type, cell_dn=c.cell_dn,
-                            mo_ref=c.mo_ref, node=c.node_name)
-                        + f"    ({c.node_name}, {c.band_key})")
+                    if g == GSM:
+                        lines.append(
+                            f"cmedit set GeranCell={c.cell_dn} "
+                            f"state={self.cfg['gsm']['active_value']}"
+                            f"    ({c.node_name}, {c.band_key})")
+                    else:
+                        carrier_ref = _nr_carrier_ref(c, self.cfg)
+                        carrier_key = (c.node_name, carrier_ref)
+                        if carrier_ref and carrier_key not in shown_nr_carriers:
+                            carrier_cmd = str(self.cfg["unlock"].get(
+                                "nr_carrier_unlock_template", "ldeb {mo_ref}"
+                            )).format(
+                                mo_ref=carrier_ref, node=c.node_name,
+                                band_number=c.band_number, sector=c.sector)
+                            lines.append(
+                                carrier_cmd
+                                + f"    ({c.node_name}, NR carrier dependency)")
+                            shown_nr_carriers.add(carrier_key)
+                        lines.append(
+                            self.cfg["unlock"]["command_template"].format(
+                                mo_type=c.mo_type, cell_dn=c.cell_dn,
+                                mo_ref=c.mo_ref, node=c.node_name)
+                            + f"    ({c.node_name}, {c.band_key})")
             cap = self.cfg.get("max_cells_per_unlock") or 0
             if cap and len(lines) > cap:
                 self.log(f"✗ {len(lines)} cells exceeds max_cells_per_unlock={cap}.")
@@ -1621,10 +2980,13 @@ class CutoverEngine:
                 self.log("Cancelled at the confirmation dialog — nothing was sent.")
                 return
 
+        # The first point where an unlock is definitely going to be sent.
+        self._ensure_alarm_supervision_before_first_unlock()
+
         for group in targets:
             if run.is_cancelled():
                 break
-            self._run_group(group, sector)
+            self._run_group(group, sector, skip_confirmation=(group == GSM))
             grp = run.groups[group]
             if (grp.status in (GroupStatus.FAILED,)
                     and self.cfg.get("stop_on_group_failure")):
@@ -1679,6 +3041,10 @@ class CutoverEngine:
         run = self.run
         run.cancel_event.clear()
 
+        if groups == [GSM]:
+            self._relock_gsm(sector)
+            return
+
         targets = [(g, run.relockable_cells_of(g, sector)) for g in groups]
         targets = [(g, cells) for g, cells in targets if cells]
         if not targets:
@@ -1722,7 +3088,8 @@ class CutoverEngine:
                     if ok:
                         run.set_cell(cell, CellStatus.RELOCKED,
                                      status_detail="re-locked",
-                                     admin_state="LOCKED", ue_count=None)
+                                     admin_state="LOCKED",
+                                     op_state="DISABLED", ue_count=None)
                     else:
                         run.set_cell(cell, CellStatus.ERROR,
                                      status_detail=(err or "re-lock failed")[:60],
@@ -1747,7 +3114,149 @@ class CutoverEngine:
         self.emit(CutoverEvent(kind="group_done",
                                message=f"Rolled back {len(all_cells)} cell(s)."))
 
-    def _run_group(self, group: str, sector: Optional[str] = None) -> None:
+    def _lock_action(self, groups: list,
+                     sector: Optional[str] = None) -> None:
+        """Lock a group that is already up (the Lock button). Locks any
+        currently-unlocked cell — not only ones this run unlocked — so a site
+        that was already unlocked can be taken back down."""
+        run = self.run
+        run.cancel_event.clear()
+
+        if run.phase != RunPhase.READY:
+            self.log(f"Lock blocked: Cut Over is not READY "
+                     f"(phase={run.phase.value}).")
+            return
+
+        if groups == [GSM]:
+            self._lock_gsm(sector)
+            return
+
+        targets = [(g, run.lockable_cells_of(g, sector)) for g in groups]
+        targets = [(g, cells) for g, cells in targets if cells]
+        if not targets:
+            self.log("Nothing to lock — no cell in these group(s) is unlocked.")
+            return
+
+        all_cells = [c for _g, cells in targets for c in cells]
+        unlock = self.cfg["unlock"]
+        template = (unlock.get("graceful_lock_template")
+                    if unlock.get("graceful_lock")
+                    else unlock.get("lock_command_template"))
+
+        if self.cfg.get("require_confirmation") and self._confirm_cb:
+            lines = [
+                template.format(mo_type=c.mo_type, cell_dn=c.cell_dn,
+                                mo_ref=c.mo_ref, node=c.node_name)
+                + f"    ({c.node_name}, {c.band_key})"
+                for c in all_cells
+            ]
+            label = "LOCK " + ", ".join(g for g, _ in targets)
+            if not self._confirm_cb(label, lines):
+                self.log("Lock cancelled — nothing was sent.")
+                return
+
+        run.set_phase(RunPhase.UNLOCKING)
+        dry = bool(self.cfg.get("dry_run"))
+        self.log(f"── Locking {len(all_cells)} cell(s) ──")
+
+        for group, cells in targets:
+            by_node: dict = {}
+            for c in cells:
+                by_node.setdefault(c.node_name, []).append(c)
+
+            def _worker(node_name: str, node_cells: list):
+                sess = run.sessions.get(node_name)
+                if sess is None:
+                    return
+
+                def _on_cell(cell, ok, out, err):
+                    if ok:
+                        run.set_cell(cell, CellStatus.RELOCKED,
+                                     status_detail="locked",
+                                     admin_state="LOCKED",
+                                     op_state="DISABLED", ue_count=None)
+                    else:
+                        run.set_cell(cell, CellStatus.ERROR,
+                                     status_detail=(err or "lock failed")[:60],
+                                     last_error=err or "")
+
+                try:
+                    run_cutover_relock(
+                        sess.ssh, node_name, node_cells, self.log, self.cfg,
+                        dry_run=dry, cancel_event=run.cancel_event,
+                        on_cell=_on_cell, allow_any=True)
+                except Exception as exc:
+                    self.log(f"[{node_name}] ✗ lock failed: "
+                             f"{type(exc).__name__}: {exc}")
+
+            self._run_per_node(by_node, _worker)
+            done = sum(1 for c in cells if c.status == CellStatus.RELOCKED)
+            run.set_group(group, GroupStatus.CANCELLED,
+                          message=f"locked {done}/{len(cells)}")
+            self.log(f"── {group}: locked {done}/{len(cells)} cell(s) ──")
+
+        run.set_phase(RunPhase.READY, active_group="")
+        self.emit(CutoverEvent(kind="group_done",
+                               message=f"Locked {len(all_cells)} cell(s)."))
+
+    def _lock_gsm(self, sector: Optional[str] = None) -> None:
+        """Lock GSM cells that are up (set GeranCell HALTED) — the GSM Lock
+        button. Locks any currently-active GeranCell, not only this run's."""
+        run = self.run
+        cfg = self.cfg
+        g = cfg["gsm"]
+        cells = run.lockable_cells_of(GSM, sector)
+        if not cells:
+            self.log("Nothing to lock — no active GeranCell.")
+            return
+        node_name = cells[0].node_name
+        sess = run.sessions.get(node_name)
+        if self.cfg.get("require_confirmation") and self._confirm_cb:
+            lines = [f"cmedit set GeranCell={c.cell_dn} state={g['locked_value']}"
+                     f"    ({c.node_name})" for c in cells]
+            if not self._confirm_cb("LOCK GSM", lines):
+                self.log("GSM lock cancelled — nothing sent.")
+                return
+        run.set_phase(RunPhase.UNLOCKING, active_group=GSM)
+        dry = bool(cfg.get("dry_run"))
+        self.log(f"── Locking {len(cells)} GeranCell(s) (set "
+                 f"{g['locked_value']}) ──")
+        for c in cells:
+            if run.is_cancelled():
+                break
+            if dry:
+                run.set_cell(c, CellStatus.RELOCKED,
+                             status_detail=f"[dry run] set {g['locked_value']}",
+                             admin_state="LOCKED")
+                continue
+            if sess is None:
+                break
+            try:
+                fdn = c.gsm_fdn or run_cutover_gsm_fetch_fdn(
+                    sess.ssh, node_name, c.cell_dn, run.shortcode, self.log, cfg)
+                ok, out = run_cutover_gsm_set_state(
+                    sess.ssh, node_name, fdn, g["locked_value"], self.log, cfg)
+            except Exception as exc:
+                ok, out = False, f"{type(exc).__name__}: {exc}"
+            if ok:
+                run.set_cell(c, CellStatus.RELOCKED,
+                             status_detail=f"GeranCell set {g['locked_value']}",
+                             geran_state=g["locked_value"])
+            else:
+                run.set_cell(c, CellStatus.ERROR, status_detail="set state failed",
+                             last_error=(out or "")[-200:])
+        done = sum(1 for c in cells if c.status == CellStatus.RELOCKED)
+        run.set_group(GSM, GroupStatus.CANCELLED,
+                      message=f"locked {done}/{len(cells)}")
+        run.set_phase(RunPhase.READY, active_group="")
+        self.emit(CutoverEvent(kind="group_done", group=GSM,
+                               message=f"Locked {done} GeranCell(s)."))
+
+    def _run_group(self, group: str, sector: Optional[str] = None,
+                   skip_confirmation: bool = False) -> None:
+        if group == GSM:
+            self._run_gsm_group(sector, skip_confirmation=skip_confirmation)
+            return
         run = self.run
         grp = run.groups[group]
         cells = run.unlockable_cells_of(group, sector)
@@ -1794,6 +3303,7 @@ class CutoverEngine:
                 self.log(f"{group}: unlocked — monitoring status in the "
                          f"background; you can unlock other groups now.")
                 self._ensure_monitor()
+                self._ensure_bg_monitor()
                 return
 
             run.set_phase(RunPhase.WAIT_ENABLE, active_group=group)
@@ -1881,6 +3391,11 @@ class CutoverEngine:
                 if ok:
                     run.set_cell(cell, CellStatus.UNLOCK_SENT,
                                  status_detail="unlock sent",
+                                 # ldeb succeeded, so do not keep rendering the
+                                 # stale pre-command LOCKED state while the
+                                 # status poll waits for operational ENABLED.
+                                 admin_state=(cell.admin_state if dry
+                                              else "UNLOCKED"),
                                  t_unlock_sent=time.monotonic(),
                                  unlock_output=(out or "")[-2000:],
                                  attempts=cell.attempts + 1)
@@ -2076,19 +3591,100 @@ class CutoverEngine:
 
     def _stop_monitor(self) -> None:
         self._monitor_stop.set()
+        self._bg_stop.set()
+
+    # ── background (slow) traffic + VSWR reader ──────────────────
+    def _bg_ssh_for(self, sess):
+        """(ssh, lock) for the slow background reads. A dedicated ``bg_ssh`` has
+        its own PTY → no lock, fully parallel to status. Otherwise share
+        ``read_ssh`` (or the primary) under ``read_lock`` so a slow stzrc/sdirc
+        never corrupts a fast status poll."""
+        if sess.bg_ssh is not None:
+            return sess.bg_ssh, None
+        if sess.read_ssh is not None:
+            return sess.read_ssh, sess.read_lock
+        return sess.ssh, sess.read_lock
+
+    def _ensure_bg_session(self, node_name: str) -> None:
+        """Open the node's dedicated background session lazily (off the discovery
+        path), so status stays fast and traffic/VSWR run on their own PTY."""
+        if not self.cfg.get("separate_read_session", True):
+            return
+        sess = self.run.sessions.get(node_name)
+        if (sess is None or sess.bg_ssh is not None or sess.bg_failed):
+            return
+        from integration_runner import IntegrationSSH
+        form = self.form
+        try:
+            r = IntegrationSSH(
+                host=str(form.get("host", "")).strip(),
+                port=int(form.get("port", 5023) or 5023),
+                username=str(form.get("username", "")).strip(),
+                password=str(form.get("password", "")),
+                log_callback=lambda m: logger.debug("[%s:bg] %s", node_name, m),
+            )
+            r.connect(timeout=30)
+            r.enter_amos(node_name,
+                         timeout=self.cfg["discovery"]["amos_timeout_s"])
+            sess.bg_ssh = r
+            self.log(f"[{node_name}] background traffic/VSWR session ready "
+                     f"(status stays fast).")
+        except Exception as exc:
+            sess.bg_failed = True
+            self.log(f"[{node_name}] ⚠ no separate traffic/VSWR session "
+                     f"({type(exc).__name__}: {exc}) — it will share the status "
+                     f"session.")
+
+    def _ensure_bg_monitor(self) -> None:
+        with self._bg_lock:
+            if self._bg_thread and self._bg_thread.is_alive():
+                return
+            self._bg_stop.clear()
+            t = threading.Thread(target=self._bg_loop,
+                                 name="cutover-bg", daemon=True)
+            self._bg_thread = t
+            t.start()
+
+    def _bg_loop(self) -> None:
+        """Poll stzrc (traffic) + sdirc (VSWR) for every node, each on its own
+        interval, on the dedicated background session — independent of the fast
+        status monitor so status never waits on a slow read."""
+        run = self.run
+        while not self._bg_stop.is_set():
+            if run.cancel_event.is_set():
+                break
+            if run.phase not in self._MONITOR_ACTIVE_PHASES:
+                break
+            for node_name in {c.node_name for c in list(run.cells)}:
+                if self._bg_stop.is_set() or run.cancel_event.is_set():
+                    break
+                self._ensure_bg_session(node_name)
+                self._maybe_refresh_traffic(node_name)
+                self._maybe_refresh_vswr(node_name)
+            self._bg_stop.wait(5)
+        with self._bg_lock:
+            self._bg_thread = None
 
     _MONITOR_WATCH = (
         CellStatus.UNLOCK_SENT, CellStatus.WAITING_ENABLE,
         CellStatus.ENABLE_TIMEOUT, CellStatus.BLOCKED_BY_DEPENDENCY,
     )
 
+    #: Phases in which the always-on status monitor keeps polling. It stops once
+    #: the run is finished/cancelled so it never spins forever after teardown.
+    _MONITOR_ACTIVE_PHASES = (
+        RunPhase.READY, RunPhase.UNLOCKING, RunPhase.WAIT_ENABLE,
+        RunPhase.WAIT_TRAFFIC, RunPhase.REPORTING,
+    )
+
     def _monitor_loop(self) -> None:
-        """Poll status for every cell we unlocked but that hasn't come up yet,
-        every ``monitor_interval_s``. Flips cells to ENABLED as they come up
-        (``_apply_st_rows``), and — the point of this loop — marks a cell that
-        is UNLOCKED but still not ENABLED past ``stuck_after_s`` as a problem so
-        the operator sees UNLOCKED/DISABLED instead of a spinner forever. Runs
-        off the action lock, so unlocking other groups stays possible."""
+        """Always-on status monitor. Every ``monitor_interval_s`` it reads each
+        node's cell status and folds it in (``_apply_st_rows`` — which flips a
+        cell to ENABLED and records its UE count, including cells that were
+        already unlocked before this run), refreshes VSWR, and flags a cell that
+        stays UNLOCKED/DISABLED past ``stuck_after_s``. It runs off the action
+        lock so unlocking stays possible, and keeps going while the run is live
+        so an already-enabled site shows real status without any unlock click."""
         run = self.run
         poll = self.cfg["enable_poll"]
         interval = float(poll.get("monitor_interval_s", 5))
@@ -2096,26 +3692,72 @@ class CutoverEngine:
         while not self._monitor_stop.is_set():
             if run.cancel_event.is_set():
                 break
-            watched = [c for c in list(run.cells)
-                       if c.was_unlocked_by_run and c.status in self._MONITOR_WATCH]
-            if not watched:
-                break                       # nothing left to watch — exit
-            # An unlock/relock action holds the action lock and is talking to the
-            # same single SSH channel; poll only when no action is running so two
-            # threads never write the node's PTY at once (that corrupts both).
-            if not self._action_lock.locked():
-                for node_name in {c.node_name for c in watched}:
-                    sess = run.sessions.get(node_name)
-                    if sess is None or sess.degraded:
-                        continue
+            if run.phase not in self._MONITOR_ACTIVE_PHASES:
+                break                       # run finished/cancelled — exit
+            # Poll every non-GSM cell's node. This includes cells still PENDING
+            # because the site was pre-unlocked.
+            nodes = [(n, run.sessions.get(n))
+                     for n in {c.node_name for c in list(run.cells)
+                               if c.rat != "GSM"}]
+            nodes = [(n, s) for n, s in nodes if s is not None and not s.degraded]
+            # Nodes with a separate read session poll on their own PTY and need
+            # no lock. If any node must fall back to its primary PTY, the sweep
+            # takes the action lock so it never overlaps an unlock; non-blocking,
+            # so a running unlock just defers this tick.
+            need_lock = any(s.read_ssh is None for _n, s in nodes)
+            acquired = False
+            if need_lock:
+                acquired = self._action_lock.acquire(blocking=False)
+                if not acquired:
+                    self._monitor_stop.wait(interval)
+                    continue
+            try:
+                for node_name, sess in nodes:
+                    if run.cancel_event.is_set():
+                        break
+                    # Status runs on the fast read session, serialised with any
+                    # background reader that fell back to it (read_lock). Traffic
+                    # and VSWR are handled by the separate _bg_loop, so a slow
+                    # stzrc/sdirc never delays this status poll.
+                    rssh = sess.read_ssh or sess.ssh
                     try:
-                        _ok, _out, rows = run_cutover_st_cell(
-                            sess.ssh, node_name, self.log, self.cfg)
+                        with sess.read_lock:
+                            _ok, _out, rows = run_cutover_st_cell(
+                                rssh, node_name, self.log, self.cfg)
                         self._apply_st_rows(node_name, rows, poll)
                     except Exception as exc:
                         self.log(f"[{node_name}] monitor poll failed: "
                                  f"{type(exc).__name__}: {exc}")
+            finally:
+                if acquired:
+                    self._action_lock.release()
+
+            # GSM assurance already performs this same read every five seconds
+            # while an unlock is waiting.  Outside that short window, keep
+            # reading GeranCell plus Trx/timeslot state so Lock/Re-lock results
+            # are confirmed from live state as well.  Different GSM BBs are
+            # checked in parallel when parallel_nodes is enabled.
+            gsm_by_node = {
+                n: cells for n in {c.node_name for c in list(run.cells)
+                                   if c.rat == "GSM"}
+                if (cells := [c for c in list(run.cells)
+                              if c.rat == "GSM" and c.node_name == n])
+                and not any(c.status in (CellStatus.UNLOCK_SENT,
+                                         CellStatus.WAITING_ENABLE)
+                            for c in cells)
+            }
+
+            def _poll_gsm(node_name, _cells):
+                try:
+                    self._gsm_combine_status(node_name)
+                except Exception as exc:
+                    self.log(f"[{node_name}] GSM monitor poll failed: "
+                             f"{type(exc).__name__}: {exc}")
+
+            self._run_per_node(gsm_by_node, _poll_gsm)
             now = time.monotonic()
+            watched = [c for c in list(run.cells)
+                       if c.was_unlocked_by_run and c.status in self._MONITOR_WATCH]
             for c in watched:
                 if c.status not in (CellStatus.WAITING_ENABLE,
                                     CellStatus.UNLOCK_SENT):
@@ -2167,12 +3809,209 @@ class CutoverEngine:
             if is_up and cell.status in (CellStatus.WAITING_ENABLE,
                                          CellStatus.UNLOCK_SENT,
                                          CellStatus.ENABLE_TIMEOUT,
-                                         CellStatus.BLOCKED_BY_DEPENDENCY):
-                run.set_cell(cell, CellStatus.ENABLED, status_detail="enabled",
+                                         CellStatus.BLOCKED_BY_DEPENDENCY,
+                                         CellStatus.PENDING):
+                # Show the actual states, e.g. "UNLOCKED/ENABLED". A PENDING cell
+                # flipping here means the site was already unlocked before this
+                # run — reflect it instead of leaving the row grey.
+                adm = (row.admin_state or "UNLOCKED").upper()
+                op = (row.op_state or "ENABLED").upper()
+                run.set_cell(cell, CellStatus.ENABLED,
+                             status_detail=f"{adm}/{op}",
                              t_enabled=time.monotonic(), **fields)
             else:
                 run.set_cell(cell, **fields)
         return matched
+
+    def _maybe_refresh_vswr(self, node_name: str, force: bool = False) -> None:
+        """Run ``sdirc`` for a node and attach per-port VSWR to its cells.
+
+        Skips unless VSWR is enabled, the node has at least one ENABLED cell to
+        annotate, and ``vswr.interval_s`` has elapsed since the last capture
+        (``force`` overrides the interval). Runs on the same single PTY as the
+        status polls, so callers must already hold that node's turn."""
+        v = self.cfg.get("vswr", {})
+        if not v.get("enabled", True):
+            return
+        run = self.run
+        sess = run.sessions.get(node_name)
+        if sess is None or sess.degraded:
+            return
+        has_vswr_candidate = any(
+            c.node_name == node_name
+            and (c.rat == "GSM" or c.status in (
+                CellStatus.ENABLED, CellStatus.WAITING_TRAFFIC,
+                CellStatus.TRAFFIC_OK))
+            for c in run.cells)
+        if not has_vswr_candidate:
+            return
+        now = time.monotonic()
+        last = self._vswr_last.get(node_name, 0.0)
+        if not force and last and (now - last) < float(v.get("interval_s", 300)):
+            return
+        self._vswr_last[node_name] = now
+        self.log(f"[{node_name}] reading VSWR (sdirc)…")
+        rssh, lock = self._bg_ssh_for(sess)
+        try:
+            if lock is not None:
+                with lock:
+                    ok, _out, res = run_cutover_vswr(
+                        rssh, node_name, self.log, self.cfg)
+            else:
+                ok, _out, res = run_cutover_vswr(
+                    rssh, node_name, self.log, self.cfg)
+        except Exception as exc:
+            self.log(f"[{node_name}] VSWR read failed: "
+                     f"{type(exc).__name__}: {exc}")
+            return
+        if ok:
+            self._apply_vswr(node_name, res)
+
+    def _maybe_refresh_traffic(self, node_name: str, force: bool = False) -> None:
+        """Read UE (traffic) via ``stzrc`` on the read session and fold it onto
+        the node's cells, on its own interval. Status (ENABLED/LOCKED) comes
+        from the fast hgetc poll; this only adds the UE count, so it can run
+        slowly in the background without holding up the status view."""
+        traffic = self.cfg.get("traffic", {})
+        run = self.run
+        sess = run.sessions.get(node_name)
+        if sess is None or sess.degraded:
+            return
+        has_enabled = any(
+            c.node_name == node_name and c.rat != "GSM"
+            and c.status in (CellStatus.ENABLED, CellStatus.WAITING_TRAFFIC,
+                             CellStatus.TRAFFIC_OK)
+            for c in run.cells)
+        if not has_enabled:
+            return
+        now = time.monotonic()
+        last = self._traffic_last.get(node_name, 0.0)
+        if not force and last and (now - last) < float(traffic.get("interval_s", 20)):
+            return
+        self._traffic_last[node_name] = now
+        rssh, lock = self._bg_ssh_for(sess)
+        try:
+            if lock is not None:
+                with lock:
+                    ok, _out, res = run_cutover_traffic(
+                        rssh, node_name, self.log, self.cfg)
+            else:
+                ok, _out, res = run_cutover_traffic(
+                    rssh, node_name, self.log, self.cfg)
+        except Exception as exc:
+            self.log(f"[{node_name}] traffic read failed: "
+                     f"{type(exc).__name__}: {exc}")
+            return
+        if not ok or res is None or not res.ok:
+            return
+        mode = self.cfg["enable_poll"].get("match_mode", "suffix")
+        threshold = max(1, int(traffic.get("ue_threshold", 1)))
+        for c in run.cells:
+            if c.node_name != node_name or c.rat == "GSM":
+                continue
+            ue = ue_for_cell(res.counts, c, mode=mode)
+            if ue is None:
+                continue
+            fields = {"ue_count": ue, "ue_peak": max(c.ue_peak, ue)}
+            if c.is_live_enabled and ue >= threshold:
+                run.set_cell(c, CellStatus.TRAFFIC_OK,
+                             status_detail=f"traffic {ue} UE",
+                             t_traffic_ok=time.monotonic(), **fields)
+            else:
+                run.set_cell(c, **fields)
+
+    def _ensure_alarm_supervision_before_first_unlock(self) -> None:
+        """Check FM supervision once on the first unlock; set only false nodes."""
+        a = self.cfg.get("alarm", {})
+        if not a.get("activate_enabled", True):
+            return
+        if self._alarm_activation_checked:
+            return
+        self._alarm_activation_checked = True
+        run = self.run
+        usable = [(name, sess) for name, sess in run.sessions.items()
+                  if sess is not None and not sess.degraded]
+        if not usable:
+            self.log("⚠ FM alarm supervision check skipped — no live session.")
+            return
+        context_node, sess = usable[0]
+        check = a.get("activate_check_command", (
+            '!python {cli} "cmedit get {shortcode}* '
+            'fmalarmsupervision.active -t"')).format(
+                cli=_gsm_cli_py(self.cfg), shortcode=run.shortcode)
+        self.log("Checking FM alarm supervision before the first unlock…")
+        try:
+            out = sess.ssh.run_amos_command_safe(
+                check, context_node, timeout=int(a.get("activate_timeout_s", 60)))
+        except Exception as exc:
+            self.log("⚠ FM alarm supervision check failed — no setting was "
+                     f"changed ({type(exc).__name__}: {exc}).")
+            return
+        states = parse_fm_alarm_supervision(out)
+        if not states:
+            self.log("⚠ FM alarm supervision response could not be parsed — "
+                     "no setting was changed.")
+            return
+        false_nodes = [name for name in run.node_names
+                       if states.get(name.upper()) is False]
+        true_nodes = [name for name in run.node_names
+                      if states.get(name.upper()) is True]
+        if true_nodes:
+            self.log("FM alarm supervision already active: "
+                     + ", ".join(true_nodes))
+        if not false_nodes:
+            self.log("✓ FM alarm supervision check complete — nothing to set.")
+            return
+        if self.cfg.get("dry_run"):
+            self.log("DRY RUN — would set FM alarm supervision active=true for "
+                     + ", ".join(false_nodes))
+            return
+        for node_name in false_nodes:
+            try:
+                ok, _out = run_cutover_activate_alarm(
+                    sess.ssh, node_name, self.log, self.cfg)
+            except Exception as exc:
+                ok = False
+                self.log(f"[{node_name}] FM alarm supervision set failed: "
+                         f"{type(exc).__name__}: {exc}")
+            if ok:
+                self.log(f"[{node_name}] ✓ FM alarm supervision set active=true.")
+            else:
+                self.log(f"[{node_name}] ⚠ could not set FM alarm supervision.")
+
+    def _apply_vswr(self, node_name: str, res) -> None:
+        """Fold a :class:`VswrResult` onto the node's cells by DN."""
+        run = self.run
+        by_cell = res.by_cell or {}
+        by_gsm_token = getattr(res, "by_gsm_token", {}) or {}
+        worst_thr = float(self.cfg.get("vswr", {}).get("warn_threshold", 1.5))
+        annotated = 0
+        for cell in run.cells:
+            if cell.node_name != node_name:
+                continue
+            dn = cell.cell_dn.upper()
+            if cell.rat == "GSM":
+                # M8239L1 -> L1; M8239S2 also accepts sdirc's GT=...-2.
+                match = re.search(r"[89]([^89]+)$", dn, re.IGNORECASE)
+                token = match.group(1).upper() if match else ""
+                ports = by_gsm_token.get(token)
+                if not ports and token.startswith("S"):
+                    ports = by_gsm_token.get(token[1:])
+            else:
+                ports = by_cell.get(dn)
+                if ports is None:                # tolerate a differing prefix
+                    ports = next((p for k, p in by_cell.items()
+                                  if k.endswith(dn) or dn.endswith(k)), None)
+            if not ports:
+                continue
+            run.set_cell(cell, vswr_ports=list(ports))
+            annotated += 1
+        if annotated:
+            flagged = sum(
+                1 for c in run.cells
+                if c.node_name == node_name and (c.vswr_worst or 0) > worst_thr)
+            note = f" — {flagged} above {worst_thr}" if flagged else ""
+            self.log(f"[{node_name}] VSWR updated for {annotated} cell(s){note}.")
 
     def _diagnose_stuck(self, cells: list) -> None:
         """Explain cells that never enabled, instead of a bare timeout.
@@ -2355,6 +4194,9 @@ class CutoverEngine:
                             detail += f" ({samples}/{need_samples} samples)"
                         run.set_cell(c, status_detail=detail, **fields)
 
+                # VSWR (sdirc) alongside traffic, on its own long interval.
+                self._maybe_refresh_vswr(node_name)
+
             pending = [c for c in targets if c.status == CellStatus.WAITING_TRAFFIC]
             if not pending:
                 self.log(f"{group}: all {len(targets)} cell(s) carrying traffic.")
@@ -2431,7 +4273,8 @@ class CutoverEngine:
                 self.log(f"[{node_name}] alarm check failed: "
                          f"{type(exc).__name__}: {exc}")
 
-    def _render_group_png(self, group: str) -> str:
+    def _render_group_png(self, group: str,
+                          node_evidence: Optional[dict] = None) -> str:
         run = self.run
         grp = run.groups[group]
         report = self.cfg["report"]
@@ -2443,28 +4286,38 @@ class CutoverEngine:
             return ""
 
         alarm_cmd = self.cfg["alarm"]["command"]
-        # Show the full alarm list, but call out what is NEW since the
-        # baseline — a pre-existing alarm is not evidence about this cut over.
-        parts = []
-        for n, s in run.sessions.items():
-            if not s.alarm_output:
-                continue
-            block = f"--- {n} ---\n{s.alarm_output}"
-            baseline = run.alarm_baseline.get(n)
-            if baseline:
-                new = diff_alarms(baseline, s.alarm_output)
-                block += ("\n--- NEW since cut over started ---\n"
-                          + ("\n".join(new) if new
-                             else "(none — no new alarms)"))
-            parts.append(block)
-        alarm_out = "\n\n".join(parts)
-
         pairs = []
-        if grp.traffic_output:
-            pairs.append((grp.traffic_command or self.cfg["traffic"]["command"],
-                          grp.traffic_output))
-        if alarm_out:
-            pairs.append((alarm_cmd, alarm_out))
+        if node_evidence is not None:
+            # Keep traffic and alarms adjacent for each BB. This makes a
+            # multi-node screenshot auditable: every alarm block is visibly
+            # associated with the node where its traffic command ran.
+            for node_name in run.node_names:
+                item = node_evidence.get(node_name)
+                if not item:
+                    continue
+                traffic_out = item.get("traffic_output", "")
+                if traffic_out:
+                    pairs.append((f"[{node_name}] {item['traffic_command']}",
+                                  traffic_out))
+                alarm_out = item.get("alarm_output", "")
+                if alarm_out:
+                    baseline = run.alarm_baseline.get(node_name)
+                    if baseline:
+                        new = diff_alarms(baseline, alarm_out)
+                        alarm_out += ("\n\n--- NEW since cut over started ---\n"
+                                      + ("\n".join(new) if new else
+                                         "(none — no new alarms)"))
+                    pairs.append((f"[{node_name}] {alarm_cmd}", alarm_out))
+        else:
+            # Compatibility path used by the manual traffic confirmation gate.
+            if grp.traffic_output:
+                pairs.append((grp.traffic_command or
+                              self.cfg["traffic"]["command"],
+                              grp.traffic_output))
+            for node_name, sess in run.sessions.items():
+                if sess.alarm_output:
+                    pairs.append((f"[{node_name}] {alarm_cmd}",
+                                  sess.alarm_output))
         if not pairs:
             return ""
 
@@ -2473,9 +4326,11 @@ class CutoverEngine:
         filename = report["filename_template"].format(
             shortcode=run.shortcode or "SITE", group=group, timestamp=ts)
         path = os.path.join(out_dir, filename)
+        evidence_nodes = ([n for n in run.node_names if n in node_evidence]
+                          if node_evidence is not None else run.node_names)
         title = report["title_template"].format(
             shortcode=run.shortcode or "SITE", group=group,
-            nodes=", ".join(run.node_names))
+            nodes=", ".join(evidence_nodes))
 
         style = TerminalStyle(**report["terminal_style"])
         try:
@@ -2494,8 +4349,59 @@ class CutoverEngine:
 
     def _report_phase(self, group: str, by_node: dict) -> None:
         run = self.run
-        self._collect_alarms(by_node)
-        png = self._render_group_png(group)
+        evidence = {}
+        evidence_lock = threading.Lock()
+        traffic_cmd = self.cfg["traffic"]["command"]
+        alarm_cmd = self.cfg["alarm"]["command"]
+
+        def _collect_node(node_name, _cells):
+            sess = run.sessions.get(node_name)
+            if sess is None or sess.degraded:
+                self.log(f"[{node_name}] evidence skipped: no healthy session.")
+                return
+            item = {
+                "traffic_command": traffic_cmd.format(node=node_name),
+                "traffic_output": "",
+                "alarm_output": "",
+                "alarm_count": 0,
+            }
+            try:
+                _ok, out, _parsed = run_cutover_traffic(
+                    sess.ssh, node_name, self.log, self.cfg)
+                item["traffic_output"] = out or ""
+            except Exception as exc:
+                item["traffic_output"] = (
+                    f"Traffic collection failed: {type(exc).__name__}: {exc}")
+                self.log(f"[{node_name}] traffic evidence failed: "
+                         f"{type(exc).__name__}: {exc}")
+            try:
+                _ok, out, total = run_cutover_alarms(
+                    sess.ssh, node_name, self.log, self.cfg)
+                item["alarm_output"] = out or ""
+                item["alarm_count"] = total or 0
+                sess.alarm_output = out
+                sess.alarm_count = total
+            except Exception as exc:
+                item["alarm_output"] = (
+                    f"Alarm collection failed: {type(exc).__name__}: {exc}")
+                self.log(f"[{node_name}] alarm evidence failed: "
+                         f"{type(exc).__name__}: {exc}")
+            with evidence_lock:
+                evidence[node_name] = item
+
+        # One worker per BB: traffic then alarm are sequential within a node,
+        # while independent BB sessions are collected concurrently.
+        self._run_per_node(by_node, _collect_node)
+
+        # Retain one combined copy for persistence/backward compatibility.
+        combined_traffic = "\n\n".join(
+            f"--- {node} ---\n{evidence[node]['traffic_output']}"
+            for node in run.node_names
+            if node in evidence and evidence[node]["traffic_output"]
+        )
+        run.set_group(group, traffic_output=combined_traffic,
+                      traffic_command=traffic_cmd)
+        png = self._render_group_png(group, evidence)
         if not png:
             return
         wa = self.cfg["report"]["whatsapp"]
@@ -2503,7 +4409,7 @@ class CutoverEngine:
             return
 
         counts = run.group_counts(group)
-        alarms = sum(s.alarm_count or 0 for s in run.sessions.values())
+        alarms = sum(item.get("alarm_count", 0) for item in evidence.values())
         caption = wa["caption_template"].format(
             group=group, shortcode=run.shortcode or "",
             nodes=", ".join(run.node_names), ok=counts["enabled"],

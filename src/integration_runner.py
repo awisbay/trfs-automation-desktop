@@ -607,6 +607,134 @@ class IntegrationSSH:
             except Exception:
                 pass
 
+    def download_newest_logfile(
+        self,
+        remote_dir: str,
+        local_path: str,
+        name_contains: str = "",
+        name_endswith: str = ".log",
+    ) -> Optional[str]:
+        """Download the NEWEST file in ``remote_dir`` matching the name filters.
+
+        Used for the moshell HC logfile, which the ``run <script>`` writes to
+        ``~/Logfile/<YYYYMMDD>/<node>_Logfile_<date>_<time>_(Pre|Post)_HC.log``.
+        We do not construct the exact name (moshell owns the timestamp) — we
+        pick the newest file whose name contains ``name_contains`` (e.g. the
+        node) and ends with ``name_endswith`` (e.g. ``_Pre_HC.log``).
+
+        Best-effort: returns the local path, or ``None`` (no exception) when the
+        directory is missing or nothing matches. HC logs are shared/kept, so
+        this does NOT delete anything from the server."""
+        try:
+            sftp = self.client.open_sftp()
+        except Exception as exc:
+            self._log(f"[hc-log] cannot open SFTP: {exc}")
+            return None
+        try:
+            try:
+                entries = sftp.listdir_attr(remote_dir)
+            except Exception as exc:
+                self._log(f"[hc-log] cannot list {remote_dir}: {exc}")
+                return None
+            nc = name_contains.lower()
+            ns = name_endswith.lower()
+            matches = [
+                e for e in entries
+                if e.filename.lower().endswith(ns)
+                and (not nc or nc in e.filename.lower())
+            ]
+            if not matches:
+                return None
+            newest = max(matches, key=lambda e: getattr(e, "st_mtime", 0) or 0)
+            ldir = os.path.dirname(local_path)
+            if ldir and not os.path.exists(ldir):
+                os.makedirs(ldir, exist_ok=True)
+            remote_newest = f"{remote_dir.rstrip('/')}/{newest.filename}"
+            sftp.get(remote_newest, local_path)
+            self._log(
+                f"[hc-log] downloaded {newest.filename} "
+                f"({(getattr(newest, 'st_size', 0) or 0)//1024} KB) "
+                f"-> {os.path.basename(local_path)}"
+            )
+            return local_path
+        except Exception as exc:
+            self._log(f"[hc-log] download failed: {exc}")
+            return None
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def download_newest_dir(
+        self,
+        remote_parent: str,
+        local_parent: str,
+        name_prefix: str = "",
+    ) -> Optional[str]:
+        """Download the NEWEST subdirectory under ``remote_parent`` whose name
+        starts with ``name_prefix``, recursively, into ``local_parent``.
+
+        Used for the TRFS logs, which land in
+        ``/home/shared/common/INTEGRATION_TEAM/TRFS/<node>_<YYMMDD_HHMM>/``.
+        Returns the local folder path, or ``None`` (no exception) on failure."""
+        import stat as _stat
+
+        try:
+            sftp = self.client.open_sftp()
+        except Exception as exc:
+            self._log(f"[trfs-log] cannot open SFTP: {exc}")
+            return None
+        try:
+            try:
+                entries = sftp.listdir_attr(remote_parent)
+            except Exception as exc:
+                self._log(f"[trfs-log] cannot list {remote_parent}: {exc}")
+                return None
+            pfx = name_prefix.lower()
+            dirs = [
+                e for e in entries
+                if _stat.S_ISDIR(e.st_mode)
+                and (not pfx or e.filename.lower().startswith(pfx))
+            ]
+            if not dirs:
+                self._log(
+                    f"[trfs-log] no folder starting with {name_prefix!r} in "
+                    f"{remote_parent}"
+                )
+                return None
+            newest = max(dirs, key=lambda e: getattr(e, "st_mtime", 0) or 0)
+            remote_dir = f"{remote_parent.rstrip('/')}/{newest.filename}"
+            local_dir = os.path.join(local_parent, newest.filename)
+
+            def _walk(rdir: str, ldir: str) -> int:
+                count = 0
+                os.makedirs(ldir, exist_ok=True)
+                for item in sftp.listdir_attr(rdir):
+                    rpath = f"{rdir.rstrip('/')}/{item.filename}"
+                    lpath = os.path.join(ldir, item.filename)
+                    if _stat.S_ISDIR(item.st_mode):
+                        count += _walk(rpath, lpath)
+                    else:
+                        sftp.get(rpath, lpath)
+                        count += 1
+                return count
+
+            files = _walk(remote_dir, local_dir)
+            self._log(
+                f"[trfs-log] downloaded {newest.filename} "
+                f"({files} file(s)) -> {local_dir}"
+            )
+            return local_dir
+        except Exception as exc:
+            self._log(f"[trfs-log] folder download failed: {exc}")
+            return None
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
     def reconnect(self, timeout: int = 30):
         """Disconnect and re-establish the SSH session."""
         self._log("Reconnecting SSH session...")

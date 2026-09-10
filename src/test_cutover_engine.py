@@ -18,7 +18,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cutover_runner
-from cutover_model import CellStatus, GroupStatus, RunPhase, UNMAPPED
+from cutover_model import CellStatus, CutoverCell, GSM, GroupStatus, RunPhase, UNMAPPED
 
 _failures = []
 
@@ -66,6 +66,7 @@ class FakeSSH:
         #: other — a transient that must NOT be accepted as real traffic.
         self.blip_on = blip_on
         self.stzrc_calls = 0
+        self.status_calls = 0
         self.sent = []
         self.unlocked = set(pre_unlocked)     # cells currently UNLOCKED
         self.pre_unlocked = set(pre_unlocked)
@@ -132,9 +133,30 @@ class FakeSSH:
         self.sent.append(command)
         c = command.strip()
 
-        if c.startswith("hgetc") and "eutrancell" in c.lower():
+        # Cell status: administrativeState / operationalState per cell. Modelled
+        # so a run-unlocked cell only reads ENABLED after `enable_after` polls,
+        # while a pre-unlocked cell is ENABLED from the first read.
+        if c.startswith("hgetc") and "administrativestate" in c.lower():
+            self.status_calls += 1
+            full = {"FDD": "EUtranCellFDD", "TDD": "EUtranCellTDD",
+                    "DU": "NRCellDU"}
+            lines = ["MO ;administrativeState;operationalState"]
+            for dn in self.all_cells:
+                mo = full[self._mo_of(dn)]
+                if dn in self.pre_unlocked:
+                    adm, op = "UNLOCKED", "ENABLED"
+                elif dn in self.unlocked:
+                    up = self.status_calls > self.enable_after
+                    adm, op = "UNLOCKED", ("ENABLED" if up else "DISABLED")
+                else:
+                    adm, op = "LOCKED", "DISABLED"
+                lines.append(f"{mo}=CCL_{dn} ;1 ({adm}) ;1 ({op})")
+            return "\n".join(lines) + "\n"
+        # Band discovery (freqBand / bandListManual) — distinct from the status
+        # command above even though both are hgetc on the cell MOs.
+        if c.startswith("hgetc") and "freqband" in c.lower():
             return LTE_BANDS
-        if c.startswith("hgetc") and "nrcelldu" in c.lower():
+        if c.startswith("hgetc") and "bandlistmanual" in c.lower():
             return NR_BANDS
         if c.startswith("hget") and "cellbarred" in c.lower():
             dn = c.split("=", 1)[1].split()[0]
@@ -259,6 +281,9 @@ lb = run.cells_of("LB")
 check("both LB cells TRAFFIC_OK",
       all(c.status == CellStatus.TRAFFIC_OK for c in lb),
       str([(c.cell_dn, c.status.value) for c in lb]))
+check("successful unlock updates administrative state",
+      all(c.admin_state == "UNLOCKED" for c in lb),
+      str([(c.cell_dn, c.admin_state, c.op_state) for c in lb]))
 check("group LB DONE", run.groups["LB"].status == GroupStatus.DONE)
 check("one ldeb per LB cell",
       sum(1 for s in fake.sent if s.startswith("ldeb")) == 2)
@@ -270,6 +295,29 @@ check("UE count read from the UEs column", all(c.ue_peak == 7 for c in lb),
       str([c.ue_peak for c in lb]))
 check("UNMAPPED cell never unlocked",
       not any("SITEA-98" in s for s in fake.sent if s.startswith("ldeb")))
+
+# ── Lock toggle: a fully-up group offers Lock, and Lock takes it down ──
+fake_lock = FakeSSH()
+eng_lock = build_engine(tmpdir, fake_lock)
+eng_lock.start_discovery(); wait_idle(eng_lock)
+eng_lock.unlock_group("LB"); wait_idle(eng_lock)
+lrun = eng_lock.run
+check("a fully-up LB offers Lock, not Unlock",
+      len(lrun.unlockable_cells_of("LB")) == 0
+      and len(lrun.lockable_cells_of("LB")) == 2,
+      f"un={len(lrun.unlockable_cells_of('LB'))} "
+      f"lo={len(lrun.lockable_cells_of('LB'))}")
+eng_lock.lock_group("LB"); wait_idle(eng_lock)
+check("Lock LB sends bl for both up cells",
+      sum(1 for s in fake_lock.sent if s.startswith("bl ")) == 2,
+      str([s for s in fake_lock.sent if s.startswith("bl")]))
+check("Lock leaves LB cells RELOCKED",
+      all(c.status == CellStatus.RELOCKED for c in lrun.cells_of("LB")))
+check("locked cells retain detailed live state",
+      all(c.admin_state == "LOCKED" and c.op_state == "DISABLED"
+          for c in lrun.cells_of("LB")),
+      str([(c.cell_dn, c.admin_state, c.op_state)
+           for c in lrun.cells_of("LB")]))
 
 # ──────────────────────────────────────────────────────────────────
 print("\n[3] rollback touches only what this run unlocked")
@@ -286,29 +334,26 @@ check("no bl for cells never unlocked",
 check("relockable set is now empty", run.relockable_cells_of("LB") == [])
 
 # ──────────────────────────────────────────────────────────────────
-print("\n[4] a cell already in service is never touched")
+print("\n[4] a cell already unlocked reads ENABLED and is lockable")
 fake4 = FakeSSH(pre_unlocked=["SITEA-11"])
 eng4 = build_engine(tmpdir, fake4)
 eng4.start_discovery(); wait_idle(eng4)
 r4 = eng4.run
-already = [c for c in r4.cells if c.already_in_service]
-check("pre-unlocked cell detected", len(already) == 1 and
-      already[0].cell_dn == "SITEA-11", str([c.cell_dn for c in already]))
-check("marked ALREADY_IN_SERVICE",
-      already[0].status == CellStatus.ALREADY_IN_SERVICE)
-check("excluded from unlockable", already[0] not in r4.unlockable_cells_of("LB"))
-check("excluded from relockable", not already[0].is_relockable)
+cell11 = next(c for c in r4.cells if c.cell_dn == "SITEA-11")
+check("pre-unlocked cell reads UNLOCKED/ENABLED from the status poll",
+      cell11.status == CellStatus.ENABLED, cell11.status.value)
+check("an already-up cell is lockable, not unlockable",
+      cell11 in r4.lockable_cells_of("LB")
+      and cell11 not in r4.unlockable_cells_of("LB"))
 
 eng4.unlock_group("LB"); wait_idle(eng4)
-check("no ldeb for the in-service cell",
+check("unlock does not re-ldeb the already-up cell",
       not any("SITEA-11" in s for s in fake4.sent if s.startswith("ldeb")),
       str([s for s in fake4.sent if s.startswith('ldeb')]))
-eng4.relock_all(); wait_idle(eng4)
-check("rollback never locks the in-service cell",
-      not any("SITEA-11" in s for s in fake4.sent if s.startswith("bl ")),
+eng4.lock_group("LB"); wait_idle(eng4)
+check("Lock sends bl for the already-up cell",
+      any("SITEA-11" in s for s in fake4.sent if s.startswith("bl ")),
       str([s for s in fake4.sent if s.startswith('bl ')]))
-check("in-service cell still ALREADY_IN_SERVICE",
-      already[0].status == CellStatus.ALREADY_IN_SERVICE)
 
 # ──────────────────────────────────────────────────────────────────
 print("\n[5] a barred cell fails fast instead of burning the timeout")
@@ -346,6 +391,15 @@ check("radio status was consulted",
 check("group FAILED", eng6.run.groups["LB"].status == GroupStatus.FAILED)
 check("cells still relockable after a failed unlock",
       len(eng6.run.relockable_cells_of("LB")) == 2)
+
+# A later live read may show that an attempted cell fell back to LOCKED. The
+# UI must then offer Unlock again, not Lock/Re-lock based only on ownership.
+for c in lb6:
+    eng6.run.set_cell(c, admin_state="LOCKED", op_state="DISABLED")
+check("confirmed LOCKED cells offer Unlock again",
+      len(eng6.run.unlockable_cells_of("LB")) == 2
+      and not eng6.run.lockable_cells_of("LB")
+      and not eng6.run.relockable_cells_of("LB"))
 
 # ──────────────────────────────────────────────────────────────────
 print("\n[7] a transient UE blip does not confirm traffic")
@@ -452,15 +506,15 @@ check("configured steps ran",
       str([(s.key, s.status) for s in eng12.run.final_steps]))
 
 # ──────────────────────────────────────────────────────────────────
-print("\n[13] pre-state failure is a hard gate")
+print("\n[13] pre-state failure is best-effort, not a hard gate")
 fake13 = FakeSSH(no_cell_table=True)
 eng13 = build_engine(tmpdir, fake13)
 eng13.start_discovery(); wait_idle(eng13)
-check("missing pre-state table blocks READY",
-      eng13.run.phase == RunPhase.FAILED, str(eng13.run.phase))
+check("missing pre-state table no longer blocks — reaches READY",
+      eng13.run.phase == RunPhase.READY, str(eng13.run.phase))
 eng13.unlock_group("LB"); wait_idle(eng13)
-check("no unlock command after pre-state failure",
-      not any(s.startswith("ldeb") for s in fake13.sent), str(fake13.sent))
+check("unlock still proceeds after a failed pre-state read",
+      any(s.startswith("ldeb") for s in fake13.sent), str(fake13.sent))
 
 
 class PartialPrestateSSH(FakeSSH):
@@ -476,8 +530,8 @@ class PartialPrestateSSH(FakeSSH):
 fake13b = PartialPrestateSSH()
 eng13b = build_engine(tmpdir, fake13b)
 eng13b.start_discovery(); wait_idle(eng13b)
-check("partial pre-state blocks READY",
-      eng13b.run.phase == RunPhase.FAILED, str(eng13b.run.phase))
+check("partial pre-state no longer blocks — reaches READY",
+      eng13b.run.phase == RunPhase.READY, str(eng13b.run.phase))
 check("partial pre-state does not mutate ownership flags",
       not any(c.was_unlocked_before for c in eng13b.run.cells))
 
@@ -565,6 +619,7 @@ try:
 
     eng15b = build_engine(
         recovery_dir, fake15, persistence__enabled=True,
+        traffic__interval_s=0.03,
     )
     check("unfinished run detected",
           eng15b.recovery_checkpoint == checkpoint15,
@@ -572,6 +627,8 @@ try:
     eng15b.recover("resume"); wait_idle(eng15b)
     check("recovery returns READY", eng15b.run.phase == RunPhase.READY,
           str(eng15b.run.phase))
+    check("non-strict recovery tolerates config changes",
+          not eng15b.run.error, eng15b.run.error)
     check("recovery never replays ldeb",
           sum(1 for c in fake15.sent if c.startswith("ldeb"))
           == ldeb_before_recovery, str(fake15.sent))
@@ -629,6 +686,143 @@ try:
     eng16b.shutdown()
 finally:
     shutil.rmtree(rollback_dir, ignore_errors=True)
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[17] recovery reconciles GSM with BSC state, not LTE/NR hgetc")
+gsm_recovery_dir = tempfile.mkdtemp(prefix="cutover-gsm-recovery-test-")
+orig_gsm_states = cutover_runner.run_cutover_gsm_states
+try:
+    fake17 = FakeSSH()
+    eng17a = build_engine(
+        gsm_recovery_dir, fake17, persistence__enabled=True)
+    eng17a.start_discovery(); wait_idle(eng17a)
+    gsm17 = CutoverCell(
+        node_name="NODEA", mo_type="GeranCell", cell_dn="T1239S1",
+        rat="GSM", group=GSM, band_key="GSM900", sector="1",
+        gsm_fdn="SubNetwork=X,GeranCell=T1239S1", geran_state="HALTED")
+    with eng17a.run.lock:
+        eng17a.run.cells.append(gsm17)
+        eng17a.run.by_key[gsm17.key] = gsm17
+        eng17a.run.groups.setdefault(GSM, cutover_runner.GroupState(name=GSM))
+        eng17a.run.groups[GSM].cell_keys.append(gsm17.key)
+        eng17a.run.touch(gsm17)
+    checkpoint17 = eng17a._persist_checkpoint()
+    eng17a.shutdown()
+
+    cutover_runner.run_cutover_gsm_states = lambda *a, **k: ({
+        "T1239S1": {
+            "fdn": "SubNetwork=X,GeranCell=T1239S1", "state": "HALTED"}
+    }, "")
+    eng17b = build_engine(
+        gsm_recovery_dir, fake17, persistence__enabled=True)
+    eng17b.recover("resume"); wait_idle(eng17b)
+    restored17 = eng17b.run.by_key[gsm17.key]
+    check("GSM recovery returns READY",
+          eng17b.run.phase == RunPhase.READY, str(eng17b.run.error))
+    check("untouched GSM remains pending",
+          restored17.status == CellStatus.PENDING, str(restored17.status))
+    check("recovered GSM displays its live Geran state",
+          restored17.status_detail == "HALTED", restored17.status_detail)
+    check("GSM recovery preserves its FDN",
+          restored17.gsm_fdn.endswith("GeranCell=T1239S1"), restored17.gsm_fdn)
+    eng17b.shutdown()
+finally:
+    cutover_runner.run_cutover_gsm_states = orig_gsm_states
+    shutil.rmtree(gsm_recovery_dir, ignore_errors=True)
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[18] empty recovery checkpoint returns to start screen")
+empty_recovery_dir = tempfile.mkdtemp(prefix="cutover-empty-recovery-test-")
+try:
+    fake18 = FakeSSH()
+    eng18a = build_engine(
+        empty_recovery_dir, fake18, persistence__enabled=True)
+    eng18a._ensure_persistence_started()
+    checkpoint18 = eng18a._persist_checkpoint()
+    eng18a.shutdown()
+
+    eng18b = build_engine(
+        empty_recovery_dir, fake18, persistence__enabled=True)
+    eng18b.recover("resume"); wait_idle(eng18b)
+    check("empty recovery returns IDLE",
+          eng18b.run.phase == RunPhase.IDLE, str(eng18b.run.phase))
+    check("empty recovery no longer blocks Start",
+          eng18b.recovery_checkpoint is None)
+    check("empty checkpoint is retired",
+          not os.path.exists(checkpoint18)
+          and os.path.isfile(os.path.join(
+              os.path.dirname(checkpoint18), "manifest.json")))
+    eng18b.shutdown()
+finally:
+    shutil.rmtree(empty_recovery_dir, ignore_errors=True)
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[19] dedicated GSM BB gets its own Cut Over session")
+cfg19 = cutover_runner.load_cutover_config(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+cfg19["persistence"]["enabled"] = False
+eng19 = cutover_runner.CutoverEngine({
+    "shortcode": "TEST", "node_name": "TEST_B01",
+    "node2_name": "TEST_B02", "gsm_node_name": "TEST_B03",
+    "host": "h", "port": 5023, "username": "u", "password": "p",
+}, cfg=cfg19, log_dir=tmpdir)
+check("LTE/NR and GSM nodes are all included",
+      eng19.run.node_names == ["TEST_B01", "TEST_B02", "TEST_B03"],
+      str(eng19.run.node_names))
+
+# Reusing the same BB in the GSM field must not open a duplicate session.
+eng19dup = cutover_runner.CutoverEngine({
+    "shortcode": "TEST", "node_name": "TEST_B01",
+    "node2_name": "TEST_B02", "gsm_node_name": "test_b02",
+    "host": "h", "port": 5023, "username": "u", "password": "p",
+}, cfg=cfg19, log_dir=tmpdir)
+check("duplicate GSM node is de-duplicated",
+      eng19dup.run.node_names == ["TEST_B01", "TEST_B02"],
+      str(eng19dup.run.node_names))
+
+# ──────────────────────────────────────────────────────────────────
+print("\n[20] per-node Cut Over work runs concurrently")
+activity20 = {"active": 0, "peak": 0}
+lock20 = threading.Lock()
+
+def _parallel_probe(_node, _value):
+    with lock20:
+        activity20["active"] += 1
+        activity20["peak"] = max(
+            activity20["peak"], activity20["active"])
+    time.sleep(0.05)
+    with lock20:
+        activity20["active"] -= 1
+
+eng19._run_per_node({"B01": None, "B02": None, "B03": None},
+                    _parallel_probe)
+check("three BB workers overlap", activity20["peak"] == 3,
+      str(activity20["peak"]))
+
+print("\n[21] NR unlock follows live sectorCarrierRef")
+fake21 = FakeSSH()
+cfg21 = cutover_runner.load_cutover_config(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+cfg21["unlock"]["inter_command_delay_s"] = 0
+carrier21 = "GNBDUFunction=1,NRSectorCarrier=N41_S1"
+nr21 = [
+    CutoverCell(node_name="NODEA", mo_type="NRCellDU",
+                cell_dn=f"SITEA-40{i}", rat="NR", band_number=41,
+                band_key="NR2600", group="HB", sector="1",
+                nr_sector_carrier_ref=carrier21)
+    for i in (1, 4)
+]
+cutover_runner.run_cutover_unlock(
+    fake21, "NODEA", nr21, lambda _m: None, cfg21)
+nr_commands21 = [c for c in fake21.sent if c.startswith("ldeb")]
+check("live carrier is unlocked before NRCellDU",
+      nr_commands21[0] == f"ldeb {carrier21}", str(nr_commands21))
+check("shared live carrier is unlocked only once",
+      nr_commands21.count(f"ldeb {carrier21}") == 1, str(nr_commands21))
+check("both related NRCellDU commands follow the carrier",
+      len(nr_commands21) == 3
+      and all("NRCellDU=" in c for c in nr_commands21[1:]),
+      str(nr_commands21))
 
 # ──────────────────────────────────────────────────────────────────
 print()

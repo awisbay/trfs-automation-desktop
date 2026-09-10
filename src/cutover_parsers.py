@@ -68,6 +68,26 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+def parse_nr_sector_carrier_refs(output: str) -> dict:
+    """Parse ``get nrcelldu sectorcarrier`` continuation rows.
+
+    Returns ``{NRCELLDU_ID_UPPER: full NRSectorCarrier MO reference}``.
+    The reference is printed on the ``>>>`` line following each NRCellDU row.
+    """
+    refs = {}
+    current = ""
+    for raw in strip_ansi(output).splitlines():
+        cell = re.search(r"\bNRCellDU=([^\s,;]+)", raw, re.IGNORECASE)
+        if cell:
+            current = cell.group(1).strip().upper()
+        carrier = re.search(
+            r"nRSectorCarrierRef\s*=\s*(\S*NRSectorCarrier=[^\s,]+)",
+            raw, re.IGNORECASE)
+        if current and carrier:
+            refs[current] = carrier.group(1).strip()
+    return refs
+
+
 def _is_noise(line: str) -> bool:
     """True for headers, separators, totals, command echoes and prompts."""
     s = strip_ansi(line).strip()
@@ -539,6 +559,10 @@ class StzrcResult:
 
 #: Header cell naming the table and the column that holds the cell name.
 _STZRC_TABLES = {"LTECell": "LTE", "NRCell": "NR"}
+#: Case-insensitive lookup so a header whose label differs only in case/spacing
+#: (seen across node SW loads) still identifies the cell table instead of the
+#: whole parse silently reporting "no cell table found".
+_STZRC_TABLES_LC = {k.lower(): v for k, v in _STZRC_TABLES.items()}
 _STZRC_TOTAL_RE = re.compile(r"Total:\s*(\d+)\s*Cells?\s*\((\d+)\s*up\)", re.IGNORECASE)
 
 
@@ -584,8 +608,9 @@ def parse_stzrc(output: str) -> StzrcResult:
             parts = _split_semis(line)
             found = None
             for i, name in enumerate(parts):
-                if name in _STZRC_TABLES:
-                    found = (i, _STZRC_TABLES[name])
+                key = name.strip().lower()
+                if key in _STZRC_TABLES_LC:
+                    found = (i, _STZRC_TABLES_LC[key])
                     break
             if found is not None:
                 cell_col, table = found
@@ -972,3 +997,292 @@ def looks_like_unknown_command(output: str, patterns: tuple) -> Optional[str]:
             if pat.lower() in text.lower():
                 return pat
     return None
+
+
+# ──────────────────────────────────────────────────────────────────
+# sdirc — per-RF-port VSWR
+# ──────────────────────────────────────────────────────────────────
+@dataclass
+class VswrResult:
+    """Per-cell VSWR from an ``sdirc`` capture.
+
+    ``by_cell`` maps an **upper-cased cell DN** (e.g. ``CMPBAHIANMALAYBBUKL-171``)
+    to a list of port readings::
+
+        [{"port": "A", "vswr": 1.13, "rl": 24.5, "fru": "B0B28_RRU1"}, …]
+
+    The same reading is attached to every cell the port serves, because a
+    cut-over cares about "what is the VSWR on the ports carrying THIS cell",
+    and one RF port carries several cells. ``vswr`` is ``None`` when the radio
+    reports ``-`` (AAS/AIR units do not expose a per-port VSWR)."""
+    ok: bool = False
+    by_cell: dict = field(default_factory=dict)
+    #: GSM tokens from ``GT=site-L1/0``, keyed as ``L1``, ``R1``, ``2``, etc.
+    by_gsm_token: dict = field(default_factory=dict)
+    warning: str = ""
+
+
+#: ``FDD=SITE-1`` / ``TDD=…`` / ``NRC=…`` / ``DU=…`` tokens in the cells column.
+_VSWR_CELL_RE = re.compile(
+    r"\b(?:EUtranCellFDD|EUtranCellTDD|NRCellDU|NRCellCU|FDD|TDD|NRC|DU|CU)"
+    r"\s*=\s*([A-Za-z0-9_.\-]+)",
+    re.IGNORECASE,
+)
+_VSWR_GSM_RE = re.compile(
+    r"\bGT\s*=\s*([A-Za-z0-9_.-]+)(?:/\d+)?", re.IGNORECASE)
+
+
+def parse_sdir_vswr(output: str) -> VswrResult:
+    """Parse the ``sdirc`` FRU/RF/VSWR/Cells table into per-cell VSWR readings.
+
+    The relevant table (the last one ``sdirc`` prints) is shaped::
+
+        FRU ;LNH ;BOARD ;RF ;BP ;TX (W/dBm) ;VSWR (RL) ;RX (dBm) ;UEs/gUEs ;Sector/AntennaGroup/Cells …
+        B0B28_RRU1 ;BXP_4 ;… ; A ;11 ;16.3 (42.1) ;1.13 (24.5) ;-79.8 ;9/- ;… FDD=…L-171 FDD=…Y-121 NRC=…P-501 (…)
+
+    One row per RF port; the last column lists exactly which cells that port
+    serves, so the cell↔port mapping is self-contained — no topology lookup.
+
+    Fails loudly (``ok=False`` + ``warning``) rather than guessing when the
+    VSWR table cannot be located, so a caller never shows a fabricated value.
+    """
+    lines = strip_ansi(output or "").splitlines()
+
+    header_idx = None
+    for i, line in enumerate(lines):
+        if "VSWR" in line and ";" in line and "RF" in line:
+            header_idx = i
+            break
+    if header_idx is None:
+        return VswrResult(ok=False, warning="no VSWR table found in sdir output")
+
+    cols = [c.strip() for c in lines[header_idx].split(";")]
+
+    def _find(pred) -> Optional[int]:
+        for idx, name in enumerate(cols):
+            if pred(name):
+                return idx
+        return None
+
+    rf_idx = _find(lambda n: n.upper() == "RF")
+    vswr_idx = _find(lambda n: "VSWR" in n.upper())
+    fru_idx = _find(lambda n: n.upper() == "FRU")
+    cells_idx = _find(lambda n: "CELL" in n.upper())  # "…/Cells (State…)"
+    if rf_idx is None or vswr_idx is None or cells_idx is None:
+        return VswrResult(
+            ok=False,
+            warning=f"VSWR table header not understood: {cols!r}")
+
+    by_cell: dict = {}
+    by_gsm_token: dict = {}
+    matched_rows = 0
+    saw_data = False
+    for line in lines[header_idx + 1:]:
+        s = line.strip()
+        if not s:
+            continue
+        # A run of only '-'/'=' is a separator. The header's own closing '===='
+        # comes right after it, so only treat a separator as the end of the
+        # table once at least one data row has been seen.
+        if set(s) <= set("-="):
+            if saw_data:
+                break
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) <= cells_idx:
+            continue
+        port = parts[rf_idx]
+        if not port or len(port) > 3:      # skip stray non-data lines
+            continue
+
+        raw_vswr = parts[vswr_idx]
+        vswr_val: Optional[float] = None
+        rl_val: Optional[float] = None
+        mnum = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)", raw_vswr)
+        if mnum:
+            try:
+                vswr_val = float(mnum.group(1))
+            except ValueError:
+                vswr_val = None
+        mrl = re.search(r"\(\s*(-?[0-9]+(?:\.[0-9]+)?)", raw_vswr)
+        if mrl:
+            try:
+                rl_val = float(mrl.group(1))
+            except ValueError:
+                rl_val = None
+
+        fru = parts[fru_idx] if fru_idx is not None else ""
+        cells_field = ";".join(parts[cells_idx:])
+        dns = {m.group(1).upper() for m in _VSWR_CELL_RE.finditer(cells_field)}
+        gsm_tokens = {
+            m.group(1).rsplit("-", 1)[-1].upper()
+            for m in _VSWR_GSM_RE.finditer(cells_field)
+        }
+        if not dns and not gsm_tokens:
+            continue
+        saw_data = True
+        matched_rows += 1
+        reading = {"port": port, "vswr": vswr_val, "rl": rl_val, "fru": fru}
+        for dn in dns:
+            by_cell.setdefault(dn, []).append(reading)
+        for token in gsm_tokens:
+            by_gsm_token.setdefault(token, []).append(reading)
+
+    if not by_cell and not by_gsm_token:
+        return VswrResult(
+            ok=False,
+            warning="VSWR table found but no cells could be attributed to ports")
+    return VswrResult(ok=True, by_cell=by_cell,
+                      by_gsm_token=by_gsm_token)
+
+
+# ──────────────────────────────────────────────────────────────────
+# GSM — GeranCell (BSC) + GsmSector/Trx (node)
+# ──────────────────────────────────────────────────────────────────
+#: A GSM cell id is ``<letter><siteDigits><band 8|9><sectorSuffix>`` — e.g.
+#: site MIN283 → ``M2839S1`` (GSM900) / ``M2838S1`` (GSM1800), site MIN823 →
+#: ``M8239R3``. Anchoring the band digit and requiring a non-digit sector char
+#: right after the exact site digits excludes foreign sites (``M2839..`` also
+#: prefix-matches other sites otherwise). Mirrors ``gsm_cell_id_re`` in
+#: ``integration_runner`` — replicated here to keep this module SSH-free.
+def _gsm_site_prefix_re(shortcode: str):
+    m = re.match(r"([A-Za-z])[A-Za-z]*(\d+)", shortcode or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def gsm_cell_belongs(cell_id: str, shortcode: str) -> bool:
+    p = _gsm_site_prefix_re(shortcode)
+    if not p:
+        return False
+    return re.match(rf"^{p[0]}{p[1]}[89]\D", cell_id or "", re.IGNORECASE) is not None
+
+
+def gsm_sector_suffix(cell_id: str, shortcode: str) -> str:
+    """Physical sector number from the final digit of a GeranCell id.
+
+    The preceding letter identifies a cell layer, not a separate Cut Over
+    sector: ``…L1``, ``…R1`` and ``…S1`` all normalise to sector ``1``.
+    """
+    p = _gsm_site_prefix_re(shortcode)
+    if not p:
+        return ""
+    mm = re.match(rf"^{p[0]}{p[1]}[89]", cell_id or "", re.IGNORECASE)
+    if not mm:
+        return ""
+    tail = (cell_id or "")[mm.end():]
+    sector = re.search(r"(\d)$", tail)
+    return sector.group(1) if sector else ""
+
+
+def gsm_band_of(cell_id: str, shortcode: str) -> str:
+    """``GSM900`` (band digit 9) or ``GSM1800`` (band digit 8), or "" if
+    the id is not this site's."""
+    p = _gsm_site_prefix_re(shortcode)
+    if not p:
+        return ""
+    mm = re.match(rf"^{p[0]}{p[1]}([89])\D", cell_id or "", re.IGNORECASE)
+    if not mm:
+        return ""
+    return "GSM900" if mm.group(1) == "9" else "GSM1800"
+
+
+def _sector_suffix_of(sector_full: str) -> str:
+    """Normalise ``…-1`` to ``1`` and ``…-R3`` to ``3``."""
+    suffix = (sector_full.rsplit("-", 1)[-1]
+              if "-" in sector_full else sector_full)
+    sector = re.search(r"(\d)$", suffix)
+    return sector.group(1) if sector else suffix
+
+
+def parse_gerancell(output: str, shortcode: str) -> dict:
+    """Parse ``cmedit get * GeranCell.(GeranCellid==<site>*,state)`` into
+    ``{cell_id_upper: {"fdn": <full FDN or "">, "state": <ACTIVE|HALTED|…>}}``.
+
+    Handles both the **verbose** form (blocks of ``FDN : …`` / ``state : …`` —
+    needed because ``cmedit set`` requires the full FDN, not a filter) and the
+    ``-t`` table form (``… GeranCellId geranCellId state`` rows). Only cells that
+    truly belong to the site are kept."""
+    result: dict = {}
+    cur_fdn = ""
+    cur_cell = ""
+    for raw in strip_ansi(output or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Verbose form ──────────────────────────────────────────
+        if line.upper().startswith("FDN"):
+            m = re.search(r"GeranCell=([A-Za-z0-9_.\-]+)", line)
+            cur_fdn = line.split(":", 1)[1].strip() if ":" in line else ""
+            cur_cell = m.group(1) if m else ""
+            continue
+        low = line.lower()
+        if low.startswith("state") and ":" in line and cur_cell:
+            if gsm_cell_belongs(cur_cell, shortcode):
+                result[cur_cell.upper()] = {
+                    "fdn": cur_fdn,
+                    "state": line.split(":", 1)[1].strip().upper()}
+            cur_fdn, cur_cell = "", ""
+            continue
+        # Table (-t) form ───────────────────────────────────────
+        parts = line.split()
+        cell = next((p for p in parts if gsm_cell_belongs(p, shortcode)), None)
+        if cell and len(parts) >= 2 and cell.upper() not in result:
+            result[cell.upper()] = {"fdn": "", "state": parts[-1].strip().upper()}
+    return result
+
+
+def parse_gerancell_states(output: str, shortcode: str) -> dict:
+    """``{cell_id_upper: state}`` — thin wrapper over :func:`parse_gerancell`."""
+    return {k: v["state"] for k, v in parse_gerancell(output, shortcode).items()}
+
+
+_GSM_TRX_RE = re.compile(r"GsmSector=([^,]+),Trx=(\d+)", re.IGNORECASE)
+
+
+def parse_tss(output: str) -> dict:
+    """``get . tss`` → per GsmSector suffix:
+    ``{"trx": {trx_id: [ts_states]}, "total": n, "enabled": n, "all_enabled": bool}``.
+
+    Reads the parenthesised ``(ENABLED ENABLED …)`` timeslot states on each
+    ``GsmSector=…,Trx=…`` row. A sector is enabled only when every timeslot on
+    every one of its Trx reads ENABLED."""
+    sectors: dict = {}
+    for line in strip_ansi(output or "").splitlines():
+        m = _GSM_TRX_RE.search(line)
+        if not m:
+            continue
+        suffix = _sector_suffix_of(m.group(1))
+        trx = m.group(2)
+        pm = re.search(r"\(([^)]*)\)", line)
+        ts_states = pm.group(1).split() if pm else []
+        d = sectors.setdefault(
+            suffix, {"trx": {}, "total": 0, "enabled": 0})
+        d["trx"][trx] = ts_states
+        for s in ts_states:
+            d["total"] += 1
+            if s.strip().upper() == "ENABLED":
+                d["enabled"] += 1
+    for d in sectors.values():
+        d["all_enabled"] = d["total"] > 0 and d["enabled"] == d["total"]
+    return sectors
+
+
+def parse_gsmsector_list(output: str) -> dict:
+    """``lst gsmsector`` → ``{sector_suffix: {trx_id: {"adm": …, "op": …}}}``.
+
+    Only ``Trx`` rows are kept (``AbisIp`` rows are skipped); adm/op come from
+    the two ``(WORD)`` tokens, e.g. ``1 (UNLOCKED) 1 (ENABLED)``."""
+    out: dict = {}
+    for line in strip_ansi(output or "").splitlines():
+        m = _GSM_TRX_RE.search(line)
+        if not m:
+            continue
+        suffix = _sector_suffix_of(m.group(1))
+        trx = m.group(2)
+        words = re.findall(r"\(([A-Za-z_]+)\)", line)
+        adm = words[0].upper() if len(words) >= 1 else ""
+        op = words[1].upper() if len(words) >= 2 else ""
+        out.setdefault(suffix, {})[trx] = {"adm": adm, "op": op}
+    return out

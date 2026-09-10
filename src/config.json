@@ -98,6 +98,11 @@
     "unlock": {
       "_comment": "One MO per command \u2014 never a regex that could match a whole node. NOTE: `deb`/`bl` is the standard moshell deblock/block pair; `ldeb` is kept here because that is what was specified for this environment. Correct either here without a rebuild.",
       "command_template": "ldeb {mo_type}={cell_dn}",
+      "nr_carrier_enabled": true,
+      "nr_carrier_mo_template": "GNBDUFunction=1,NRSectorCarrier=N{band_number}_S{sector}",
+      "nr_carrier_unlock_template": "ldeb {mo_ref}",
+      "nr_carrier_lookup_command": "get nrcelldu sectorcarrier",
+      "nr_carrier_allow_name_fallback": false,
       "lock_command_template": "bl {mo_type}={cell_dn}",
       "graceful_lock": false,
       "graceful_lock_template": "set {mo_type}={cell_dn} administrativeState SHUTTING_DOWN",
@@ -124,6 +129,11 @@
         "enabled": true,
         "name_template": "PreCutover_{node}_{timestamp}"
       },
+      "_comment_post_create_cv": "Post HC creates a post-cutover CV named Post_CutOver_DDMMYYYY_HHMM (timestamp = %d%m%Y_%H%M).",
+      "post_create_cv": {
+        "enabled": true,
+        "name_template": "Post_CutOver_{timestamp}"
+      },
       "modump": {
         "enabled": true
       },
@@ -138,17 +148,47 @@
           "Syntax error",
           "command not found"
         ]
+      },
+      "_comment_posthc": "Post HC runs this script (post-cutover health check). Its moshell logfile (~/Logfile/<date>/*_Post_HC.log) is downloaded per node, like Pre HC's *_Pre_HC.log.",
+      "posthc": {
+        "enabled": true,
+        "script_path": "/home/shared/common/INTEGRATION_TEAM/script/PostHC.txt",
+        "command_template": "run {script_path}",
+        "timeout_s": 900,
+        "error_patterns": [
+          "ERROR",
+          "Unknown command",
+          "Syntax error",
+          "command not found"
+        ]
       }
     },
-    "_comment_prestate": "Required hard gate. Every discovered cell must match a live pre-state row before READY. A failed or partial read blocks Cut Over so rollback ownership is never guessed.",
+    "_comment_trfs": "TRFS Log button (independent of Pre HC): connects each node, runs rats_command (pv $rats) to identify its techs — G=2G, L=4G, N=5G, one letter = standalone, several = combination — then runs LABEL.mos once (first click) and the per-node TRFS script: 2G+4G(±5G)=all, 2G-only=gsm_only, 4G/5G(no 2G)=no2g. After each script moshell is given idle_wait_s to finish flushing, then the node's newest <node>_<YYMMDD_HHMM> folder under remote_log_dir is downloaded into LOG/<site>/TRFS/.",
+    "trfs": {
+      "enabled": true,
+      "label_script": "/home/shared/ms260229/INOC/SCRIPTS/DM/LABEL.mos",
+      "command_template": "run {script_path}",
+      "scripts": {
+        "all": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_2G4G5G_allTech_cmd.mos",
+        "no2g": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_4Gand5G_only_cmd.mos",
+        "gsm_only": "/home/shared/common/INTEGRATION_TEAM/script/TRFS_2G_cmd_only.mos"
+      },
+      "remote_log_dir": "/home/shared/common/INTEGRATION_TEAM/TRFS",
+      "rats_command": "pv $rats",
+      "rats_timeout_s": 60,
+      "idle_wait_s": 20,
+      "timeout_s": 1800
+    },
+    "_comment_prestate": "Best-effort, NOT a gate. Records which cells were already unlocked (so rollback never re-locks a live cell), but a failed/partial read no longer blocks Cut Over — a site already unlocked and carrying traffic must still be workable. Set required=true to restore the old hard gate.",
     "prestate": {
       "enabled": true,
-      "required": true,
+      "required": false,
       "skip_already_in_service": true
     },
     "persistence": {
       "enabled": true,
-      "checkpoint_interval_s": 0.5
+      "checkpoint_interval_s": 0.5,
+      "require_config_match": false
     },
     "_comment_diagnosis": "Explain stuck cells instead of just timing out. A cell at DEPENDENCY_LOCKED is usually waiting on its radio (this is what `st B3` checks); a barred cell is up but can never attract a UE.",
     "diagnosis": {
@@ -164,10 +204,10 @@
       "lte_before_nr": true
     },
     "enable_poll": {
-      "_comment": "source=stzrc reuses the traffic command, whose LTECell/NRCell tables carry an S state column \u2014 one command per poll instead of two. Set source=st to use the commands list instead. row_regex overrides the built-in tolerant parser; it needs named groups mo/adm/op (avail optional).",
-      "source": "stzrc",
+      "_comment": "Cell status source. source=st runs the commands list \u2014 a fast hgetc for administrativeState/operationalState (UNLOCKED/ENABLED vs LOCKED/DISABLED), read right after discovery. Traffic (UE via stzrc) and VSWR (sdirc) are read separately in the background off the read session. Set source=stzrc to fold state out of the traffic table instead (slower). row_regex overrides the parser; needs named groups mo/adm/op (avail optional).",
+      "source": "st",
       "commands": [
-        "st cell"
+        "hgetc EUtranCellFDD|EUtranCellTDD|NRCellDU administrativeState|operationalState"
       ],
       "command_timeout_s": 90,
       "interval_s": 15,
@@ -191,7 +231,7 @@
     "traffic": {
       "_comment": "stzrc prints ;-delimited LTECell/NRCell tables carrying both an S state column and a UEs column, and is parsed natively. Traffic = the UEs column going 0 -> non-zero for required_consecutive_samples polls in a row. If the UE column cannot be located, on_parse_failure=manual_confirm stops for an operator eyeball rather than guessing a number.",
       "command": "stzrc",
-      "command_timeout_s": 120,
+      "command_timeout_s": 300,
       "interval_s": 20,
       "timeout_s": 600,
       "ue_column_names": [
@@ -221,7 +261,12 @@
       "baseline_before_unlock": true,
       "no_alarm_patterns": [
         "No Active alarms"
-      ]
+      ],
+      "_comment_activate": "On the first confirmed unlock, check FM alarm supervision once for the site and set active=true only on nodes currently false.",
+      "activate_enabled": true,
+      "activate_check_command": "!python {cli} \"cmedit get {shortcode}* fmalarmsupervision.active -t\"",
+      "activate_command": "!python {cli} \"cmedit set {node} fmalarmsupervision active=true\"",
+      "activate_timeout_s": 60
     },
     "report": {
       "screenshot_subdir": "CUTOVER",
