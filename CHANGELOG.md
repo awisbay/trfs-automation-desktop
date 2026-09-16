@@ -4,6 +4,40 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.11.0] - 2026-09-16
+
+### Added
+- **Audit: TermPointToGNB X2 address.** Read-only check that each co-located
+  LTE anchor's `TermPointToGNB` points at its own NR gNB's IP (including
+  LTE-only basebands). Isolated per site so a neighbouring site's TermPoint never
+  inherits this site's address; works on cmdump and modump; reports only, no
+  correction is generated.
+- **Audit: power license capacity.** Node power capacity computed with the
+  `licensepower.pl` formula, written to its own Excel sheets with evidence.
+  Incomplete data is reported as unresolved, never as a pass.
+- **Audit: bandwidth license capacity.** LTE/NR channel-bandwidth and
+  sector-carrier requirements checked against the installed licenses, with
+  explicit topology and missing-data checks.
+- **Cut Over: "Update Traffic & VSWR" button.** Traffic and VSWR are now cached
+  snapshots: one pass after discovery/recovery, then refreshed on demand. Each
+  pass opens short-lived per-node sessions in parallel (traffic, then VSWR) and
+  closes them afterwards; a failed read keeps the last values. Replaces the
+  continuous background polling.
+- **Cut Over: safe Cancel / Back.** Cancel stops every worker and closes all SSH
+  sessions in the background; Back and in-app navigation stay blocked until
+  nothing is still running.
+- **BSC broker map:** MINVBS01, MINVBS03, MINVBS04, MINVBS05, MINVBS07.
+
+### Changed
+- **Log files are prefixed and timestamped per workflow** (`INTEGRATION_`,
+  `CUTOVER_`, `AUDIT_`), so repeated runs never overwrite each other. Cut Over
+  command-execution captures now go to `LOG/<site>/MOSHELL/`, group tees to
+  `LOG/<site>/SESSION/`; `POST/` keeps only the downloaded Post_HC logfiles.
+- **Post HC no longer rediscovers or resets cells**, and its completion message
+  names any node that has no downloaded Post_HC logfile.
+- **TRFS download reports progress** (folder search, file-transfer heartbeat),
+  and the TRFS flush delay is interruptible by Cancel.
+
 ## [1.10.0] - 2026-09-10
 
 ### Added

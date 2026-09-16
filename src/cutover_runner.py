@@ -814,7 +814,7 @@ def run_cutover_prehc(ssh, node_name: str, log_cb: Callable[[str], None],
                f"flagged something (info only, not blocking). Review the HC "
                f"log; cell status will still be shown.")
         return True, out
-    log_cb(f"[{node_name}] ✓ {label} completed.")
+    log_cb(f"[{node_name}] {label} command returned — logfile download pending.")
     return True, out
 
 
@@ -838,7 +838,7 @@ def run_cutover_download_hc_log(ssh, node_name: str, mode: str,
     local_name = (f"{node_name}_Logfile_{stamp}_{label}.log"
                   if mode == "post"
                   else f"{node_name}_Logfile_{date}_{label}.log")
-    local_path = os.path.join(local_dir, local_name)
+    local_path = os.path.join(local_dir, f"CUTOVER_{local_name}")
     got = ssh.download_newest_logfile(
         remote_dir, local_path,
         name_contains=node_name, name_endswith=f"_{label}.log",
@@ -898,7 +898,7 @@ def trfs_script_for_techs(has_2g: bool, has_4g: bool, has_5g: bool,
 
 def run_cutover_trfs(ssh, node_name: str, script_path: str,
                      local_dir: str, log_cb: Callable[[str], None],
-                     cfg: dict) -> tuple:
+                     cfg: dict, cancel_event=None) -> tuple:
     """Run one TRFS script on a node, wait for moshell to go idle, then pull
     the node's newest TRFS log folder. Returns (ok, local_folder_or_msg)."""
     trfs = cfg.get("trfs", {})
@@ -915,18 +915,47 @@ def run_cutover_trfs(ssh, node_name: str, script_path: str,
 
     # moshell keeps flushing the log after the prompt returns; give it a short
     # idle window before grabbing the folder so the log is complete.
-    idle = float(trfs.get("idle_wait_s", 20))
+    idle = max(0.0, float(trfs.get("idle_wait_s", 20)))
     if idle > 0:
-        log_cb(f"[{node_name}] TRFS script done — waiting {idle:.0f}s for "
-               f"moshell to go idle before downloading the log folder…")
-        time.sleep(idle)
+        wait_started = time.monotonic()
+        log_cb(f"[{node_name}] TRFS command returned — fixed flush delay "
+               f"{idle:g}s (download time is additional; script idle is not checked)…")
+        if cancel_event is not None:
+            if cancel_event.wait(idle):
+                return False, "TRFS cancelled before download."
+        else:
+            time.sleep(idle)
+        log_cb(f"[{node_name}] TRFS flush delay finished "
+               f"({time.monotonic() - wait_started:.1f}s elapsed).")
 
+    if cancel_event is not None and cancel_event.is_set():
+        return False, "TRFS cancelled before download."
     remote_parent = str(trfs.get(
         "remote_log_dir", "/home/shared/common/INTEGRATION_TEAM/TRFS"))
-    got = ssh.download_newest_dir(
-        remote_parent, local_dir, name_prefix=f"{node_name}_")
+    download_started = time.monotonic()
+    download_done = threading.Event()
+    def _progress(message):
+        log_cb(f"[{node_name}] TRFS download "
+               f"[{time.monotonic() - download_started:.1f}s]: {message}")
+    def _heartbeat():
+        while not download_done.wait(15):
+            _progress("still in progress — SFTP/search/file transfer; "
+                      "this is not the flush delay.")
+    heartbeat = threading.Thread(target=_heartbeat,
+                                 name=f"trfs-download-progress-{node_name}",
+                                 daemon=True)
+    heartbeat.start()
+    try:
+        got = ssh.download_newest_dir(
+            remote_parent, local_dir, name_prefix=f"{node_name}_",
+            progress_cb=_progress)
+    finally:
+        download_done.set()
+        heartbeat.join(timeout=1)
     if got:
+        _progress("finished successfully.")
         return True, got
+    _progress("failed — folder missing or SFTP download error.")
     return False, (f"TRFS log folder for {node_name} not found under "
                    f"{remote_parent}")
 
@@ -1334,6 +1363,9 @@ class CutoverEngine:
         self._persistence_lock = threading.RLock()
         self._action_lock = threading.Lock()
         self._threads: list = []
+        self._cancel_thread = None
+        self._cancel_lock = threading.Lock()
+        self._cancel_complete = threading.Event()
         # Set when a manual traffic gate is waiting on the operator.
         self._traffic_gate: dict = {}
         # Background status monitor: after a non-blocking unlock the enable wait
@@ -1347,6 +1379,8 @@ class CutoverEngine:
         self._bg_thread: Optional[threading.Thread] = None
         self._bg_stop = threading.Event()
         self._bg_lock = threading.Lock()
+        self._snapshot_initial_started = False
+        self._snapshot_sessions = {}
         # node -> time.monotonic() of the last sdirc VSWR / stzrc traffic read,
         # so those (heavy) commands run at their own interval rather than every
         # status poll.
@@ -1393,6 +1427,24 @@ class CutoverEngine:
     def is_busy(self) -> bool:
         return self._action_lock.locked()
 
+    def is_stopping(self) -> bool:
+        return bool(self._cancel_thread and self._cancel_thread.is_alive())
+
+    def _live_workers(self) -> list:
+        workers = list(self._threads) + [
+            self._monitor_thread, self._bg_thread, self._checkpoint_thread]
+        return [t for t in workers if t is not None and t.is_alive()
+                and t is not threading.current_thread()]
+
+    def can_leave(self) -> bool:
+        """Navigation is safe only after workers and sessions are gone."""
+        return (not self.is_stopping() and not self._live_workers()
+                and not self.run.sessions and not self._snapshot_sessions
+                and not self.is_busy())
+
+    def can_cancel(self) -> bool:
+        return not self.is_stopping() and not self.can_leave()
+
     def start_discovery(self, skip_preparation: bool = False,
                         skip_modump: bool = False,
                         hc_mode: str = "pre") -> None:
@@ -1408,15 +1460,58 @@ class CutoverEngine:
         self._spawn(self._discovery_worker, f"cutover-{self._hc_mode}hc")
 
     def start_posthc(self) -> None:
-        """Post HC: the post-cutover counterpart of Pre HC. Creates a
-        Post_CutOver CV, runs the postHC script (and downloads its log), then
-        re-reads cell status. Skips the slow modump, like Pre HC."""
-        self.start_discovery(skip_modump=True, hc_mode="post")
+        """Run Post HC and download logs without rediscovering/resetting cells."""
+        self._spawn(self._posthc_worker, "cutover-posthc")
+
+    def _posthc_worker(self) -> None:
+        run = self.run
+        self._hc_mode = "post"
+        self._skip_modump = True
+        post_dir = os.path.join(self.log_dir, "POST")
+        os.makedirs(post_dir, exist_ok=True)
+        started = time.monotonic()
+        results = {}
+        self.log("Post HC starting — CV, script, then logfile download; "
+                 "no rediscovery or traffic/VSWR wait.")
+        try:
+            missing = self._ensure_sessions()
+            def _worker(node_name, sess):
+                with run.lock:
+                    run.artifacts.pop(f"{node_name}:POSTHC_LOG", None)
+                results[node_name] = self._run_preparation_for_node(node_name, sess)
+            self._run_per_node(dict(run.sessions), _worker)
+            if run.is_cancelled():
+                self.log("Post HC cancelled — completion was not confirmed.")
+                return
+            downloaded = [n for n in results
+                          if run.artifacts.get(f"{n}:POSTHC_LOG")]
+            issues = [n for n, ok in results.items() if not ok] + missing
+            message = (f"Post HC action finished in {time.monotonic() - started:.1f}s. "
+                       f"Downloaded logfiles: {len(downloaded)}/{len(run.node_names)} nodes.")
+            if issues:
+                message += "\nFailed/unconnected nodes: " + ", ".join(issues)
+            absent = [n for n in run.node_names if n not in downloaded]
+            if absent:
+                message += "\nNo downloaded Post_HC logfile: " + ", ".join(absent)
+            message += "\nReview the logs for health-check warnings."
+            self.log(message)
+            self.emit(CutoverEvent(kind="posthc_done", png_path=post_dir,
+                                   message=message))
+        finally:
+            self._hc_mode = "pre"
 
     def run_trfs_log(self) -> None:
         """Run the TRFS logging scripts on every node (LABEL.mos once first),
         then download each node's newest TRFS log folder."""
         self._spawn(self._trfs_worker, "cutover-trfs")
+
+    def refresh_traffic_vswr(self) -> bool:
+        """Refresh cached measurements using short-lived, independent sessions."""
+        return self._start_measurement_snapshot(initial=False)
+
+    def measurements_busy(self) -> bool:
+        with self._bg_lock:
+            return bool(self._bg_thread and self._bg_thread.is_alive())
 
     def recover(self, mode: str = "resume") -> None:
         """Reconnect and reconcile an unfinished run before resume/rollback."""
@@ -1521,14 +1616,53 @@ class CutoverEngine:
             gate["event"].set()
 
     def cancel(self) -> None:
-        self.run.cancel_event.set()
-        self._stop_monitor()
-        self.log("Cancel requested. Cells already unlocked stay unlocked — "
-                 "cut over does not roll back.")
-        for gate in self._traffic_gate.values():
-            gate["ok"] = False
-            gate["event"].set()
-        self._force_disconnect()
+        with self._cancel_lock:
+            if self.is_stopping():
+                return
+            self._cancel_complete.clear()
+            self.run.cancel_event.set()
+            self._stop_monitor()
+            self._checkpoint_stop.set()
+            self._checkpoint_event.set()
+            self.run.touch()
+            for gate in self._traffic_gate.values():
+                gate["ok"] = False
+                gate["event"].set()
+            self.log("Cancelling — stopping workers and closing SSH sessions. "
+                     "Already-sent network changes are NOT rolled back.")
+            self._cancel_thread = threading.Thread(
+                target=self._cancel_worker, name="cutover-cancel", daemon=True)
+            self._cancel_thread.start()
+
+    def _cancel_worker(self) -> None:
+        try:
+            while True:
+                self._force_disconnect()
+                workers = self._live_workers()
+                if not workers:
+                    break
+                for worker in workers:
+                    worker.join(timeout=0.2)
+            # A connecting worker may have registered its session after the
+            # first disconnect attempt. Close again after every worker exited.
+            self._force_disconnect()
+            for sess in list(self.run.sessions.values()):
+                for ssh in (sess.ssh, sess.read_ssh, sess.bg_ssh):
+                    if ssh is not None:
+                        ssh.disconnect()
+                sess.connected = False
+            self.run.sessions.clear()
+            self.run.set_phase(RunPhase.CANCELLED, active_group="")
+            self._persist_checkpoint()
+            self._cancel_complete.set()
+            self.log("Cancelled — all Cut Over workers stopped and SSH sessions "
+                     "closed. Back is now available.")
+            self.emit(CutoverEvent(kind="cancel_done"))
+        except Exception as exc:
+            self.log(f"Cancellation could not be confirmed: {exc}. "
+                     "Back remains blocked; retry Cancel.")
+            self.run.touch()
+            self.emit(CutoverEvent(kind="progress"))
 
     def shutdown(self) -> None:
         self._persist_checkpoint()
@@ -1536,6 +1670,13 @@ class CutoverEngine:
         self._checkpoint_stop.set()
         self._checkpoint_event.set()
         self.run.cancel_event.set()
+        with self._bg_lock:
+            snapshots = list(self._snapshot_sessions.values())
+        for ssh in snapshots:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
         for gate in self._traffic_gate.values():
             gate["ok"] = False
             gate["event"].set()
@@ -1635,13 +1776,10 @@ class CutoverEngine:
 
     # ── internals ────────────────────────────────────────────────
     def _spawn(self, target, name: str) -> bool:
-        if not self._action_lock.acquire(blocking=False):
-            self.log("Another cut-over action is already running — ignoring.")
-            return False
-
         def _wrapped():
             try:
-                target()
+                if not self.run.is_cancelled():
+                    target()
             except Exception as exc:
                 logger.exception("Cut-over worker crashed")
                 self.log(f"✗ {name} crashed: {type(exc).__name__}: {exc}")
@@ -1650,12 +1788,27 @@ class CutoverEngine:
                 self._action_lock.release()
 
         t = threading.Thread(target=_wrapped, name=name, daemon=True)
-        self._threads.append(t)
-        t.start()
+        with self._cancel_lock:
+            if self.is_stopping():
+                self.log("Action blocked — cancellation is still in progress.")
+                return False
+            if not self._action_lock.acquire(blocking=False):
+                self.log("Another cut-over action is already running — ignoring.")
+                return False
+            self.run.cancel_event.clear()
+            self._threads.append(t)
+            t.start()
         return True
 
     def _force_disconnect(self) -> None:
         """Close channels so threads blocked in recv() unwind immediately."""
+        with self._bg_lock:
+            snapshots = list(self._snapshot_sessions.values())
+        for ssh in snapshots:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
         for sess in list(self.run.sessions.values()):
             for ssh in (sess.ssh, sess.read_ssh, sess.bg_ssh):
                 if ssh is None:
@@ -1679,15 +1832,15 @@ class CutoverEngine:
 
     def _save_preparation_log(self, node_name: str, step: str,
                               output: str) -> str:
-        """Persist one pre-Cut Over step output under a unique run folder."""
+        """Keep command execution captures in MOSHELL, not result folders."""
         safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", node_name) or "NODE"
         safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", step) or "STEP"
         post = getattr(self, "_hc_mode", "pre") == "post"
-        folder = os.path.join(self.log_dir, "POST") if post else self._run_dir
+        folder = os.path.join(self.log_dir, "MOSHELL")
         os.makedirs(folder, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = (f"{safe_node}_{safe_step}_{stamp}.log"
-                    if post else f"{safe_node}_{safe_step}.log")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        mode = "POST" if post else "PRE"
+        filename = f"CUTOVER_{safe_node}_{mode}_{safe_step}_{stamp}.log"
         path = os.path.join(folder, filename)
         with open(path, "w", encoding="utf-8", errors="replace") as handle:
             handle.write(output or "")
@@ -1796,7 +1949,12 @@ class CutoverEngine:
                         )
                         self.run.touch()
             if ok:
-                self.log(f"[{node_name}] ✓ {label} passed.")
+                if label == hc_label:
+                    self.log(f"[{node_name}] {label} script output saved; "
+                             "logfile download attempted. Waiting for the "
+                             "remaining nodes before completion popup.")
+                else:
+                    self.log(f"[{node_name}] ✓ {label} passed.")
             else:
                 all_ok = False
                 self.log(f"[{node_name}] ✗ {label} failed.")
@@ -1817,7 +1975,6 @@ class CutoverEngine:
         if not trfs.get("enabled", True):
             self.log("TRFS logging is disabled in config.")
             return
-        run.cancel_event.clear()
         missing = self._ensure_sessions()
         if missing:
             self.log(f"✗ TRFS: could not connect to {', '.join(missing)}.")
@@ -1875,7 +2032,8 @@ class CutoverEngine:
 
             self.log(f"[{node_name}] TRFS techs {techs} → {script}")
             ok, detail = run_cutover_trfs(
-                sess.ssh, node_name, script, local_dir, self.log, self.cfg)
+                sess.ssh, node_name, script, local_dir, self.log, self.cfg,
+                cancel_event=run.cancel_event)
             with results_lock:
                 results[node_name] = (ok, detail)
                 if ok:
@@ -2245,14 +2403,21 @@ class CutoverEngine:
                 ssh.set_live_sink(self._live_sink_factory(node_name))
             self.log(f"[{node_name}] connecting…")
             ssh.connect(timeout=30)
+            if self.run.is_cancelled():
+                ssh.disconnect()
+                return None
             sess.connected = True
             self.log(f"[{node_name}] entering AMOS…")
             ssh.enter_amos(node_name,
                            timeout=self.cfg["discovery"]["amos_timeout_s"])
             sess.in_amos = True
+            if self.run.is_cancelled():
+                ssh.disconnect()
+                return None
         except Exception as exc:
             sess.last_error = f"{type(exc).__name__}: {exc}"
             self.log(f"[{node_name}] ✗ connection failed: {sess.last_error}")
+            ssh.disconnect()
             return None
 
         # Second, read-only session for background status/traffic/VSWR polling,
@@ -2269,8 +2434,16 @@ class CutoverEngine:
                                                         node_name, m),
                 )
                 r.connect(timeout=30)
+                if self.run.is_cancelled():
+                    r.disconnect()
+                    ssh.disconnect()
+                    return None
                 r.enter_amos(node_name,
                              timeout=self.cfg["discovery"]["amos_timeout_s"])
+                if self.run.is_cancelled():
+                    r.disconnect()
+                    ssh.disconnect()
+                    return None
                 sess.read_ssh = r
                 self.log(f"[{node_name}] read-only status session ready "
                          f"(unlock and polling won't contend).")
@@ -2302,7 +2475,6 @@ class CutoverEngine:
 
     def _discovery_worker(self) -> None:
         run = self.run
-        run.cancel_event.clear()
         run.set_phase(RunPhase.PREPARING)
         self.log(f"Cut Over starting for {', '.join(run.node_names) or '(no nodes)'}")
         if self.cfg.get("dry_run"):
@@ -2503,8 +2675,8 @@ class CutoverEngine:
                 kind="posthc_done",
                 png_path=post_dir,
                 message=(f"Post HC completed on {len(run.sessions)} node(s). "
-                         "CV output, Post HC command logs, and downloaded "
-                         "Post_HC logfiles were saved."),
+                         "Downloaded Post_HC logfiles are in POST; command "
+                         "execution captures are in MOSHELL."),
             ))
 
         # A site can already be fully unlocked and carrying traffic before this
@@ -2933,7 +3105,6 @@ class CutoverEngine:
                 f"Unlock blocked: Cut Over is not READY (phase={run.phase.value})."
             )
             return
-        run.cancel_event.clear()
 
         targets = [g for g in groups if run.unlockable_cells_of(g, sector)]
         if not targets:
@@ -3039,7 +3210,6 @@ class CutoverEngine:
     def _relock_action(self, groups: list,
                        sector: Optional[str] = None) -> None:
         run = self.run
-        run.cancel_event.clear()
 
         if groups == [GSM]:
             self._relock_gsm(sector)
@@ -3120,8 +3290,6 @@ class CutoverEngine:
         currently-unlocked cell — not only ones this run unlocked — so a site
         that was already unlocked can be taken back down."""
         run = self.run
-        run.cancel_event.clear()
-
         if run.phase != RunPhase.READY:
             self.log(f"Lock blocked: Cut Over is not READY "
                      f"(phase={run.phase.value}).")
@@ -3325,7 +3493,7 @@ class CutoverEngine:
     def _start_group_logs(self, group: str, node_names) -> None:
         """Tee every byte of this group to a file — the audit trail that
         matters when someone asks what was unlocked on a production site."""
-        session_dir = os.path.join(self.log_dir, "CUTOVER")
+        session_dir = os.path.join(self.log_dir, "SESSION")
         try:
             os.makedirs(session_dir, exist_ok=True)
         except Exception:
@@ -3336,7 +3504,8 @@ class CutoverEngine:
                 continue
             try:
                 sess.ssh.start_step_log(os.path.join(
-                    session_dir, f"CUTOVER_{group}_{node_name}.log"))
+                    session_dir, f"CUTOVER_{group}_{node_name}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"))
             except Exception:
                 pass
 
@@ -3636,34 +3805,123 @@ class CutoverEngine:
                      f"session.")
 
     def _ensure_bg_monitor(self) -> None:
+        # Kept as the initial-discovery/recovery hook. Unlock clicks must not
+        # start another measurement pass once the initial snapshot was taken.
+        if not self.cfg["enable_poll"].get("background_monitor", True):
+            return
+        self._start_measurement_snapshot(initial=True)
+
+    def _start_measurement_snapshot(self, initial: bool) -> bool:
         with self._bg_lock:
             if self._bg_thread and self._bg_thread.is_alive():
-                return
+                return False
+            if initial and self._snapshot_initial_started:
+                return False
+            if not self.run.cells or self.run.is_cancelled():
+                return False
+            self._snapshot_initial_started = True
             self._bg_stop.clear()
             t = threading.Thread(target=self._bg_loop,
-                                 name="cutover-bg", daemon=True)
+                                 name="cutover-measurement-snapshot", daemon=True)
             self._bg_thread = t
             t.start()
+            return True
 
     def _bg_loop(self) -> None:
-        """Poll stzrc (traffic) + sdirc (VSWR) for every node, each on its own
-        interval, on the dedicated background session — independent of the fast
-        status monitor so status never waits on a slow read."""
+        """One measurement pass, parallel per node, then close every session."""
         run = self.run
-        while not self._bg_stop.is_set():
-            if run.cancel_event.is_set():
-                break
-            if run.phase not in self._MONITOR_ACTIVE_PHASES:
-                break
-            for node_name in {c.node_name for c in list(run.cells)}:
-                if self._bg_stop.is_set() or run.cancel_event.is_set():
-                    break
-                self._ensure_bg_session(node_name)
-                self._maybe_refresh_traffic(node_name)
-                self._maybe_refresh_vswr(node_name)
-            self._bg_stop.wait(5)
-        with self._bg_lock:
-            self._bg_thread = None
+        nodes = sorted({c.node_name for c in list(run.cells)})
+        results = {}
+        self.log("Traffic/VSWR snapshot starting — temporary sessions; "
+                 "traffic first, then VSWR per node.")
+        def _worker(node_name):
+            from integration_runner import IntegrationSSH
+            ssh = IntegrationSSH(
+                host=str(self.form.get("host", "")).strip(),
+                port=int(self.form.get("port", 5023) or 5023),
+                username=str(self.form.get("username", "")).strip(),
+                password=str(self.form.get("password", "")),
+                log_callback=lambda m: logger.debug("[%s:snapshot] %s", node_name, m))
+            with self._bg_lock:
+                self._snapshot_sessions[node_name] = ssh
+            try:
+                if self._bg_stop.is_set() or run.is_cancelled():
+                    return
+                self.log(f"[{node_name}] opening temporary traffic/VSWR session…")
+                ssh.connect(timeout=30)
+                ssh.enter_amos(node_name,
+                               timeout=self.cfg["discovery"]["amos_timeout_s"])
+                good = True
+                if not self._bg_stop.is_set() and not run.is_cancelled():
+                    try:
+                        self.log(f"[{node_name}] snapshot: reading traffic…")
+                        ok, _out, res = run_cutover_traffic(
+                            ssh, node_name, self.log, self.cfg)
+                        if ok and res is not None and res.ok:
+                            self._apply_traffic_snapshot(node_name, res)
+                        else:
+                            good = False
+                            self.log(f"[{node_name}] traffic unavailable — retaining last values.")
+                    except Exception as exc:
+                        good = False
+                        self.log(f"[{node_name}] traffic snapshot failed — "
+                                 f"retaining last values: {exc}")
+                if (self.cfg.get("vswr", {}).get("enabled", True)
+                        and not self._bg_stop.is_set() and not run.is_cancelled()):
+                    try:
+                        self.log(f"[{node_name}] snapshot: reading VSWR (sdirc)…")
+                        ok, _out, res = run_cutover_vswr(
+                            ssh, node_name, self.log, self.cfg)
+                        if ok:
+                            self._apply_vswr(node_name, res)
+                        else:
+                            good = False
+                            self.log(f"[{node_name}] VSWR unavailable — retaining last values.")
+                    except Exception as exc:
+                        good = False
+                        self.log(f"[{node_name}] VSWR snapshot failed — "
+                                 f"retaining last values: {exc}")
+                results[node_name] = good
+            except Exception as exc:
+                results[node_name] = False
+                self.log(f"[{node_name}] measurement session failed: {exc}")
+            finally:
+                try:
+                    ssh.disconnect()
+                finally:
+                    with self._bg_lock:
+                        self._snapshot_sessions.pop(node_name, None)
+                    self.log(f"[{node_name}] temporary traffic/VSWR session closed.")
+        threads = [threading.Thread(target=_worker, args=(node,), daemon=True)
+                   for node in nodes]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.log("Traffic/VSWR snapshot finished "
+                     f"({sum(results.values())}/{len(nodes)} nodes successful). "
+                     "Values are cached until Update Traffic & VSWR is clicked.")
+        finally:
+            with self._bg_lock:
+                self._bg_thread = None
+            self.emit(CutoverEvent(kind="progress"))
+
+    def _apply_traffic_snapshot(self, node_name, res) -> None:
+        mode = self.cfg["enable_poll"].get("match_mode", "suffix")
+        threshold = max(1, int(self.cfg["traffic"].get("ue_threshold", 1)))
+        for cell in list(self.run.cells):
+            if cell.node_name != node_name or cell.rat == "GSM":
+                continue
+            ue = ue_for_cell(res.counts, cell, mode=mode)
+            if ue is None:
+                continue
+            fields = dict(ue_count=ue, ue_peak=max(cell.ue_peak, ue))
+            if cell.is_live_enabled and ue >= threshold:
+                self.run.set_cell(cell, CellStatus.TRAFFIC_OK,
+                                  status_detail=f"traffic {ue} UE", **fields)
+            else:
+                self.run.set_cell(cell, **fields)
 
     _MONITOR_WATCH = (
         CellStatus.UNLOCK_SENT, CellStatus.WAITING_ENABLE,
@@ -3837,6 +4095,10 @@ class CutoverEngine:
         sess = run.sessions.get(node_name)
         if sess is None or sess.degraded:
             return
+        # Continuous slow polling must never occupy the primary action PTY.
+        # With no separate session, skip rather than delay/corrupt TRFS/Post HC.
+        if sess.bg_ssh is None and sess.read_ssh is None and not force:
+            return
         has_vswr_candidate = any(
             c.node_name == node_name
             and (c.rat == "GSM" or c.status in (
@@ -3876,6 +4138,8 @@ class CutoverEngine:
         run = self.run
         sess = run.sessions.get(node_name)
         if sess is None or sess.degraded:
+            return
+        if sess.bg_ssh is None and sess.read_ssh is None and not force:
             return
         has_enabled = any(
             c.node_name == node_name and c.rat != "GSM"
@@ -4194,8 +4458,8 @@ class CutoverEngine:
                             detail += f" ({samples}/{need_samples} samples)"
                         run.set_cell(c, status_detail=detail, **fields)
 
-                # VSWR (sdirc) alongside traffic, on its own long interval.
-                self._maybe_refresh_vswr(node_name)
+                # VSWR is a cached snapshot, refreshed only by its explicit
+                # initial/manual measurement pass, never by this traffic gate.
 
             pending = [c for c in targets if c.status == CellStatus.WAITING_TRAFFIC]
             if not pending:
@@ -4430,7 +4694,6 @@ class CutoverEngine:
                                    message="No verification configured."))
             return
 
-        run.cancel_event.clear()
         run.set_phase(RunPhase.FINAL_VERIFY)
         self.log("── Post-cutover verification ──")
 

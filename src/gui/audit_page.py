@@ -741,6 +741,30 @@ class AuditPage:
             except Exception as exc:
                 self._log(f"EN-DC external check failed: {exc}")
 
+            # Co-located NR X2 IP on every LTE anchor, including LTE-only BBs.
+            from audit.termpoint_audit import audit_termpoint_to_gnb
+            tp = audit_termpoint_to_gnb(records, nodes=nodes)
+            results += tp
+            tpc = Counter(r.status for r in tp)
+            from audit.power_audit import audit_power_license
+            power_results, power_evidence = audit_power_license(records, nodes=nodes)
+            results += power_results
+            power_counts = Counter(r.status for r in power_results)
+            from audit.bandwidth_audit import audit_bandwidth_license
+            bandwidth_results = audit_bandwidth_license(records, nodes=nodes)
+            results += bandwidth_results
+            bandwidth_counts = Counter(r.status for r in bandwidth_results)
+            self._log(f"Bandwidth license: {bandwidth_counts['Match']} sufficient, "
+                      f"{bandwidth_counts['Mismatch']} insufficient, "
+                      f"{bandwidth_counts['NotFound']} unresolved.")
+            self._log(f"Power license: {power_counts['Match']} sufficient, "
+                      f"{power_counts['Mismatch']} insufficient, "
+                      f"{power_counts['NotFound']} unresolved.")
+            self._log(
+                f"TermPointToGNB: {tpc['Match']} match, "
+                f"{tpc['Mismatch']} mismatch, "
+                f"{tpc['NotFound'] + tpc['MO_NotFound']} unresolved.")
+
             # Feature compliance: condition (8T8R/4T4R/NR/AAS/LTE/ESS) → the
             # CXC features that must be ACTIVATED+ENABLED, else DEACTIVATED.
             try:
@@ -925,7 +949,8 @@ class AuditPage:
                 "Mode": "Batch / Cluster" if is_batch else "Single site",
                 "Generated": ts,
             }, lld_results=lld_results, cell_rows=cell_rows,
-                ess_rows=ess_rows)
+                ess_rows=ess_rows, power_results=power_results,
+                power_evidence=power_evidence)
             self._result_path = out
             self._results = results
             self._gen_ctx = {"site": label, "out_dir": out_dir, "xlsx": out}
@@ -938,6 +963,9 @@ class AuditPage:
                 f"Done — {c['Mismatch']} mismatch, "
                 f"{c['NotFound']+c['MO_NotFound']} not found.{lld_tail}")
             clean = c["Mismatch"] == 0 and lc["Mismatch"] == 0 and lc["NotFound"] == 0
+            clean = clean and not (tpc["NotFound"] or tpc["MO_NotFound"])
+            clean = clean and not power_counts["NotFound"]
+            clean = clean and not bandwidth_counts["NotFound"]
             self.status_text.color = SUCCESS if clean else ACCENT_WARM
             self.open_btn.visible = True
             self.gen_btn.visible = c["Mismatch"] > 0
@@ -1630,6 +1658,12 @@ class AuditPage:
 
             # cmedit files first (per-line via cli.py), independent of the
             # mobatch/moshell path used for .mos.
+            from app_path import get_app_dir
+            session_dir = os.path.join(get_app_dir(), "LOG", safe, "SESSION")
+            os.makedirs(session_dir, exist_ok=True)
+            ssh.start_step_log(os.path.join(
+                session_dir, f"AUDIT_RUN_SCRIPTS_{safe}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"))
             if cmedit_files:
                 cok = cfail = 0
                 for p in cmedit_files:
@@ -1658,7 +1692,7 @@ class AuditPage:
                 local_logs_dir = os.path.join(out_dir, "MOBATCH_LOGS", stamp or safe)
                 self._log(f"Downloading mobatch logs → {local_logs_dir} ...")
                 local_files = download_remote_dir(ssh, logdir, local_logs_dir,
-                                                  self._log)
+                                                 self._log, filename_prefix="AUDIT")
                 logs = [p for p in local_files if p.lower().endswith(".log")]
                 if logs:
                     try:
@@ -1706,6 +1740,7 @@ class AuditPage:
             self._stop_timer()
             if ssh is not None:
                 try:
+                    ssh.stop_step_log()
                     ssh.disconnect()
                 except Exception:
                     pass

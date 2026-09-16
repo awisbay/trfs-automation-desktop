@@ -316,7 +316,7 @@ class IntegrationSSH:
         if remote_path:
             self._remote_logs.append((remote_path, subfolder))
 
-    def drain_remote_logs(self, moshell_dir: str) -> list[str]:
+    def drain_remote_logs(self, moshell_dir: str, filename_prefix: str = "") -> list[str]:
         """Download all queued remote logs into `moshell_dir` (or a subfolder)
         and clear the queue.
 
@@ -338,7 +338,13 @@ class IntegrationSSH:
                 os.makedirs(target_dir, exist_ok=True)
             except Exception:
                 pass
-            local = os.path.join(target_dir, os.path.basename(remote))
+            name = os.path.basename(remote)
+            if filename_prefix:
+                # Preserve the original suffix used by relation/baseline
+                # parsers; do not duplicate a workflow prefix already present.
+                if not name.upper().startswith(filename_prefix.upper() + "_"):
+                    name = f"{filename_prefix}_{time.time_ns()}_{name}"
+            local = os.path.join(target_dir, name)
             try:
                 self.sftp_download(remote, local)
                 downloaded.append(local)
@@ -671,6 +677,7 @@ class IntegrationSSH:
         remote_parent: str,
         local_parent: str,
         name_prefix: str = "",
+        progress_cb: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
         """Download the NEWEST subdirectory under ``remote_parent`` whose name
         starts with ``name_prefix``, recursively, into ``local_parent``.
@@ -680,13 +687,19 @@ class IntegrationSSH:
         Returns the local folder path, or ``None`` (no exception) on failure."""
         import stat as _stat
 
+        def _progress(message):
+            if progress_cb is not None:
+                progress_cb(message)
+
         try:
+            _progress("opening SFTP connection…")
             sftp = self.client.open_sftp()
         except Exception as exc:
             self._log(f"[trfs-log] cannot open SFTP: {exc}")
             return None
         try:
             try:
+                _progress(f"searching for the newest log folder under {remote_parent}…")
                 entries = sftp.listdir_attr(remote_parent)
             except Exception as exc:
                 self._log(f"[trfs-log] cannot list {remote_parent}: {exc}")
@@ -706,6 +719,9 @@ class IntegrationSSH:
             newest = max(dirs, key=lambda e: getattr(e, "st_mtime", 0) or 0)
             remote_dir = f"{remote_parent.rstrip('/')}/{newest.filename}"
             local_dir = os.path.join(local_parent, newest.filename)
+            _progress(f"downloading folder {newest.filename} → {local_dir}")
+            transferred = [0]
+            last_progress = [time.monotonic()]
 
             def _walk(rdir: str, ldir: str) -> int:
                 count = 0
@@ -718,9 +734,15 @@ class IntegrationSSH:
                     else:
                         sftp.get(rpath, lpath)
                         count += 1
+                        transferred[0] += 1
+                        if time.monotonic() - last_progress[0] >= 5:
+                            _progress(f"{transferred[0]} file(s) downloaded; "
+                                      f"last completed: {item.filename}")
+                            last_progress[0] = time.monotonic()
                 return count
 
             files = _walk(remote_dir, local_dir)
+            _progress(f"download complete: {files} file(s) → {local_dir}")
             self._log(
                 f"[trfs-log] downloaded {newest.filename} "
                 f"({files} file(s)) -> {local_dir}"
@@ -1629,7 +1651,7 @@ def _set_controlling_bsc(
             _os.makedirs(moshell_dir, exist_ok=True)
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", node_name)
             path = _os.path.join(
-                moshell_dir, f"CONTROLLING_BSC_{safe}.log"
+                moshell_dir, f"INTEGRATION_CONTROLLING_BSC_{safe}_{time.time_ns()}.log"
             )
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(_trace) + "\n")
@@ -5338,7 +5360,7 @@ def run_mobatch_scripts(ssh: IntegrationSSH, node_files: list, stamp: str,
 
 
 def download_remote_dir(ssh: IntegrationSSH, remote_dir: str, local_dir: str,
-                        log_cb: Callable[[str], None]) -> list:
+                        log_cb: Callable[[str], None], filename_prefix: str = "") -> list:
     """Recursively SFTP-download every file under ``remote_dir`` into
     ``local_dir`` (flattened structure preserved). Returns local file paths."""
     import os as _os
@@ -5359,6 +5381,9 @@ def download_remote_dir(ssh: IntegrationSSH, remote_dir: str, local_dir: str,
             if S_ISDIR(ent.st_mode):
                 _walk(rp, lp)
             else:
+                if filename_prefix:
+                    lp = _os.path.join(
+                        ldir, f"{filename_prefix}_{time.time_ns()}_{ent.filename}")
                 try:
                     sftp.get(rp, lp)
                     downloaded.append(lp)

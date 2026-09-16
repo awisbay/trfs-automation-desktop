@@ -564,10 +564,19 @@ check("preparation order", prep_calls == ["CV", "MODUMP", "PREHC"],
       str(prep_calls))
 check("preparation permits READY only after all pass",
       eng14.run.phase == RunPhase.READY, str(eng14.run.phase))
-prep_root = os.path.join(tmpdir, "PRE_CUTOVER", eng14._preparation_started_at)
+# Command-execution captures live in MOSHELL/ (not the PRE_CUTOVER result
+# folder), as CUTOVER_<node>_<PRE|POST>_<step>_<timestamp>.log, and each path is
+# recorded in run.artifacts so recovery can find it.
+moshell_dir = os.path.join(tmpdir, "MOSHELL")
+_mos = os.listdir(moshell_dir) if os.path.isdir(moshell_dir) else []
 check("preparation logs persisted",
-      all(os.path.exists(os.path.join(prep_root, f"NODEA_{step}.log"))
-          for step in ("CREATE_CV", "MODUMP", "PREHC")), prep_root)
+      all(any(n.startswith(f"CUTOVER_NODEA_PRE_{step}_") and n.endswith(".log")
+              for n in _mos)
+          for step in ("CREATE_CV", "MODUMP", "PREHC")), str(_mos))
+check("preparation log paths recorded in artifacts",
+      all(os.path.exists(eng14.run.artifacts.get(f"NODEA:{step}", ""))
+          for step in ("CREATE_CV", "MODUMP", "PREHC")),
+      str({k: v for k, v in eng14.run.artifacts.items() if k.startswith("NODEA:")}))
 
 fake14b = FakeSSH()
 eng14b = build_engine(tmpdir, fake14b)

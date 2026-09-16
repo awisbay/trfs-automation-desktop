@@ -161,6 +161,20 @@ def main(page: ft.Page):
 
     def route_change(e):
         route = page.route or "/"
+        controller = getattr(page, "cutover_controller", None)
+        if (controller is not None and not controller._finished
+                and page.views and page.views[-1].route == "/cutover"
+                and route != "/cutover"):
+            if not controller.engine.can_leave():
+                controller._alert(
+                    "Navigation blocked",
+                    "Click Cancel and wait until all Cut Over processes and "
+                    "SSH sessions have stopped before leaving this page.")
+                page.go("/cutover")
+                return
+            controller._finished = True
+            controller.engine.shutdown()
+            page.cutover_controller = None
         # Guard against duplicate route_change firings for the SAME
         # route. Flet can fire on_route_change redundantly; without
         # this, /integration_run would be built twice — spawning a
@@ -178,6 +192,10 @@ def main(page: ft.Page):
         page.update()
 
     def view_pop(e):
+        controller = getattr(page, "cutover_controller", None)
+        if controller is not None and not controller._finished:
+            controller._on_back(e)
+            return
         print(f"[VIEW_POP] fired, views={len(page.views)}")
         page.views.pop()
         if page.views:

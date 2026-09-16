@@ -1405,7 +1405,8 @@ class IntegrationRunPage:
     def _save_step_log(self, step_number: int, node_name: str,
                        log_suffix: str, node_tag: str = "lte"):
         """Save per-node session log snapshot to LOG/<SHORTCODE>/SESSION/."""
-        filename = f"{step_number:02d}_{node_name}_{log_suffix}.txt"
+        filename = (f"INTEGRATION_{step_number:02d}_{node_name}_{log_suffix}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.txt")
         session_dir = os.path.join(self.log_dir, "SESSION")
         os.makedirs(session_dir, exist_ok=True)
         filepath = os.path.join(session_dir, filename)
@@ -2966,7 +2967,8 @@ class IntegrationRunPage:
                 os.makedirs(session_dir, exist_ok=True)
                 session_log_path = os.path.join(
                     session_dir,
-                    f"SESSION_{key.upper()}_{node_name}.log",
+                    f"INTEGRATION_SESSION_{key.upper()}_{node_name}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log",
                 )
                 try:
                     ssh.start_step_log(session_log_path)
@@ -2981,7 +2983,8 @@ class IntegrationRunPage:
                         .replace(" ", "_")
                     )
                     remote_step_log_path = (
-                        f"/home/shared/{ssh.username}/{key.upper()}_{safe_node}.log"
+                        f"/home/shared/{ssh.username}/INTEGRATION_{key.upper()}_"
+                        f"{safe_node}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
                     )
                     try:
                         ssh.run_amos_command_safe(
@@ -3521,7 +3524,8 @@ class IntegrationRunPage:
                     # during this step into LOG/{SHORTCODE}/MOSHELL/
                     try:
                         moshell_dir = os.path.join(self.log_dir, "MOSHELL")
-                        downloaded = ssh.drain_remote_logs(moshell_dir)
+                        downloaded = ssh.drain_remote_logs(
+                            moshell_dir, filename_prefix="INTEGRATION")
                         if downloaded:
                             ui_cb(
                                 f"Downloaded {len(downloaded)} moshell log "
@@ -3667,7 +3671,8 @@ class IntegrationRunPage:
                                                    node_name)
                                     _raw = os.path.join(
                                         self.log_dir, "MOSHELL",
-                                        f"BASELINE_{_safe}.log")
+                                        f"INTEGRATION_BASELINE_{_safe}_"
+                                        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
                                     _got = ssh.fetch_and_purge_baseline_logs(
                                         node_name, _raw)
                                     if _got:

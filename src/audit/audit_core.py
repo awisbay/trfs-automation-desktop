@@ -1818,8 +1818,12 @@ def _write_cell_inventory_sheet(ws, rows: List["CellInvRow"]) -> None:
 def write_excel(results: List[AuditResult], out_path: str, meta: dict,
                 lld_results: Optional[List["LldResult"]] = None,
                 cell_rows: Optional[List["CellInvRow"]] = None,
-                ess_rows: Optional[list] = None) -> str:
+                ess_rows: Optional[list] = None,
+                power_results=None, power_evidence=None) -> str:
     wb = Workbook()
+    if power_results is not None:
+        from .power_audit import write_power_sheets
+        write_power_sheets(wb, power_results, power_evidence or [])
 
     # Summary sheet
     summ = wb.active
@@ -1905,7 +1909,8 @@ def _banner(name: str) -> str:
 # a real settable attribute on the node's AbisIp MO, so its Mismatch rows carry
 # the full FDN + clean IP and ARE generated (see broker_check).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
-                            "consistency", "endc", "chain", "feature"}
+                            "consistency", "endc", "chain", "feature",
+                            "termpoint-gnb", "power-license", "bandwidth-license"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

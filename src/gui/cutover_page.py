@@ -92,6 +92,14 @@ _W_STATE = 150
 _W_TRAFFIC = 64
 
 
+def _sector_all_unlocked(cells) -> bool:
+    """Only confirmed administrative unlock/ACTIVE counts, not a zero target count."""
+    return bool(cells) and all(
+        (cell.geran_state or "").upper() == "ACTIVE" if cell.rat == "GSM"
+        else (cell.admin_state or "").upper() == "UNLOCKED"
+        for cell in cells)
+
+
 class _CellRow:
     """One cell: status icon, node, MO, band chip, state, UE count, VSWR."""
 
@@ -534,6 +542,7 @@ class CutOverPage:
             wait_for_user=self._ask_continue,
         )
         self.run = self.engine.run
+        self.page.cutover_controller = self
 
         self._rows: dict = {}          # cell key -> _CellRow
         self._sections: dict = {}      # group name -> _GroupSection
@@ -604,12 +613,16 @@ class CutOverPage:
         )
         self.cancel_btn = ft.OutlinedButton(
             "Cancel", icon=ft.Icons.STOP_CIRCLE_OUTLINED,
+            tooltip="Stop monitoring and running actions; close all SSH sessions. "
+                    "Does not roll back cells.",
             style=ft.ButtonStyle(color=DANGER,
+                                 mouse_cursor=ft.MouseCursor.CLICK,
+                                 overlay_color=ft.Colors.with_opacity(0.20, DANGER),
                                  side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, DANGER)),
                                  shape=ft.RoundedRectangleBorder(radius=12)),
             on_click=self._on_cancel,
         )
-        back_btn = ft.OutlinedButton(
+        self.back_btn = ft.OutlinedButton(
             "Back", icon=ft.Icons.ARROW_BACK,
             style=ft.ButtonStyle(color=TEXT_MUTED,
                                  side=ft.BorderSide(1, BORDER),
@@ -634,7 +647,7 @@ class CutOverPage:
                 self.post_hc_btn,
                 self.start_unlock_btn,
                 self.cancel_btn,
-                back_btn,
+                self.back_btn,
             ],
             spacing=12,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -727,11 +740,18 @@ class CutOverPage:
                                  padding=ft.Padding.symmetric(horizontal=18, vertical=14)),
             on_click=self._on_relock_all,
         )
+        self.measurements_btn = ft.OutlinedButton(
+            "Update Traffic & VSWR", icon=ft.Icons.REFRESH, disabled=True,
+            tooltip="Open temporary sessions per node, read traffic then VSWR, "
+                    "and close them. Displayed values remain cached until refreshed.",
+            style=ft.ButtonStyle(color=ACCENT),
+            on_click=self._on_update_measurements,
+        )
         self.summary_text = ft.Text("", size=12, color=TEXT_MUTED)
 
         action_bar = ft.Row(
             [*self.sector_unlock_btns.values(), self.unlock_all_btn,
-             self.verify_btn, self.relock_all_btn,
+             self.verify_btn, self.relock_all_btn, self.measurements_btn,
              ft.Container(width=8), self.summary_text],
             spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True,
             run_spacing=10,
@@ -879,6 +899,12 @@ class CutOverPage:
                 pass
 
         run = self.run
+        lifecycle = (self.engine.is_stopping(), self.engine.can_leave(),
+                     self.engine.measurements_busy())
+        if lifecycle != getattr(self, "_last_lifecycle", None):
+            self._last_lifecycle = lifecycle
+            self._refresh_chrome()
+            dirty = True
         with run.lock:
             changed = run.version != self._last_version
             keys = set(run.dirty_cells)
@@ -945,7 +971,7 @@ class CutOverPage:
 
     def _refresh_chrome(self) -> None:
         run = self.run
-        busy = self.engine.is_busy()
+        busy = self.engine.is_busy() or self.engine.is_stopping()
 
         for name, section in self._sections.items():
             section.set_counts(
@@ -988,13 +1014,41 @@ class CutOverPage:
         for sector, button in self.sector_unlock_btns.items():
             count = sum(len(run.unlockable_cells_of(group, sector))
                         for group in global_groups)
-            exists = any(c.sector == sector and c.group in global_groups
-                         for c in run.cells)
+            sector_cells = [c for c in run.cells
+                            if c.sector == sector and c.group in global_groups]
+            exists = bool(sector_cells)
+            all_unlocked = _sector_all_unlocked(sector_cells)
             button.visible = exists
             button.disabled = busy or run.phase != RunPhase.READY or count == 0
+            label = (f"S{sector} — Unlocked" if all_unlocked
+                     else f"Unlock S{sector}" if count else f"S{sector} — Unavailable")
+            accent = SUCCESS if all_unlocked else ACCENT
+            foreground = (accent if all_unlocked or not button.disabled else TEXT_MUTED)
+            # Explicit content avoids stale icon/text when Flet rerenders a
+            # disabled button; green denotes UNLOCKED, not necessarily ENABLED.
+            button.icon = None
+            button.content = ft.Row(
+                [ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE if all_unlocked
+                         else ft.Icons.LOCK_OPEN_ROUNDED, color=foreground, size=18),
+                 ft.Text(label, color=foreground)],
+                spacing=8, tight=True,
+            )
+            button.style = ft.ButtonStyle(
+                color={ft.ControlState.DEFAULT: accent,
+                       ft.ControlState.DISABLED: foreground},
+                bgcolor=ft.Colors.with_opacity(0.10, SUCCESS) if all_unlocked else None,
+                side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, accent)),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=14, vertical=14),
+            )
             button.tooltip = (
-                f"Unlock {count} cell(s) in S{sector} across LB, MB, HB and GSM; "
-                "other sectors are not touched"
+                f"All {len(sector_cells)} cell(s) in S{sector} are already unlocked; "
+                "no unlock command is needed. Operational state is shown per cell."
+                if all_unlocked else
+                f"Unlock the remaining {count} cell(s) in S{sector} across LB, MB, HB "
+                "and GSM; already-unlocked cells and other sectors are not touched."
+                if count else
+                f"S{sector} has no eligible unlock targets; review the individual cell states."
             )
         self.verify_btn.disabled = busy or not discovered
         self.relock_all_btn.visible = any_relockable > 0
@@ -1003,7 +1057,10 @@ class CutOverPage:
             f"Lock the {any_relockable} cell(s) this run unlocked. "
             f"Cells already in service before this run are not touched."
         )
-        self.cancel_btn.disabled = not busy
+        stopping = self.engine.is_stopping()
+        self.cancel_btn.disabled = not self.engine.can_cancel()
+        self.cancel_btn.content = ft.Text("Cancelling…" if stopping else "Cancel")
+        self.back_btn.disabled = stopping
         self.start_hc_btn.disabled = (
             busy or run.phase != RunPhase.IDLE
             or bool(self.engine.recovery_checkpoint)
@@ -1020,6 +1077,11 @@ class CutOverPage:
         reconciling = run.phase == RunPhase.RECOVERING
         self.trfs_btn.disabled = busy or reconciling
         self.post_hc_btn.disabled = busy or reconciling
+        measuring = self.engine.measurements_busy()
+        self.measurements_btn.disabled = (
+            measuring or reconciling or not run.cells or run.is_cancelled())
+        self.measurements_btn.content = ft.Text(
+            "Updating Traffic & VSWR…" if measuring else "Update Traffic & VSWR")
 
         phase_text = {
             RunPhase.IDLE: (
@@ -1039,6 +1101,8 @@ class CutOverPage:
             RunPhase.FAILED: run.error or "Failed",
         }.get(run.phase, str(run.phase))
         self.status_text.value = phase_text
+        if stopping:
+            self.status_text.value = "Cancelling — waiting for all workers and SSH sessions to stop…"
         self.status_text.color = (
             DANGER if run.phase == RunPhase.FAILED else
             SUCCESS if run.phase == RunPhase.DONE else ACCENT
@@ -1050,7 +1114,7 @@ class CutOverPage:
             total = len(traffic_cells)
             ok = sum(1 for c in traffic_cells if c.is_carrying_traffic)
             unmapped = len(run.cells_of(UNMAPPED))
-            parts = [f"{ok}/{total} cell(s) carrying traffic"]
+            parts = [f"{ok}/{total} cell(s) carrying traffic (last snapshot)"]
             if unmapped:
                 parts.append(f"{unmapped} in an unmapped band (never unlocked)")
             self.summary_text.value = " · ".join(parts)
@@ -1069,6 +1133,9 @@ class CutOverPage:
             self._trfs_done_dialog(event)
         elif event.kind == "posthc_done":
             self._posthc_done_dialog(event)
+        elif event.kind == "cancel_done":
+            self._refresh_chrome()
+            self.status_text.value = "Cancelled — all processes stopped; you can click Back."
 
     def _posthc_done_dialog(self, event) -> None:
         """Show the final Post HC folder only after the whole action finishes."""
@@ -1093,7 +1160,7 @@ class CutOverPage:
             actions.append(ft.TextButton("Open folder", on_click=_open))
         dlg = ft.AlertDialog(
             modal=False,
-            title=ft.Text("Post HC completed", color=SUCCESS),
+            title=ft.Text("Post HC finished — review results", color=TEXT),
             content=body,
         )
         actions.append(ft.TextButton("OK", on_click=lambda e: self._close_dialog(dlg)))
@@ -1284,7 +1351,9 @@ class CutOverPage:
         )
         with self._dialog_lock:
             self._show_dialog(dlg)
-            done.wait()
+            while not done.wait(0.2):
+                if self.run.cancel_event.is_set():
+                    _resolve(False)
         return result["ok"]
 
     def _ask_continue(self, message: str) -> bool:
@@ -1311,7 +1380,9 @@ class CutOverPage:
         )
         with self._dialog_lock:
             self._show_dialog(dlg)
-            done.wait()
+            while not done.wait(0.2):
+                if self.run.cancel_event.is_set():
+                    _resolve(False)
         return result["ok"]
 
     # ── dialog plumbing (Flet 0.84 dialog stack) ─────────────────
@@ -1357,6 +1428,11 @@ class CutOverPage:
         """Health check: run preparation (CV backup + preHC) and discovery, but
         skip the slow modump capture."""
         self.engine.start_discovery(skip_modump=True)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_update_measurements(self, e) -> None:
+        self.engine.refresh_traffic_vswr()
         self._refresh_chrome()
         self.page.update()
 
@@ -1423,13 +1499,19 @@ class CutOverPage:
 
     def _on_cancel(self, e) -> None:
         self.engine.cancel()
-        self.status_text.value = "Cancelling…"
+        self._refresh_chrome()
         self.page.update()
 
     def _on_back(self, e) -> None:
+        if not self.engine.can_leave():
+            self._alert("Back blocked",
+                        "Click Cancel first and wait until all Cut Over processes "
+                        "and SSH sessions have stopped before clicking Back.")
+            return
         self._finished = True
         try:
             self.engine.shutdown()
         except Exception:
             pass
+        self.page.cutover_controller = None
         self.page.go("/form")
