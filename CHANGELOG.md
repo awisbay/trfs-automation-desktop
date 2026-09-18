@@ -4,6 +4,66 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.15.0] - 2026-09-18
+
+### Added
+- **External radio sharing audit:** compare `isSharedWithExternalNE` with LLD
+  RI-port declarations, resolved radio FRUs/serials and synchronization evidence.
+  Incomplete or contradictory evidence is reported as unresolved. Report-only;
+  no parameter changes or restarts are generated.
+- **All evidence:** capture `alt`, `st cell` and `stzr` together, with node-level
+  views for All, Part 1 (alarms + cell status), and Part 2 (traffic).
+- **VSWR evidence:** preview and copy the cached sdir summary from the last
+  measurement refresh without sending new node commands. Includes capture time,
+  fiber checks, link rates, optical loss, BER when needed, and RF-port VSWR.
+
+### Changed
+- Restore direct sector unlock buttons in the Cells panel.
+- Evidence selection previews only; the Copy button explicitly copies an image.
+- BSC traffic offers sector selection followed by individual cell images.
+- Traffic offers node selection followed by FRU/alarm and LTE/NR-cell parts.
+- Combined evidence width follows the traffic table; Alarms width is capped at
+  1800 pixels. Full raw text remains available in companion TXT files.
+- Larger evidence font; disabled/enabled states, IPv4 addresses and sdir summary
+  statuses use terminal colors. Remove added new-alarm commentary from images.
+- Missing AAS VSWR is not treated as unreadable; positive/negative optical-loss
+  digits align using a dedicated sign position.
+- Evidence filenames include microseconds to avoid same-second collisions.
+
+## [1.14.0] - 2026-09-18
+
+### Added
+- **Cut Over evidence → WhatsApp.** New EVIDENCE buttons — **Alarms** (`alt`),
+  **Cell status** (`st cell`), **Traffic** (`stzrc`) — run the command on every
+  node **in parallel** on the already-open session (no new login), render a
+  terminal-style image per node plus one combined, save PNG + TXT under
+  `LOG/<site>/EVIDENCE/`, and copy the image to the clipboard so it can be pasted
+  straight into WhatsApp. The result dialog has a tab per node (All | B01 | B03…),
+  each with Copy and Open folder. Cell status / Traffic skip GSM-only basebands.
+- **BSC traffic (`rlcrp`).** From the ENM scripting VM the tool SSHes to the
+  site's BSC with the ENM user/password, enters MML and runs
+  `rlcrp:cell=<cell>;` for every GSM cell, with image tabs per sector (All | S1 |
+  S2 | S3). The BSC is read from the GeranCell FDN; its IP comes from
+  `cutover.bsc_traffic.ip_map` in `config.json` (MINBS01 preset). Busy TCH per
+  cell fills the GSM rows' Traffic column. The password never reaches a log.
+- **Live alarm strip** under the title: one chip per node with the active alarm
+  count and how many are **new since the cut over started** (red), refreshed on
+  demand (↻) or by the Alarms evidence; clicking a chip opens that node's tab.
+
+### Changed
+- **Cut Over layout reorganised by workflow** so the page reads left → right:
+  **PREPARE** (Start, Pre HC) · **EVIDENCE → WhatsApp** (Alarms, Cell status,
+  Traffic, BSC traffic) · **FINISH** (Post HC, TRFS Log, Verify); Cancel and
+  Back sit alone at the top right. "Start Unlock" is now **Start**, the first
+  (and, until cells are found, the only highlighted) action. Bulk actions that
+  span every group (Unlock all, Unlock S1/S2/S3 everywhere, Roll back all) moved
+  into one **All groups** menu above the cell list, next to **Refresh traffic &
+  VSWR**; the per-group Evidence button is replaced by the site-wide evidence.
+  Groups with no cells are hidden once discovery has run.
+- Evidence images never wrap a line: the image widens to the longest line, and
+  progress dots / echoed prompts / control characters are dropped, matching the
+  TRFS capture style.
+
 ## [1.13.0] - 2026-09-18
 
 ### Added

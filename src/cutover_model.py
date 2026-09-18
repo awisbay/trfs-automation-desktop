@@ -179,6 +179,10 @@ class CutoverCell:
     gsm_fdn: str = ""
     #: GSM only — the BSC GeranCell state (``ACTIVE`` / ``HALTED`` / …).
     geran_state: str = ""
+    #: GSM only — busy traffic channels (TCH in STATE BUSY) from the last BSC
+    #: ``rlcrp`` printout, and when it was taken. ``None`` = not read yet.
+    gsm_busy_tch: Optional[int] = None
+    gsm_busy_tch_at: str = ""
 
     # ── pre-state (captured before we send anything) ─────────────
     #: True if this cell was ALREADY unlocked when the run started. Such a cell
@@ -418,6 +422,11 @@ class CutoverEvent:
     png_path: str = ""
     caption: str = ""
     message: str = ""
+    #: Evidence dialogs: ordered ``[(tab_label, png_path), …]`` — first tab is
+    #: the combined image.
+    images: list = field(default_factory=list)
+    #: False for a background refresh (alarm strip) — update, don't pop up.
+    show: bool = True
 
 
 @dataclass
@@ -440,6 +449,9 @@ class CutoverRun:
     #: node -> raw `alt` output captured before the first unlock, so the
     #: evidence can show alarms this cut over actually caused.
     alarm_baseline: dict = field(default_factory=dict)
+    #: Live alarm strip, refreshed manually: node -> {"total": int,
+    #: "new": int, "by_severity": dict, "at": "HH:MM:SS", "error": str}.
+    alarm_status: dict = field(default_factory=dict)
     #: Paths only; raw outputs stay in separate files so the structured
     #: checkpoint and final manifest remain compact.
     artifacts: dict = field(default_factory=dict)

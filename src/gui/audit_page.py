@@ -854,6 +854,14 @@ class AuditPage:
                 else:
                     self._log(f"⚠ LLD file not found: {lld}")
 
+            from audit.radio_sharing_audit import audit_radio_sharing
+            sharing_results = audit_radio_sharing(
+                records, nodes=nodes, lld_path=lld or None, log=self._log)
+            results += sharing_results
+            sc = Counter(x.status for x in sharing_results)
+            self._log(f"Radio sharing: Match={sc['Match']} Mismatch={sc['Mismatch']} "
+                      f"NotFound={sc['NotFound']}")
+
             # ESS (LTE/NR spectrum sharing) — pairs from the LTE CDD's ESS sheet
             # vs the node dump. Own 'ESS' sheet in the report.
             ess_rows = []

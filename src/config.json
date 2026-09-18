@@ -260,6 +260,31 @@
       ]
     },
     "_comment_alarm": "baseline_before_unlock captures `alt` before the first unlock so the evidence can separate alarms this cut over caused from ones the site already had.",
+    "_comment_capture": "Evidence buttons (Alarms / Cell status / Traffic): the command runs on every node in parallel on the already-open session; a terminal-style PNG per node + one combined is saved under LOG/<site>/<subdir>/ and copied to the clipboard for WhatsApp. Lines are never wrapped; max_width only caps extreme cases.",
+    "capture": {
+      "commands": {
+        "alarms": "alt",
+        "cell_status": "st cell",
+        "traffic": "stzrc"
+      },
+      "timeout_s": {
+        "alarms": 120,
+        "cell_status": 90,
+        "traffic": 300
+      },
+      "subdir": "EVIDENCE",
+      "max_width": 4000
+    },
+    "_comment_bsc_traffic": "BSC traffic evidence: ssh from the ENM scripting VM to the BSC with the ENM user/password, `mml`, then `rlcrp:cell=<cell>;` for every GSM cell (images per sector). The site's BSC is read from the GeranCell FDN (MeContext=...); add each BSC's IP to ip_map (name -> IP, case-insensitive).",
+    "bsc_traffic": {
+      "enabled": true,
+      "ip_map": {
+        "MINBS01": "10.14.204.197"
+      },
+      "ssh_port": 22,
+      "login_timeout_s": 45,
+      "cell_timeout_s": 90
+    },
     "alarm": {
       "command": "alt",
       "command_timeout_s": 120,

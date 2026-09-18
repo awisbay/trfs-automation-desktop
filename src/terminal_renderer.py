@@ -12,7 +12,56 @@ logger = logging.getLogger(__name__)
 
 # ANSI escape code regex for stripping
 import re
+import ipaddress
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]")
+
+HIGHLIGHT_TOKENS = re.compile(
+    r'\b(?:DISABLED|ENABLED)\b|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])')
+
+
+def terminal_text_runs(line, default_color):
+    """Preserve every character; color only exact states and valid IPv4s."""
+    runs, start = [], 0
+    for match in HIGHLIGHT_TOKENS.finditer(line):
+        token = match.group()
+        color = {'DISABLED': (255, 235, 59), 'ENABLED': (80, 250, 123)}.get(token)
+        if color is None:
+            try:
+                ipaddress.IPv4Address(token)
+                color = (230, 100, 255)
+            except ValueError:
+                continue
+        if match.start() > start:
+            runs.append((line[start:match.start()], default_color))
+        runs.append((token, color))
+        start = match.end()
+    if start < len(line):
+        runs.append((line[start:], default_color))
+    return runs
+
+
+def ansi_text_runs(line, default_color):
+    """Use explicit summary colors, with normal token highlighting elsewhere."""
+    colors = {31: (255, 90, 90), 32: (80, 250, 123),
+              33: (255, 235, 59), 36: (100, 220, 255)}
+    current = default_color
+    start = 0
+    runs = []
+    for match in re.finditer(r'\x1b\[([0-9;]*)m', line):
+        fragment = strip_ansi(line[start:match.start()])
+        runs.extend(terminal_text_runs(fragment, current) if current == default_color
+                    else [(fragment, current)])
+        for code in match[1].split(';'):
+            number = int(code or 0)
+            if number in (0, 39):
+                current = default_color
+            elif number in colors:
+                current = colors[number]
+        start = match.end()
+    fragment = strip_ansi(line[start:])
+    runs.extend(terminal_text_runs(fragment, current) if current == default_color
+                else [(fragment, current)])
+    return runs
 
 
 def strip_ansi(text: str) -> str:
@@ -55,6 +104,8 @@ def render_terminal_screenshot(
     save_path: str,
     title: Optional[str] = None,
     max_width: int = 1400,
+    prompts: Optional[set] = None,
+    preserve_content: bool = False,
 ) -> str:
     """
     Render command output as a terminal-style screenshot image.
@@ -71,7 +122,6 @@ def render_terminal_screenshot(
         Path to the saved image file
     """
     # Clean up output
-    output = strip_ansi(output)
     output = output.replace("\r\n", "\n").replace("\r", "\n")
 
     # Remove trailing empty lines
@@ -81,7 +131,7 @@ def render_terminal_screenshot(
 
     # Cap very long outputs to prevent oversized images
     MAX_LINES = 3000
-    if len(lines) > MAX_LINES:
+    if not preserve_content and len(lines) > MAX_LINES:
         truncated_count = len(lines) - MAX_LINES
         lines = lines[:MAX_LINES]
         lines.append(f"... ({truncated_count} more lines truncated) ...")
@@ -107,7 +157,9 @@ def render_terminal_screenshot(
     # Output lines as-is (prompt line is already included from AMOS output)
     for line in lines:
         # Highlight prompt lines with header color
-        if ">" in line and command.split()[0] in line:
+        if prompts and line.strip() in prompts:
+            line_styles.append("header")   # explicit prompt lines (evidence)
+        elif ">" in line and command.split()[0] in line:
             line_styles.append("header")
         elif line.strip().endswith(">"):
             line_styles.append("header")
@@ -117,7 +169,11 @@ def render_terminal_screenshot(
 
     # Calculate image dimensions
     max_line_len = max(len(line) for line in display_lines) if display_lines else 40
-    img_width = min(max_width, max(600, style.padding * 2 + max_line_len * char_width + 10))
+    natural_width = max(600, style.padding * 2 +
+                        int(max((font.getlength(strip_ansi(line).expandtabs(8)) for line in lines), default=0)) + 10)
+    if title:
+        natural_width = max(natural_width, 90 + int(font.getlength('  ' + title)))
+    img_width = natural_width if preserve_content else min(max_width, natural_width)
     img_height = style.padding * 2 + len(display_lines) * line_height + 10
 
     # Title bar height
@@ -145,6 +201,11 @@ def render_terminal_screenshot(
     text_color = tuple(style.text_color)
     header_color = tuple(style.header_color)
 
+    def draw_colored(x, y, text, base_color):
+        for fragment, color in ansi_text_runs(text.expandtabs(8), base_color):
+            draw.text((x, y), fragment, fill=color, font=font)
+            x += font.getlength(fragment)
+
     for i, (line, line_style) in enumerate(zip(display_lines, line_styles)):
         y = y_offset + i * line_height
 
@@ -163,11 +224,11 @@ def render_terminal_screenshot(
                 # Calculate x offset for the rest
                 node_bbox = font.getbbox(node_part)
                 x_offset = style.padding + (node_bbox[2] - node_bbox[0])
-                draw.text((x_offset, y), rest_part, fill=text_color, font=font)
+                draw_colored(x_offset, y, rest_part, text_color)
             else:
-                draw.text((style.padding, y), line, fill=header_color, font=bold_font)
+                draw_colored(style.padding, y, line, header_color)
         else:
-            draw.text((style.padding, y), line, fill=text_color, font=font)
+            draw_colored(style.padding, y, line, text_color)
 
     # Save
     os.makedirs(os.path.dirname(save_path), exist_ok=True)

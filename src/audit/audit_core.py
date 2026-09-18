@@ -2020,7 +2020,8 @@ def _banner(name: str) -> str:
 # the full FDN + clean IP and ARE generated (see broker_check).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
                             "consistency", "endc", "chain", "feature",
-                            "termpoint-gnb", "power-license", "bandwidth-license", "trx-license"}
+                            "termpoint-gnb", "power-license", "bandwidth-license", "trx-license",
+                            "radio-sharing"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

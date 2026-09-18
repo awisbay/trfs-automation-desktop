@@ -60,6 +60,7 @@ from cutover_model import (
 )
 from cutover_parsers import (
     diff_alarms,
+    parse_rlcrp_busy_tch,
     gsm_band_of,
     gsm_sector_suffix,
     looks_like_unknown_command,
@@ -272,6 +273,30 @@ _DEFAULTS = {
         "activate_command": (
             '!python {cli} "cmedit set {node} fmalarmsupervision active=true"'),
         "activate_timeout_s": 60,
+    },
+    "capture": {
+        # Evidence buttons (Alarms / Cell status / Traffic): run the command on
+        # every node in parallel on the already-open read session, render a
+        # terminal-style PNG per node + one combined, save PNG + TXT under
+        # LOG/<site>/<subdir>/ and put the combined image on the clipboard.
+        "commands": {"alarms": "alt", "cell_status": "st cell",
+                     "traffic": "stzrc"},
+        "timeout_s": {"alarms": 120, "cell_status": 90, "traffic": 300},
+        "subdir": "EVIDENCE",
+        # Lines are never wrapped; the image widens to the longest line so wide
+        # tables (stzrc, alt) stay on one line and are not clipped.
+        "max_width": 4000,
+    },
+    "bsc_traffic": {
+        # BSC traffic evidence: ssh from the ENM scripting VM to the BSC with
+        # the ENM user/password, `mml`, then `rlcrp:cell=<cell>;` per GSM cell.
+        # ip_map: BSC name -> IP. The site's BSC is read from the GeranCell FDN
+        # (MeContext=<BSC>); the form's BSC name is the fallback.
+        "enabled": True,
+        "ip_map": {},
+        "ssh_port": 22,
+        "login_timeout_s": 45,
+        "cell_timeout_s": 90,
     },
     "vswr": {
         # After a cell enables, sdirc reads the VSWR of every RF port and the
@@ -1213,6 +1238,30 @@ def run_cutover_gsm_trx_unlock(ssh, node_name: str, sector_mo: str,
     return ok, out
 
 
+def split_traffic_output(output: str):
+    """Separate node/FRU/alarm information from the LTE/NR cell tables."""
+    lines = output.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    for index, line in enumerate(lines):
+        if re.match(r'^\s*Id\s*[;|\s]+(?:LTECell|NRCell)\b', strip_ansi(line), re.I):
+            start = index
+            if start and re.fullmatch(r'\s*=+\s*', strip_ansi(lines[start - 1])):
+                start -= 1
+            return '\n'.join(lines[:start]), '\n'.join(lines[start:])
+    return None  # Failed/non-table output remains available as one image.
+
+
+def run_cutover_capture(ssh, node_name: str, command: str,
+                        timeout: int) -> tuple:
+    """Run one evidence command on a node. Returns (ok, output); a rejected /
+    unknown command is reported as not ok instead of being rendered as if it
+    were real output."""
+    out = ssh.run_amos_command_safe(command, node_name, timeout=int(timeout))
+    bad = looks_like_unknown_command(
+        out, ("Unknown command", "Syntax error", "command not found",
+              "Invalid command"))
+    return (not bad), (out or "")
+
+
 def run_cutover_alarms(ssh, node_name: str, log_cb: Callable[[str], None],
                        cfg: dict, wait_for_user=None) -> tuple:
     """Run the alarm command. Returns (ok, output, total_alarms)."""
@@ -1385,10 +1434,15 @@ class CutoverEngine:
         # so those (heavy) commands run at their own interval rather than every
         # status poll.
         self._vswr_last: dict = {}
+        self._vswr_cache: dict = {}
         self._traffic_last: dict = {}
         # Site-wide FM supervision is checked exactly once, immediately before
         # the first confirmed unlock command.
         self._alarm_activation_checked = False
+        # Evidence captures (Alarms / Cell status / Traffic / BSC traffic): one
+        # thread per kind, independent of the action lock so unlock stays usable.
+        self._capture_lock = threading.Lock()
+        self._capture_threads: dict = {}
         # HC mode for the current preparation run: "pre" (Pre HC) or "post"
         # (Post HC — post-cutover check, creates a Post_CutOver CV).
         self._hc_mode = "pre"
@@ -1499,6 +1553,517 @@ class CutoverEngine:
                                    message=message))
         finally:
             self._hc_mode = "pre"
+
+    # ── Evidence capture (Alarms / Cell status / Traffic / BSC traffic) ──
+    _EVIDENCE_TITLES = {"alarms": "Alarms", "cell_status": "Cell status",
+                        "traffic": "Traffic", "bsc_traffic": "BSC traffic",
+                        "combined": "All evidence", "vswr": "VSWR"}
+
+    def capture_busy(self, kind: str) -> bool:
+        with self._capture_lock:
+            t = self._capture_threads.get(kind)
+            return bool(t and t.is_alive())
+
+    def capture_evidence(self, kind: str) -> bool:
+        """Run the evidence command on every node in parallel, save PNG + TXT
+        and emit ``evidence_ready`` so the GUI copies the image."""
+        return self._start_capture(
+            kind, lambda: self._vswr_evidence_worker() if kind == "vswr"
+            else self._capture_combined_worker() if kind == "combined"
+            else self._capture_worker(kind, show=True))
+
+    def refresh_alarms(self) -> bool:
+        """Same parallel ``alt`` pass, only refreshing the alarm strip."""
+        return self._start_capture(
+            "alarms", lambda: self._capture_worker("alarms", show=False))
+
+    def capture_bsc_traffic(self) -> bool:
+        """``rlcrp`` for every GSM cell on the site's BSC (BSC traffic)."""
+        return self._start_capture("bsc_traffic", self._bsc_traffic_worker)
+
+    def _start_capture(self, kind: str, target) -> bool:
+        if self.is_stopping():
+            self.log("Evidence blocked — cancellation is still in progress.")
+            return False
+        label = self._EVIDENCE_TITLES.get(kind, kind)
+        with self._capture_lock:
+            conflicts = (("alarms", "cell_status", "traffic") if kind == "combined"
+                         else ("combined",) if kind in ("alarms", "cell_status", "traffic") else ())
+            if any(self._capture_threads.get(k) and self._capture_threads[k].is_alive()
+                   for k in conflicts):
+                self.log(f"{label} blocked — another evidence capture is running.")
+                return False
+            current = self._capture_threads.get(kind)
+            if current and current.is_alive():
+                self.log(f"{label} capture is already running.")
+                return False
+
+            def _wrapped():
+                try:
+                    target()
+                except Exception as exc:
+                    logger.exception("Evidence capture crashed")
+                    self.log(f"✗ {label} capture crashed: "
+                             f"{type(exc).__name__}: {exc}")
+                finally:
+                    self.run.touch()
+                    self.emit(CutoverEvent(kind="progress"))
+
+            t = threading.Thread(target=_wrapped, name=f"cutover-capture-{kind}",
+                                 daemon=True)
+            self._capture_threads[kind] = t
+            self._threads.append(t)
+            t.start()
+        self.run.touch()
+        return True
+
+    def _evidence_nodes(self, kind: str) -> list:
+        """Alarms: every node. Cell status / Traffic: only basebands that carry
+        LTE/NR cells (a GSM-only BB has no st cell / stzrc table)."""
+        run = self.run
+        if kind == "alarms" or not run.cells:
+            return list(run.node_names)
+        radio = {c.node_name for c in run.cells if c.rat in ("LTE", "NR")}
+        return [n for n in run.node_names if n in radio]
+
+    @staticmethod
+    def _node_label(node_name: str) -> str:
+        """Short tab label: the last ``_`` segment (MIN823_GINGOOB01 -> GINGOOB01)."""
+        return node_name.rsplit("_", 1)[-1] if "_" in node_name else node_name
+
+    def _update_alarm_status(self, results: dict) -> None:
+        run = self.run
+        patterns = tuple(self.cfg["alarm"].get("no_alarm_patterns", ()))
+        stamp = datetime.now().strftime("%H:%M:%S")
+        with run.lock:
+            for node, (ok, out) in results.items():
+                if not ok:
+                    run.alarm_status[node] = {"total": None, "new": None,
+                                              "by_severity": {}, "at": stamp,
+                                              "error": out.strip()[-200:]}
+                    continue
+                total, by_sev, _none = parse_alarm_summary(out, patterns)
+                baseline = run.alarm_baseline.get(node)
+                new = len(diff_alarms(baseline, out)) if baseline else None
+                run.alarm_status[node] = {"total": total, "new": new,
+                                          "by_severity": dict(by_sev),
+                                          "at": stamp, "error": ""}
+            run.touch()
+
+    def _render_evidence(self, kind: str, title_kind: str,
+                         blocks: list, tabs: list) -> list:
+        """Render the combined image (all ``blocks``) plus one image per tab.
+
+        ``blocks``: ``[(header, output), …]`` for the combined image.
+        ``tabs``: ``[(label, file_tag, [(header, output), …]), …]``.
+        Writes a ``.txt`` beside every PNG. Returns ``[(label, png), …]`` with
+        the combined image first; an empty list if rendering failed."""
+        from config_loader import TerminalStyle
+        from terminal_renderer import render_terminal_screenshot
+        cap = self.cfg.get("capture", {})
+        out_dir = os.path.join(self.log_dir, cap.get("subdir", "EVIDENCE"))
+        os.makedirs(out_dir, exist_ok=True)
+        site = self.run.shortcode or "SITE"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        when = datetime.now().strftime("%Y-%m-%d %H:%M")
+        tag = kind.upper()
+        style = TerminalStyle(**self.cfg["report"]["terminal_style"])
+        style.font_size = max(22, style.font_size)
+        max_width = int(cap.get("max_width", 4000))
+
+        def _write_txt(png: str, items: list) -> None:
+            with open(os.path.splitext(png)[0] + ".txt", "w", encoding="utf-8",
+                      errors="replace") as fh:
+                for header, output in items:
+                    fh.write(f"### {header}\n{strip_ansi(output).rstrip()}\n\n")
+
+        def _clean(header: str, output: str) -> list:
+            """Output lines as they'd look in the terminal, minus noise:
+            progress-dot lines, the echoed command / prompt at the top and a
+            trailing prompt. Lines are never wrapped."""
+            cmd = header.split("> ", 1)[-1].strip()
+            text = (output or "") if kind == "vswr" else strip_ansi(output or "")
+            lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            kept = []
+            for line in lines:
+                # Drop control characters (e.g. the BSC's trailing bell / form
+                # feed) that render as "?" boxes in the image.
+                line = "".join(ch for ch in line if ch == "\t" or ord(ch) >= 32
+                               or (kind == "vswr" and ch == '\x1b'))
+                st = line.strip()
+                if st and set(st) <= set("."):
+                    continue
+                if not kept and (not st or st == cmd or st.endswith(f"> {cmd}")
+                                 or st.endswith(">") or st == "<"):
+                    continue
+                kept.append(line.rstrip())
+            while kept and (not kept[-1].strip()
+                            or kept[-1].strip() in ("<", ">")
+                            or kept[-1].strip().endswith(">")):
+                kept.pop()
+            return kept
+
+        def _render(items: list, png: str, title: str) -> None:
+            text = []
+            for header, output in items:
+                text += [header, ""] + _clean(header, output) + [""]
+            with _render_lock:
+                render_terminal_screenshot(
+                    items[0][0], "\n".join(text), style, png, title=title,
+                    max_width=max_width, prompts={h for h, _ in items},
+                    preserve_content=True)
+            if kind == "alarms":
+                from PIL import Image
+                with Image.open(png) as original:
+                    if original.width > 1800:
+                        cropped = original.crop((0, 0, 1800, original.height))
+                        cropped.save(png, 'PNG')
+            if kind == "combined":
+                # Follow traffic width; full alarm descriptions remain in TXT.
+                from PIL import Image
+                from terminal_renderer import _get_font
+                traffic_lines = []
+                for header, output in items:
+                    if header.split('> ', 1)[-1].strip().split(' ')[0] in ('stzr', 'stzrc'):
+                        traffic_lines += [header] + _clean(header, output)
+                if traffic_lines:
+                    font = _get_font(style.font, style.font_size)
+                    width = max(600, style.padding * 2 + 10 +
+                                int(max(font.getlength(line.expandtabs(8)) for line in traffic_lines)))
+                    with Image.open(png) as original:
+                        if original.width > width:
+                            cropped = original.crop((0, 0, width, original.height))
+                            cropped.save(png, 'PNG')
+            _write_txt(png, items)
+
+        images = []
+        try:
+            combined = os.path.join(out_dir, f"{site}_{tag}_{ts}.png")
+            _render(blocks, combined, f"{site} - {title_kind} - {when}")
+            images.append(("All", combined))
+            for label, file_tag, items in tabs:
+                png = os.path.join(out_dir, f"{site}_{tag}_{file_tag}_{ts}.png")
+                _render(items, png, f"{site} - {title_kind} - {label} - {when}")
+                images.append((label, png))
+                if kind == "combined":
+                    images.append((f"{label} / All", png))
+                    status_items, traffic_items = [], []
+                    for item in items:
+                        command = item[0].split('> ', 1)[-1].strip()
+                        (traffic_items if command.split(' ')[0] in ('stzr', 'stzrc')
+                         else status_items).append(item)
+                    for part_index, part_label, part_items in (
+                        (1, "Part 1: alt + st cell", status_items),
+                        (2, "Part 2: stzr", traffic_items),
+                    ):
+                        if not part_items:
+                            continue
+                        part_png = os.path.splitext(png)[0] + f"_part{part_index}.png"
+                        _render(part_items, part_png,
+                                f"{site} - {label} - {part_label} - {when}")
+                        # Both parts use this node's traffic width when available.
+                        # An alarm description must not make Part 1 excessively wide.
+                        if traffic_items:
+                            from PIL import Image
+                            from terminal_renderer import _get_font
+                            font = _get_font(style.font, style.font_size)
+                            traffic_lines = [line for header, output in traffic_items
+                                             for line in [header] + _clean(header, output)]
+                            width = max(600, style.padding * 2 + 10 +
+                                        int(max(font.getlength(line.expandtabs(8)) for line in traffic_lines)))
+                            with Image.open(part_png) as original:
+                                if original.width > width:
+                                    cropped = original.crop((0, 0, width, original.height))
+                                    cropped.save(part_png, 'PNG')
+                        images.append((f"{label} / {part_label}", part_png))
+                if kind == "traffic" and len(items) == 1:
+                    header, output = items[0]
+                    parts = split_traffic_output(output)
+                    if parts:
+                        for part_index, part in enumerate(parts, 1):
+                            part_png = os.path.splitext(png)[0] + f"_part{part_index}.png"
+                            _render([(header, part)], part_png,
+                                    f"{site} - {label} - Traffic Part {part_index} - {when}")
+                            images.append((f"{label} / Part {part_index}", part_png))
+        except Exception as exc:
+            self.log(f"✗ Could not render the {title_kind} image: "
+                     f"{type(exc).__name__}: {exc}")
+        return images
+
+    def _cache_vswr_output(self, node, output):
+        from sdir_summary import build_sdir_summary
+        summary = build_sdir_summary(output, node)
+        with self.run.lock:
+            if summary:
+                self._vswr_cache[node] = {
+                    'summary': summary, 'at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'raw': output}
+
+    def _vswr_evidence_worker(self):
+        with self.run.lock:
+            snapshots = {node: dict(self._vswr_cache[node]) for node in self.run.node_names
+                         if node in self._vswr_cache}
+        if not snapshots:
+            self.emit(CutoverEvent(kind="diagnostic", message=
+                      "No cached VSWR. Use Update Traffic & VSWR first."))
+            return
+        blocks, tabs = [], []
+        for node in self.run.node_names:
+            snapshot = snapshots.get(node, {
+                'at': 'unavailable',
+                'summary': f'sdir Summary {node}\nNo cached VSWR for this node. Use Update Traffic & VSWR first.'})
+            item = (f"{node}> cached sdir Summary ({snapshot['at']})", snapshot['summary'])
+            blocks.append(item)
+            tabs.append((self._node_label(node), self._node_label(node), [item]))
+        images = self._render_evidence('vswr', 'VSWR (cached)', blocks, tabs)
+        if images:
+            self.emit(CutoverEvent(kind='evidence_ready', group='vswr',
+                      caption=f"VSWR — {self.run.shortcode}", images=images,
+                      png_path=images[0][1], message="VSWR preview from cached readings; no node commands executed."))
+
+    def _capture_combined_worker(self) -> None:
+        """Capture commands sequentially per session, with nodes in parallel."""
+        run = self.run
+        self._ensure_sessions()
+        nodes = self._evidence_nodes("alarms")
+        radio_nodes = set(self._evidence_nodes("cell_status"))
+        cap = self.cfg.get("capture", {})
+        commands = cap.get("commands", {})
+        timeouts = cap.get("timeout_s", {})
+        outputs, alarms = {}, {}
+        started = time.monotonic()
+        self.log("All evidence: capturing alt, st cell and stzr on every eligible node…")
+
+        def one(node):
+            blocks = []
+            sess = run.sessions.get(node)
+            plan = [(commands.get("alarms", "alt"), int(timeouts.get("alarms", 120)))]
+            if node in radio_nodes:
+                plan += [(commands.get("cell_status", "st cell"), int(timeouts.get("cell_status", 90))),
+                         (commands.get("combined_traffic", "stzr"), int(timeouts.get("traffic", 300)))]
+            ssh = sess.read_ssh if sess else None
+            if sess and ssh is None and not self.is_busy():
+                ssh = sess.ssh
+            for index, (command, timeout) in enumerate(plan):
+                if run.is_cancelled() or self.is_stopping():
+                    break
+                try:
+                    if ssh is None:
+                        raise RuntimeError("No available SSH session; retry after the current action finishes")
+                    with sess.read_lock:
+                        ok, out = run_cutover_capture(ssh, node, command, timeout)
+                except Exception as exc:
+                    ok, out = False, f"{type(exc).__name__}: {exc}"
+                if index == 0:
+                    alarms[node] = (ok, out)
+                blocks.append((f"{node}> {command}", out if ok else f"CAPTURE FAILED\n{out}"))
+            outputs[node] = blocks
+
+        workers = [threading.Thread(target=one, args=(node,), daemon=True) for node in nodes]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        if run.is_cancelled() or self.is_stopping():
+            return
+        self._update_alarm_status(alarms)
+        blocks = [block for node in nodes for block in outputs.get(node, [])]
+        if not blocks:
+            self.log("All evidence: no nodes available to capture.")
+            return
+        tabs = [(self._node_label(node), self._node_label(node), outputs[node]) for node in nodes]
+        images = self._render_evidence("combined", "All evidence", blocks, tabs)
+        message = f"All evidence captured in {time.monotonic() - started:.1f}s; review each command for failures."
+        self.log(message)
+        if images:
+            self.emit(CutoverEvent(kind="evidence_ready", group="combined",
+                                  caption=f"All evidence — {run.shortcode}",
+                                  png_path=images[0][1], images=images, message=message))
+
+    def _capture_worker(self, kind: str, show: bool = True) -> None:
+        run = self.run
+        cap = self.cfg.get("capture", {})
+        command = cap.get("commands", {}).get(kind, "")
+        timeout = int(cap.get("timeout_s", {}).get(kind, 120))
+        title_kind = self._EVIDENCE_TITLES[kind]
+        nodes = self._evidence_nodes(kind)
+        if not command or not nodes:
+            self.log(f"{title_kind}: nothing to capture (no command or no node "
+                     f"with LTE/NR cells).")
+            return
+        self._ensure_sessions()
+        started = time.monotonic()
+        self.log(f"{title_kind}: running `{command}` on {len(nodes)} node(s) "
+                 f"in parallel…")
+        results: dict = {}
+
+        def _one(node: str) -> None:
+            sess = run.sessions.get(node)
+            if sess is None:
+                results[node] = (False, "no SSH session — connection failed")
+                return
+            ssh = sess.read_ssh
+            if ssh is None:
+                if self.is_busy():
+                    results[node] = (False, "the node's session is busy with an "
+                                            "unlock/lock action — try again "
+                                            "when it finishes")
+                    return
+                ssh = sess.ssh
+            try:
+                with sess.read_lock:
+                    results[node] = run_cutover_capture(ssh, node, command,
+                                                        timeout)
+            except Exception as exc:
+                results[node] = (False, f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=_one, args=(n,), daemon=True,
+                                    name=f"capture-{kind}-{n}") for n in nodes]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if run.is_cancelled():
+            return
+        elapsed = time.monotonic() - started
+        failed = [n for n in nodes if not results.get(n, (False, ""))[0]]
+        if kind == "alarms":
+            self._update_alarm_status(results)
+        if not show:
+            self.log(f"Alarms refreshed on {len(nodes)} node(s) in "
+                     f"{elapsed:.1f}s" + (f"; failed: {', '.join(failed)}"
+                                         if failed else "."))
+            return
+
+        blocks, tabs = [], []
+        for node in nodes:
+            ok, out = results.get(node, (False, "no result"))
+            if not ok:
+                out = f"✗ {command} failed on {node}\n{out.strip()[-600:]}"
+            header = f"{node}> {command}"
+            blocks.append((header, out))
+            tabs.append((self._node_label(node), self._node_label(node),
+                         [(header, out)]))
+        images = self._render_evidence(kind, title_kind, blocks, tabs)
+        message = (f"{title_kind}: {len(nodes) - len(failed)}/{len(nodes)} "
+                   f"node(s) captured in {elapsed:.1f}s.")
+        if failed:
+            message += " Failed: " + ", ".join(failed) + "."
+        self.log(message)
+        if images:
+            self.emit(CutoverEvent(kind="evidence_ready", group=kind,
+                                   caption=f"{title_kind} — {run.shortcode}",
+                                   png_path=images[0][1], images=images,
+                                   message=message))
+
+    def _bsc_of(self, cell) -> str:
+        m = re.search(r"(?:^|,)MeContext=([^,]+)", cell.gsm_fdn or "")
+        if m:
+            return m.group(1)
+        return str(self.form.get("bsc_name", "")).strip()
+
+    def _bsc_traffic_worker(self) -> None:
+        import bsc_mml
+        from integration_runner import IntegrationSSH
+        run = self.run
+        bt = self.cfg.get("bsc_traffic", {})
+        if not bt.get("enabled", True):
+            self.log("BSC traffic is disabled in config.")
+            return
+        gsm = [c for c in run.cells if c.rat == "GSM"]
+        if not gsm:
+            self.log("BSC traffic: no GSM cells — run Start first (or the site "
+                     "has no GSM).")
+            return
+        form = self.form
+        user = str(form.get("username", "")).strip()
+        password = str(form.get("password", ""))
+        ip_map = {str(k).upper(): str(v).strip()
+                  for k, v in (bt.get("ip_map") or {}).items()}
+        by_bsc: dict = {}
+        for c in gsm:
+            by_bsc.setdefault(self._bsc_of(c), []).append(c)
+
+        started = time.monotonic()
+        outputs: dict = {}
+        cell_bsc: dict = {}
+        errors: list = []
+        for bsc, cells in by_bsc.items():
+            if run.is_cancelled():
+                return
+            if not bsc:
+                errors.append("BSC unknown for "
+                              + ", ".join(c.cell_dn for c in cells)
+                              + " (no MeContext in the GeranCell FDN and no BSC "
+                                "name in the form).")
+                continue
+            ip = ip_map.get(bsc.upper())
+            if not ip:
+                errors.append(f"No IP for BSC {bsc} — add it to "
+                              f"cutover.bsc_traffic.ip_map in config.json.")
+                continue
+
+            def _factory():
+                return IntegrationSSH(
+                    host=str(form.get("host", "")).strip(),
+                    port=int(form.get("port", 5023) or 5023),
+                    username=user, password=password,
+                    log_callback=lambda m: logger.debug("[bsc] %s", m))
+
+            try:
+                res = bsc_mml.run_rlcrp(
+                    _factory, ip, user, password, [c.cell_dn for c in cells],
+                    self.log, ssh_port=int(bt.get("ssh_port", 22)),
+                    login_timeout=float(bt.get("login_timeout_s", 45)),
+                    cell_timeout=float(bt.get("cell_timeout_s", 90)))
+            except bsc_mml.BscMmlError as exc:
+                errors.append(str(exc))
+                continue
+            for dn, out in res:
+                outputs[dn] = out
+                cell_bsc[dn] = bsc
+
+        stamp = datetime.now().strftime("%H:%M")
+        for c in gsm:
+            if c.cell_dn in outputs:
+                run.set_cell(c, gsm_busy_tch=parse_rlcrp_busy_tch(
+                    outputs[c.cell_dn]), gsm_busy_tch_at=stamp)
+        if not outputs:
+            message = "BSC traffic failed:\n" + "\n".join(errors or ["no output"])
+            self.log(f"✗ {message}")
+            self.emit(CutoverEvent(kind="diagnostic", message=message))
+            return
+
+        def _item(c):
+            text = outputs[c.cell_dn]
+            lines = text.splitlines()
+            if lines and "rlcrp:cell=" in lines[0].lower():
+                text = "\n".join(lines[1:])   # header already shows the command
+            return (f"{cell_bsc[c.cell_dn]}> rlcrp:cell={c.cell_dn};", text)
+
+        done = [c for c in gsm if c.cell_dn in outputs]
+        blocks = [_item(c) for c in done]
+        tabs = []
+        for sector in sorted({c.sector for c in done if c.sector},
+                             key=lambda s: (len(s), s)):
+            items = [_item(c) for c in done if c.sector == sector]
+            tabs.append((f"S{sector}", f"S{sector}", items))
+            for c in done:
+                if c.sector == sector:
+                    cell_tag = re.sub(r'[^A-Za-z0-9_.-]', '_', c.cell_dn)
+                    tabs.append((f"S{sector} / {c.cell_dn}", f"S{sector}_{cell_tag}", [_item(c)]))
+        images = self._render_evidence("bsc_traffic", "BSC traffic", blocks, tabs)
+        elapsed = time.monotonic() - started
+        message = (f"BSC traffic: {len(done)}/{len(gsm)} GSM cell(s) in "
+                   f"{elapsed:.1f}s.")
+        if errors:
+            message += "\n" + "\n".join(errors)
+        self.log(message)
+        if images:
+            self.emit(CutoverEvent(kind="evidence_ready", group="bsc_traffic",
+                                   caption=f"BSC traffic — {run.shortcode}",
+                                   png_path=images[0][1], images=images,
+                                   message=message))
 
     def run_trfs_log(self) -> None:
         """Run the TRFS logging scripts on every node (LABEL.mos once first),
@@ -3872,6 +4437,7 @@ class CutoverEngine:
                         self.log(f"[{node_name}] snapshot: reading VSWR (sdirc)…")
                         ok, _out, res = run_cutover_vswr(
                             ssh, node_name, self.log, self.cfg)
+                        self._cache_vswr_output(node_name, _out)
                         if ok:
                             self._apply_vswr(node_name, res)
                         else:
@@ -4126,6 +4692,7 @@ class CutoverEngine:
             self.log(f"[{node_name}] VSWR read failed: "
                      f"{type(exc).__name__}: {exc}")
             return
+        self._cache_vswr_output(node_name, _out)
         if ok:
             self._apply_vswr(node_name, res)
 
@@ -4565,12 +5132,6 @@ class CutoverEngine:
                                   traffic_out))
                 alarm_out = item.get("alarm_output", "")
                 if alarm_out:
-                    baseline = run.alarm_baseline.get(node_name)
-                    if baseline:
-                        new = diff_alarms(baseline, alarm_out)
-                        alarm_out += ("\n\n--- NEW since cut over started ---\n"
-                                      + ("\n".join(new) if new else
-                                         "(none — no new alarms)"))
                     pairs.append((f"[{node_name}] {alarm_cmd}", alarm_out))
         else:
             # Compatibility path used by the manual traffic confirmation gate.

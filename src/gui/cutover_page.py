@@ -100,6 +100,31 @@ def _sector_all_unlocked(cells) -> bool:
         for cell in cells)
 
 
+def _outline_style(colour) -> ft.ButtonStyle:
+    """The secondary (outlined) action style used across the page."""
+    return ft.ButtonStyle(
+        color=colour,
+        side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, colour)),
+        shape=ft.RoundedRectangleBorder(radius=12),
+        padding=ft.Padding.symmetric(horizontal=16, vertical=12),
+    )
+
+
+def _cluster(caption: str, controls: list) -> ft.Container:
+    """A captioned group of related actions (PREPARE / EVIDENCE / FINISH)."""
+    return ft.Container(
+        padding=ft.Padding.only(left=12, right=12, top=8, bottom=10),
+        border_radius=12,
+        border=ft.Border.all(1, BORDER),
+        bgcolor=ft.Colors.with_opacity(0.04, TEXT),
+        content=ft.Column(
+            [ft.Text(caption, size=10, color=TEXT_MUTED,
+                     weight=ft.FontWeight.W_700),
+             ft.Row(controls, spacing=8, wrap=True, run_spacing=8)],
+            spacing=6, tight=True),
+    )
+
+
 class _CellRow:
     """One cell: status icon, node, MO, band chip, state, UE count, VSWR."""
 
@@ -189,6 +214,18 @@ class _CellRow:
                 DANGER if icon_state == "error" else
                 ACCENT_WARM if icon_state == "warn" else TEXT_MUTED
             )
+        if getattr(cell, "rat", "") == "GSM":
+            busy = getattr(cell, "gsm_busy_tch", None)
+            self._ue.value = "—" if busy is None else str(busy)
+            self._ue.color = (TEXT_MUTED if busy is None else
+                              SUCCESS if busy > 0 else ACCENT_WARM)
+            self._ue.tooltip = (None if busy is None else
+                                f"Busy TCH from BSC rlcrp at "
+                                f"{getattr(cell, 'gsm_busy_tch_at', '')}")
+            self._refresh_vswr(cell)
+            self.control.bgcolor = (ft.Colors.with_opacity(0.07, ACCENT)
+                                    if icon_state == "running" else None)
+            return
         self._ue.value = "—" if cell.ue_count is None else str(cell.ue_count)
         if cell.ue_count is None:
             self._ue.color = TEXT_MUTED
@@ -520,7 +557,8 @@ class _GroupSection:
         )
 
         up = counts["enabled"] + counts["traffic_ok"]
-        self.evidence_button.visible = up > 0
+        # Replaced by the site-wide Evidence buttons (all nodes at once).
+        self.evidence_button.visible = False
         self.evidence_button.disabled = busy
         self.evidence_button.tooltip = (
             f"Build the traffic + alarm screenshot for {self.name} "
@@ -555,19 +593,14 @@ class CutOverPage:
         self.page.title = f"NodeCraft — {self.shortcode or 'Cut Over'} (Cut Over)"
 
         self.status_text = ft.Text(
-            "Ready — click Pre HC to create CV and run preHC (no modump)",
+            "Ready — click Start to find the cells and read their status",
             size=13, color=ACCENT,
         )
-        self.start_hc_btn = ft.ElevatedButton(
+        self.start_hc_btn = ft.OutlinedButton(
             "Pre HC",
             icon=ft.Icons.HEALTH_AND_SAFETY_OUTLINED,
             tooltip="Create CV, run preHC (download its logfile), then discover cells",
-            style=ft.ButtonStyle(
-                bgcolor=ACCENT,
-                color="#06242A",
-                shape=ft.RoundedRectangleBorder(radius=12),
-                padding=ft.Padding.symmetric(horizontal=18, vertical=12),
-            ),
+            style=_outline_style(ACCENT),
             on_click=self._on_start_hc,
         )
         self.trfs_btn = ft.OutlinedButton(
@@ -598,16 +631,16 @@ class CutOverPage:
             ),
             on_click=self._on_post_hc,
         )
-        self.start_unlock_btn = ft.OutlinedButton(
-            "Start Unlock",
-            icon=ft.Icons.LOCK_OPEN_ROUNDED,
-            tooltip="Skip preparation (CV, modump, preHC) — go straight to "
-                    "discovering cells and their status so you can unlock now",
+        self.start_unlock_btn = ft.ElevatedButton(
+            "Start",
+            icon=ft.Icons.PLAY_ARROW_ROUNDED,
+            tooltip="Connect the nodes, find the cells and read their status "
+                    "(no CV / modump / preHC). Then unlock from the groups below.",
             style=ft.ButtonStyle(
-                color=ACCENT,
-                side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT)),
+                bgcolor=ACCENT,
+                color="#06242A",
                 shape=ft.RoundedRectangleBorder(radius=12),
-                padding=ft.Padding.symmetric(horizontal=18, vertical=12),
+                padding=ft.Padding.symmetric(horizontal=20, vertical=12),
             ),
             on_click=self._on_start_unlock,
         )
@@ -642,10 +675,6 @@ class CutOverPage:
                     spacing=2,
                 ),
                 ft.Container(expand=True),
-                self.start_hc_btn,
-                self.trfs_btn,
-                self.post_hc_btn,
-                self.start_unlock_btn,
                 self.cancel_btn,
                 self.back_btn,
             ],
@@ -749,13 +778,96 @@ class CutOverPage:
         )
         self.summary_text = ft.Text("", size=12, color=TEXT_MUTED)
 
-        action_bar = ft.Row(
-            [*self.sector_unlock_btns.values(), self.unlock_all_btn,
-             self.verify_btn, self.relock_all_btn, self.measurements_btn,
-             ft.Container(width=8), self.summary_text],
-            spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True,
-            run_spacing=10,
+        # Evidence → WhatsApp: each captures every node in parallel, saves
+        # PNG + TXT and copies the image to the clipboard.
+        self.evidence_btns = {}
+        for kind, label, icon, tip in (
+            ("combined", "All evidence", ft.Icons.COLLECTIONS_OUTLINED,
+             "Capture `alt`, `st cell` and `stzr` together"),
+            ("alarms", "Alarms", ft.Icons.NOTIFICATIONS_ACTIVE_OUTLINED,
+             "Run `alt` on every node at once"),
+            ("cell_status", "Cell status", ft.Icons.CELL_TOWER,
+             "Run `st cell` on every LTE/NR node"),
+            ("traffic", "Traffic", ft.Icons.SSID_CHART,
+             "Run `stzrc` on every LTE/NR node (takes ~1 min)"),
+            ("vswr", "VSWR", ft.Icons.SETTINGS_INPUT_ANTENNA,
+             "Preview the latest cached sdir summary without reading the node again"),
+            ("bsc_traffic", "BSC traffic", ft.Icons.SETTINGS_INPUT_ANTENNA,
+             "Run `rlcrp` on the BSC for every GSM cell, grouped per sector"),
+        ):
+            self.evidence_btns[kind] = ft.OutlinedButton(
+                label, icon=icon, disabled=True,
+                tooltip=tip + " — the image is copied, paste it into WhatsApp.",
+                style=_outline_style(INFO),
+                on_click=lambda e, k=kind: self._on_capture(k),
+            )
+        self.verify_btn.content = ft.Text("Verify")
+
+        workflow = ft.Row(
+            [
+                _cluster("PREPARE", [self.start_unlock_btn, self.start_hc_btn]),
+                _cluster("EVIDENCE  →  WhatsApp (copies the image)",
+                         list(self.evidence_btns.values())),
+                _cluster("FINISH", [self.post_hc_btn, self.trfs_btn,
+                                    self.verify_btn]),
+            ],
+            spacing=12, wrap=True, run_spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.START,
         )
+
+        # Live alarm strip — refreshed manually (↻) or by the Alarms evidence.
+        self.alarm_chips = ft.Row([], spacing=8, wrap=True, run_spacing=6)
+        self.alarm_refresh_btn = ft.IconButton(
+            ft.Icons.REFRESH, icon_size=18, icon_color=TEXT_MUTED,
+            tooltip="Refresh active alarms on every node (runs `alt`)",
+            on_click=self._on_refresh_alarms,
+        )
+        alarm_strip = ft.Container(
+            padding=ft.Padding.symmetric(horizontal=12, vertical=4),
+            border_radius=10,
+            bgcolor=ft.Colors.with_opacity(0.05, TEXT),
+            content=ft.Row(
+                [ft.Icon(ft.Icons.NOTIFICATIONS_OUTLINED, size=16,
+                         color=TEXT_MUTED),
+                 ft.Text("Active alarms", size=12, color=TEXT_MUTED,
+                         weight=ft.FontWeight.W_600),
+                 self.alarm_chips, ft.Container(expand=True),
+                 self.alarm_refresh_btn],
+                spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+
+        # Bulk actions that span every group live in one menu instead of a
+        # permanent footer row (each group keeps its own Unlock/Lock buttons).
+        self._menu_unlock_all = ft.PopupMenuItem(
+            content=ft.Text("Unlock all groups (LB → MB → HB)"),
+            icon=ft.Icons.PLAYLIST_PLAY_ROUNDED, on_click=self._on_unlock_all)
+        self._menu_sector_items = {
+            s: ft.PopupMenuItem(
+                content=ft.Text(f"Unlock S{s} in every group"),
+                icon=ft.Icons.LOCK_OPEN_ROUNDED,
+                on_click=lambda e, s=s: self._on_unlock_sector(s))
+            for s in ("1", "2", "3")}
+        self._menu_rollback = ft.PopupMenuItem(
+            content=ft.Text("Roll back all (cells this run unlocked)"),
+            icon=ft.Icons.UNDO_ROUNDED, on_click=self._on_relock_all)
+        self.all_groups_menu = ft.PopupMenuButton(
+            content=ft.Container(
+                padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+                border=ft.Border.all(1, BORDER), border_radius=10,
+                content=ft.Row([ft.Icon(ft.Icons.MORE_HORIZ, size=18,
+                                        color=TEXT_MUTED),
+                                ft.Text("All groups", size=13, color=TEXT)],
+                               spacing=6, tight=True)),
+            items=[self._menu_unlock_all, *self._menu_sector_items.values(),
+                   self._menu_rollback],
+            tooltip="Actions across every band group",
+        )
+
+        cells_toolbar = ft.Row(
+            [ft.Text("Cells", size=15, weight=ft.FontWeight.BOLD, color=TEXT),
+             ft.Container(expand=True), self.all_groups_menu,
+             self.measurements_btn],
+            spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
         self.log_column = ft.Column([], spacing=1, scroll=ft.ScrollMode.AUTO,
                                     auto_scroll=True, expand=True)
@@ -767,17 +879,25 @@ class CutOverPage:
             content=ft.Column(
                 [
                     header,
+                    alarm_strip,
+                    workflow,
                     dry_banner,
-                    panel(self.cells_column, bgcolor=PANEL, padding=16, expand=True),
-                    panel(action_bar, bgcolor=PANEL_RAISED, padding=14),
+                    panel(ft.Column([cells_toolbar,
+                                     ft.Row(list(self.sector_unlock_btns.values()),
+                                            spacing=8, wrap=True), self.cells_column,
+                                     self.summary_text], spacing=10,
+                                    expand=True),
+                          bgcolor=PANEL, padding=16, expand=True),
                     ft.Container(
-                        height=170,
+                        height=150,
                         content=panel(self.log_column, bgcolor=PANEL, padding=12,
                                       expand=True),
                     ),
                 ],
                 spacing=12,
                 expand=True,
+                # Full-width rows: the log panel must not collapse while empty.
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
         )
 
@@ -954,6 +1074,11 @@ class CutOverPage:
 
         for name, section in self._sections.items():
             cells = run.cells_of(name)
+            # Empty groups: no column header, and once discovery has found the
+            # site's cells, hide the whole group so only real bands are shown.
+            section.col_header.visible = bool(cells)
+            if name == UNMAPPED or run.cells:
+                section.control.visible = bool(cells)
             if len(section.rows_column.controls) == len(cells):
                 continue
             section.rows_column.controls = []
@@ -965,9 +1090,6 @@ class CutOverPage:
                 row.set_identity_widths(node_width, mo_width)
                 row.refresh(cell)
                 section.rows_column.controls.append(row.control)
-            section.col_header.visible = bool(cells)
-            if name == UNMAPPED:
-                section.control.visible = bool(cells)
 
     def _refresh_chrome(self) -> None:
         run = self.run
@@ -1081,7 +1203,9 @@ class CutOverPage:
         self.measurements_btn.disabled = (
             measuring or reconciling or not run.cells or run.is_cancelled())
         self.measurements_btn.content = ft.Text(
-            "Updating Traffic & VSWR…" if measuring else "Update Traffic & VSWR")
+            "Refreshing traffic & VSWR…" if measuring
+            else "Refresh traffic & VSWR")
+        self._refresh_workflow_controls(busy, reconciling)
 
         phase_text = {
             RunPhase.IDLE: (
@@ -1133,6 +1257,8 @@ class CutOverPage:
             self._trfs_done_dialog(event)
         elif event.kind == "posthc_done":
             self._posthc_done_dialog(event)
+        elif event.kind == "evidence_ready":
+            self._evidence_dialog(event)
         elif event.kind == "cancel_done":
             self._refresh_chrome()
             self.status_text.value = "Cancelled — all processes stopped; you can click Back."
@@ -1422,6 +1548,198 @@ class CutOverPage:
         )
         dlg.actions = [ft.TextButton("OK", on_click=lambda e: self._close_dialog(dlg))]
         self._show_dialog(dlg)
+
+    # ── workflow controls: evidence, alarm strip, all-groups menu ─────────
+    def _refresh_workflow_controls(self, busy: bool, reconciling: bool) -> None:
+        run = self.run
+        stopping = self.engine.is_stopping()
+        sessions_ready = bool(run.sessions) and not stopping and not reconciling
+        has_gsm = any(c.rat == "GSM" for c in run.cells)
+        labels = {"alarms": "Alarms", "cell_status": "Cell status",
+                  "traffic": "Traffic", "bsc_traffic": "BSC traffic",
+                  "combined": "All evidence", "vswr": "VSWR"}
+        for kind, btn in self.evidence_btns.items():
+            running = self.engine.capture_busy(kind)
+            btn.content = ft.Text("Capturing…" if running else labels[kind])
+            if kind == "vswr":
+                btn.disabled = running or stopping or not bool(self.engine._vswr_cache)
+            elif kind == "bsc_traffic":
+                btn.visible = has_gsm or not run.cells
+                btn.disabled = running or stopping or not has_gsm
+            else:
+                btn.disabled = running or not sessions_ready or (
+                    self.engine.capture_busy("combined") if kind != "combined" else
+                    any(self.engine.capture_busy(k) for k in ("alarms", "cell_status", "traffic")))
+        self.alarm_refresh_btn.disabled = (
+            not sessions_ready or self.engine.capture_busy("alarms"))
+        self._refresh_alarm_strip()
+
+        # Next-step guidance: Start is the filled button only until cells exist.
+        self.start_unlock_btn.style = (
+            ft.ButtonStyle(bgcolor=ACCENT, color="#06242A",
+                           shape=ft.RoundedRectangleBorder(radius=12),
+                           padding=ft.Padding.symmetric(horizontal=20, vertical=12))
+            if not run.cells else _outline_style(ACCENT))
+
+        # All-groups menu mirrors the (detached) bulk buttons' state.
+        self._menu_unlock_all.disabled = self.unlock_all_btn.disabled
+        for sector, item in self._menu_sector_items.items():
+            button = self.sector_unlock_btns[sector]
+            item.visible = button.visible
+            item.disabled = button.disabled
+        self._menu_rollback.visible = self.relock_all_btn.visible
+        self._menu_rollback.disabled = self.relock_all_btn.disabled
+        self.all_groups_menu.disabled = not run.cells
+
+    def _refresh_alarm_strip(self) -> None:
+        run = self.run
+        chips = []
+        for node in run.node_names:
+            st = run.alarm_status.get(node)
+            label = self.engine._node_label(node)
+            if not st:
+                text, colour, tip = f"{label}  —", TEXT_MUTED, "Not read yet — click ↻"
+            elif st.get("error"):
+                text, colour, tip = f"{label}  ✗", DANGER, st["error"]
+            else:
+                total, new = st.get("total") or 0, st.get("new")
+                text = f"{label}  {total}" + (f" ({new} new)" if new else "")
+                colour = DANGER if new else (ACCENT_WARM if total else SUCCESS)
+                sev = ", ".join(f"{k} {v}" for k, v in
+                                sorted(st.get("by_severity", {}).items()))
+                tip = f"{total} active alarm(s){' — ' + sev if sev else ''}; " \
+                      f"read at {st.get('at', '')}. Click for the full list."
+            chips.append(ft.Container(
+                padding=ft.Padding.symmetric(horizontal=10, vertical=3),
+                border_radius=999,
+                bgcolor=ft.Colors.with_opacity(0.14, colour),
+                border=ft.Border.all(1, ft.Colors.with_opacity(0.4, colour)),
+                tooltip=tip,
+                on_click=lambda e, n=node: self._on_alarm_chip(n),
+                content=ft.Row([ft.Icon(ft.Icons.CIRCLE, size=9, color=colour),
+                                ft.Text(text, size=12, color=TEXT)],
+                               spacing=6, tight=True),
+            ))
+        if not chips:
+            chips = [ft.Text("Run Start, then ↻", size=12, color=TEXT_MUTED)]
+        self.alarm_chips.controls = chips
+
+    def _on_capture(self, kind: str) -> None:
+        self._evidence_focus = None
+        if kind == "bsc_traffic":
+            self.engine.capture_bsc_traffic()
+        else:
+            self.engine.capture_evidence(kind)
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_refresh_alarms(self, e) -> None:
+        self.engine.refresh_alarms()
+        self._refresh_chrome()
+        self.page.update()
+
+    def _on_alarm_chip(self, node: str) -> None:
+        """Open that node's tab of a fresh Alarms capture."""
+        self._evidence_focus = self.engine._node_label(node)
+        self.engine.capture_evidence("alarms")
+        self._refresh_chrome()
+        self.page.update()
+
+    def _evidence_dialog(self, event) -> None:
+        """Preview evidence by node/section; copy only on explicit button click."""
+        import os
+        images = [(label, path) for label, path in (event.images or [])
+                  if os.path.isfile(path)]
+        if not images:
+            return
+        # One node / one sector: the "All" image is the same picture twice.
+        if len(images) == 2:
+            images = images[1:]
+        focus = getattr(self, "_evidence_focus", None)
+        start = next((i for i, (label, _) in enumerate(images)
+                      if label == focus), 0)
+        self._evidence_focus = None
+        state = {"i": start}
+        note = ft.Text("Select an image, then press Copy.", size=12, color=TEXT_MUTED)
+        holder = ft.Container()
+        tab_row = ft.Row([], spacing=6, wrap=True)
+        cell_tab_row = ft.Row([], spacing=6, wrap=True)
+
+        def _select_sector(i):
+            sector = images[i][0]
+            child = next((j for j, (label, _) in enumerate(images)
+                          if label.startswith(sector + " / ")), i)
+            _select(child)
+
+        def _image(path):
+            with open(path, "rb") as fh:
+                return ft.Image(src=fh.read(), fit=ft.BoxFit.CONTAIN)
+
+        def _select(i, copy=False):
+            state["i"] = i
+            holder.content = ft.Column([_image(images[i][1])],
+                                       scroll=ft.ScrollMode.AUTO)
+            root = images[i][0].split(" / ", 1)[0]
+            tab_row.controls = [
+                ft.OutlinedButton(
+                    label,
+                    style=ft.ButtonStyle(
+                        color=ACCENT if label == root else TEXT_MUTED,
+                        bgcolor=(ft.Colors.with_opacity(0.14, ACCENT)
+                                 if label == root else None),
+                        side=ft.BorderSide(1, ACCENT if label == root else BORDER),
+                        shape=ft.RoundedRectangleBorder(radius=8)),
+                    on_click=lambda e, j=j: _select_sector(j))
+                for j, (label, _) in enumerate(images) if " / " not in label]
+            cell_tab_row.controls = [
+                ft.OutlinedButton(label.split(" / ", 1)[1],
+                    style=ft.ButtonStyle(color=ACCENT if j == i else TEXT_MUTED),
+                    on_click=lambda e, j=j: _select(j))
+                for j, (label, _) in enumerate(images) if label.startswith(root + " / ")]
+            cell_tab_row.visible = bool(cell_tab_row.controls)
+            if copy:
+                note.value, note.color = "Copying to the clipboard…", TEXT_MUTED
+                self.page.run_task(self._copy_image_async, images[i][1], note)
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        def _open(e):
+            from whatsapp_sender import open_containing_folder
+            open_containing_folder(images[state["i"]][1])
+
+        dlg = ft.AlertDialog(
+            title=ft.Text(event.caption or "Evidence", color=TEXT),
+            content=ft.Container(
+                width=1100, height=600,
+                content=ft.Column([tab_row, cell_tab_row, note,
+                                   ft.Container(content=holder, expand=True)],
+                                  spacing=8)),
+        )
+        dlg.actions = [
+            ft.TextButton("Open folder", on_click=_open),
+            ft.OutlinedButton("Copy", icon=ft.Icons.CONTENT_COPY,
+                              on_click=lambda e: _select(state["i"], copy=True)),
+            ft.ElevatedButton("Close", on_click=lambda e: self._close_dialog(dlg)),
+        ]
+        _select(start, copy=False)
+        self._show_dialog(dlg)
+
+    async def _copy_image_async(self, path: str, note) -> None:
+        from whatsapp_sender import copy_image_to_clipboard
+        ok, err = await asyncio.to_thread(copy_image_to_clipboard, path)
+        if ok:
+            note.value = ("Copied — paste into WhatsApp with Ctrl+V. "
+                          "attach the original PNG as a document to preserve the file quality.")
+            note.color = SUCCESS
+        else:
+            note.value = f"Could not copy the image ({err}). File: {path}"
+            note.color = DANGER
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     # ── button handlers ──────────────────────────────────────────
     def _on_start_hc(self, e) -> None:

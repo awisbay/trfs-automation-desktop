@@ -1286,3 +1286,30 @@ def parse_gsmsector_list(output: str) -> dict:
         op = words[1].upper() if len(words) >= 2 else ""
         out.setdefault(suffix, {})[trx] = {"adm": adm, "op": op}
     return out
+
+
+# ──────────────────────────────────────────────────────────────────
+# BSC rlcrp — busy traffic channels
+# ──────────────────────────────────────────────────────────────────
+#: A traffic-channel row of an ``rlcrp`` printout, e.g.
+#: ``59992 TCH-352258   FR      1,2,   BUSY   1        1800    EGPRS   GPRS`` or
+#: ``      TCH-352257   HR      1,3    LOCK   1        1800``. The lookbehind
+#: keeps SDCCH-/BCCH-/CBCH- rows (signalling, not traffic) out of the count.
+_RLCRP_TCH_RE = re.compile(
+    r"(?<![A-Z])TCH-\d+\b.*?\b(IDLE|BUSY|LOCK|BLOC\w*|HLOC\w*)\b", re.I)
+
+
+def parse_rlcrp_busy_tch(output: str) -> Optional[int]:
+    """Count traffic channels (``TCH-…``) whose STATE is BUSY in an ``rlcrp``
+    printout. Returns ``None`` when the output contains no TCH row at all (the
+    printout failed or the cell is unknown) — never a fabricated 0."""
+    busy = 0
+    seen = False
+    for line in strip_ansi(output or "").splitlines():
+        m = _RLCRP_TCH_RE.search(line)
+        if not m:
+            continue
+        seen = True
+        if m.group(1).upper() == "BUSY":
+            busy += 1
+    return busy if seen else None
