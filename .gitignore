@@ -87,3 +87,6 @@ scratchpad_build.log
 scratchpad_monitor.csv
 src/_load_pid.txt
 .ncstate
+
+# Extracted review material (not source)
+review_rev_e/

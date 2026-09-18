@@ -3,8 +3,8 @@ audit_page.py — standalone CDD Audit page.
 
 Just enter the Site ID + browse the CDD(s). The page then:
   * auto-finds the node dumps in LOG/<SITEID>/DUMP/ (*_modump.zip /
-    *_cmdump.zip), identifies each node from the filename, and parses ALL
-    of them (multi-node),
+    *_cmdump.zip), validates payload identities and selects the newest snapshot
+    for each node across formats,
   * for GSM, queries live via cmedit (BSC level) using the SSH credentials
     entered on the MAIN form (auto-filtered by Site ID, like the GSM checks
     in the integration flow),
@@ -388,13 +388,14 @@ class AuditPage:
         batch_nodes = batch_nodes or []
         is_batch = bool(batch_nodes)
         try:
-            from audit import dump_parser, cdd_reader, audit_core, cmedit_source
+            from audit import cdd_reader, audit_core, cmedit_source
             from app_path import get_app_dir
 
             label = cluster if is_batch else site
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", label)
             records = {}
             nodes = []
+            dump_evidence = []
 
             # ── 0. BATCH: export all nodes live into one combined dump ─────
             if is_batch:
@@ -425,13 +426,12 @@ class AuditPage:
                         return
                     self._log(f"Parsing combined dump: "
                               f"{os.path.basename(zip_path)} ...")
-                    records.update(dump_parser.parse_dump(zip_path))
-                    seen = set()
-                    for ldn in records:
-                        m = re.search(r"ManagedElement=([^,]+)", ldn)
-                        if m:
-                            seen.add(m.group(1))
-                    nodes = sorted(seen)
+                    from audit.dump_selection import select_node_dumps
+                    records, nodes, dump_evidence = select_node_dumps(
+                        [zip_path], expected_nodes=batch_nodes, log=self._log)
+                    if not records:
+                        self._fail("Batch dump contains no valid requested node identities — see log.")
+                        return
                     self._log(f"  → {len(records)} MO(s) across {len(nodes)} "
                               f"node(s): {', '.join(nodes[:6])}"
                               f"{' …' if len(nodes) > 6 else ''}")
@@ -443,58 +443,33 @@ class AuditPage:
                     self._log(f"GSM-only batch: {len(nodes)} node(s), no dump "
                               "export.")
 
-            # ── 1. Parse node dumps — browsed file(s) first, then auto-find ──
+            # ── 1. Select newest validated snapshots from browsed/auto files ──
             # Browsed dumps let you audit a node whose dump isn't in the site
             # folder, or point at a specific cm/modump. Both formats are
             # auto-detected by the parser. Auto-find still runs for LTE/NR.
             found = list(dumps)
             if not is_batch and (lte or nr or lld):
                 dump_dir = os.path.join(get_app_dir(), "LOG", safe, "DUMP")
-                root_cmdumps = sorted(
-                    glob.glob(os.path.join(dump_dir, "*_cmdump.zip")),
-                    key=os.path.getmtime, reverse=True,
-                )
-                root_modumps = glob.glob(os.path.join(dump_dir, "*_modump.zip"))
+                root_cmdumps = glob.glob(os.path.join(dump_dir, "*_cmdump*.zip"))
+                root_modumps = glob.glob(os.path.join(dump_dir, "*_modump*.zip"))
                 cutover_modumps = glob.glob(os.path.join(
                     get_app_dir(), "LOG", safe, "PRE_CUTOVER", "DUMP",
                     "*_modump_*.zip",
                 ))
-                modumps = sorted(
-                    root_modumps + cutover_modumps,
-                    key=os.path.getmtime, reverse=True,
-                )
+                modumps = root_modumps + cutover_modumps
                 auto = root_cmdumps + modumps
                 if not auto and not dumps:
                     self._log(f"⚠ No dumps in {dump_dir} and none browsed — "
                               "LTE/NR audit will find nothing.")
                 found += auto
-            for path in found:
-                if not os.path.isfile(path):
-                    self._log(f"  ✗ dump not found: {path}")
-                    continue
-                base = os.path.basename(path)
-                node = re.sub(
-                    r"_(cm|mo)dump(?:_\d{8}_\d{6})?\.(zip|gz|log|xml)$",
-                    "", base,
-                )
-                node = re.sub(r"\.(zip|gz|log|xml)$", "", node)
-                # Scope to the entered Site ID — a browsed dump left over from a
-                # previous site (the field isn't cleared when Site ID changes)
-                # must not leak another site's nodes into this report.
-                if not node.lower().startswith(site.lower()):
-                    self._log(f"  ⚠ {base}: node '{node}' ≠ Site ID '{site}' — "
-                              "skipped (wrong site).")
-                    continue
-                if node in nodes:
-                    continue          # already parsed this node's dump (cmdump wins)
-                self._log(f"Parsing dump for {node}: {base} ...")
-                try:
-                    recs = dump_parser.parse_dump(path)
-                    records.update(recs)
-                    nodes.append(node)
-                    self._log(f"  → {len(recs)} MO(s).")
-                except Exception as exc:
-                    self._log(f"  ✗ parse failed: {exc}")
+            from audit.dump_selection import select_node_dumps
+            extra_records, extra_nodes, extra_evidence = select_node_dumps(
+                found, site=("" if is_batch else site),
+                expected_nodes=(batch_nodes if is_batch else None),
+                existing_nodes=nodes, log=self._log)
+            records.update(extra_records)
+            nodes.extend(extra_nodes)
+            dump_evidence.extend(extra_evidence)
             self._log(f"Nodes from dumps: {', '.join(nodes) or '(none)'}")
 
             cdd_paths = {}
@@ -625,22 +600,27 @@ class AuditPage:
             # match by Site ID (gsmNodeName starts with it). So read CDD for
             # each dump node AND the Site ID itself, then de-dup.
             self._log("Reading CDD (config-driven) for all nodes...")
+            cdd_started = time.perf_counter()
             read_keys = list(nodes)
             if site and site not in read_keys:
                 read_keys.append(site)
             items = []
             seen_items = set()
-            for node in read_keys:
-                for it in cdd_reader.read_audit_items(cdd_paths, node, audit_map,
-                                                      log=self._log):
-                    sig = (it.tech, it.category, it.mo_local,
-                           it.parameter, it.key, it.expected)
-                    if sig in seen_items:
-                        continue
-                    seen_items.add(sig)
-                    items.append(it)
+            with cdd_reader.CddReadCache() as cdd_cache:
+                for node in read_keys:
+                    node_started = time.perf_counter()
+                    for it in cdd_reader.read_audit_items(cdd_paths, node, audit_map,
+                                                          log=self._log, cache=cdd_cache):
+                        sig = (it.tech, it.category, it.mo_local,
+                               it.parameter, it.key, it.expected)
+                        if sig in seen_items:
+                            continue
+                        seen_items.add(sig)
+                        items.append(it)
+                    self._log(f"CDD {node}: read completed in {time.perf_counter() - node_started:.1f}s "
+                              "(shared workbook cache).")
             self._log(f"Total expected params: {len(items)} across "
-                      f"{len(read_keys)} key(s).")
+                      f"{len(read_keys)} key(s); CDD reading took {time.perf_counter() - cdd_started:.1f}s.")
             if not items and not lld:
                 self._fail("No CDD rows matched these nodes "
                            "(check node names vs eNodeBName/gsmNodeName in CDD).")
@@ -754,6 +734,12 @@ class AuditPage:
             bandwidth_results = audit_bandwidth_license(records, nodes=nodes)
             results += bandwidth_results
             bandwidth_counts = Counter(r.status for r in bandwidth_results)
+            from audit.trx_license_audit import audit_trx_license
+            trx_results = audit_trx_license(records, nodes=nodes)
+            results += trx_results
+            trx_counts = Counter(r.status for r in trx_results)
+            self._log(f"GSM TRX license: {trx_counts['Match']} sufficient, "
+                      f"{trx_counts['Mismatch']} insufficient, {trx_counts['NotFound']} unresolved.")
             self._log(f"Bandwidth license: {bandwidth_counts['Match']} sufficient, "
                       f"{bandwidth_counts['Mismatch']} insufficient, "
                       f"{bandwidth_counts['NotFound']} unresolved.")
@@ -771,7 +757,7 @@ class AuditPage:
                 frules = audit_map.get("feature_rules") or {}
                 cdd_tx = {}
                 for it in items:
-                    if it.parameter == "noOfTxAntennas":
+                    if it.tech == "lte_nr" and it.parameter == "noOfTxAntennas":
                         try:
                             cdd_tx.setdefault(it.node or site, set()).add(
                                 int(str(it.expected).strip()))
@@ -779,7 +765,8 @@ class AuditPage:
                             pass
                 fr = audit_core.audit_features(
                     records, frules, cdd_tx_by_node=cdd_tx, nodes=nodes,
-                    log=self._log)
+                    log=self._log,
+                    cdd_tx_by_carrier=audit_core.cdd_lte_tx_by_carrier(items, records))
                 if fr:
                     results += fr
                     frc = Counter(r.status for r in fr)
@@ -947,6 +934,9 @@ class AuditPage:
                             else (os.path.basename(gsm) if gsm else "-")),
                 "LLD": os.path.basename(lld) if lld else "-",
                 "Mode": "Batch / Cluster" if is_batch else "Single site",
+                "Dump sources": "\n".join(
+                    f"{row['node']}: {row['path']} | {row['timestamp']} | {row['time_basis']}"
+                    for row in dump_evidence) or "-",
                 "Generated": ts,
             }, lld_results=lld_results, cell_rows=cell_rows,
                 ess_rows=ess_rows, power_results=power_results,

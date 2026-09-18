@@ -4,6 +4,71 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.13.0] - 2026-09-18
+
+### Added
+- **Audit picks one coherent dump per node.** When several cmdump/modump files
+  exist for a node, the newest snapshot wins across both formats and is never
+  back-filled with attributes from an older file. The capture time in the file
+  name takes precedence over the copy's modification time; a file whose content
+  belongs to a different node than its name is rejected; generic or combined
+  exports take their node list from the content itself. The choice made for
+  each node is logged as evidence.
+- **Mixed-mode feature rules.** Mixed Mode GSM (CXC4012017) is required when a
+  baseband carries GSM together with another technology, Mixed Mode LTE
+  (CXC4012015) likewise for LTE, and CXC4012026 / CXC4011018 are always
+  required. Separate basebands and external neighbours never trigger mixed mode.
+
+### Changed
+- **Feature detection is stricter about where a requirement comes from.** For
+  MIMO features the CDD wins, then the node configuration, and attached RF
+  branches are used only when neither is available; NR carriers no longer gate
+  LTE MIMO features, and each LTE carrier keeps its own CDD priority. AAS
+  detection falls back to the radio product name when the FRU id does not say
+  (the FRU id still wins when it does). Capacity features read their real MO for
+  state and in the generated script.
+- **Missing required features are reported even where a baseline rule exists**,
+  instead of being suppressed.
+- **Power license demand is calculated per physical radio.** Configured power
+  of every carrier and GSM TRX is summed per radio, then one 20 W capacity unit
+  (the radio's initial package) is subtracted per radio, never per carrier, with
+  a floor of zero. A radio shared between basebands gets its initial package on
+  each BB; aliases/duplicate branches of the same radio count once. The remark
+  shows the per-radio breakdown. If a carrier can't be tied to exactly one
+  physical radio, the node is reported as unresolved rather than guessed.
+
+## [1.12.0] - 2026-09-16
+
+### Added
+- **Audit: GSM TRX license capacity.** Per-node check of configured TRX against
+  the granted TRX capacity (CXC4012021 / CXC4012037); installed keys are not
+  added together. Reported only — never a correction target.
+- **Audit report "Remark" column.** Each finding can carry a plain-language
+  remark (e.g. power shortage in capacity units, or why an activation script was
+  left out). Expected/actual headers now read "CDD / Required" and
+  "Node / Granted".
+
+### Changed
+- **TermPointToGNB mismatches now generate a fix**, but only for a strictly
+  validated case: an `ipAddress` mismatch on a real `TermPointToGNB` MO whose
+  expected value is a valid, non-zero, non-multicast IPv4 address. Everything
+  else stays report-only.
+- **Feature activation scripts are skipped when the license is not ENABLED** —
+  the row is still reported, with a remark, but no `featureState 1` is emitted
+  for a feature the node cannot activate. `licenseState` is never a correction
+  target.
+- **Power license** evidence is shown in the main audit sheet (source + remark)
+  instead of separate sheets.
+- **LLD reader tolerates layout changes:** the header row is found
+  automatically (titles/notes above it are fine), header names are matched by
+  concept (e.g. "Baseband RI Port", "RRU CPRI Port"), and ambiguous headers or
+  columns raise a clear error instead of being guessed. A skipped CPRI check now
+  logs which headers were recognised.
+- **RET audit** also resolves port-only RET labels (`<site/band>_R<n>`) using the
+  AntennaUnitGroup sector.
+- **CDD reading is faster:** each workbook/sheet is read once per audit and
+  shared across nodes, with per-node timing in the log.
+
 ## [1.11.0] - 2026-09-16
 
 ### Added

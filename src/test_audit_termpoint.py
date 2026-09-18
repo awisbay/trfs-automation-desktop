@@ -122,9 +122,22 @@ class TermPointAuditTests(unittest.TestCase):
         self.assertEqual([(r.ref_cell, r.expected, r.status) for r in rows],
                          [(NR, "10.40.128.0", "Mismatch"), (other, "10.40.128.2", "Match")])
 
-    def test_audit_only_no_generated_set_commands(self):
-        from audit.audit_core import _NON_SETTABLE_CATEGORIES
-        self.assertIn("termpoint-gnb", _NON_SETTABLE_CATEGORIES)
+    def test_correction_only_for_valid_mismatch(self):
+        from audit.audit_core import generate_moshell_scripts, _collect_set_rows
+        from dataclasses import replace
+        rows = audit_termpoint_to_gnb(fixture())
+        row = next(r for r in rows if r.status == "Mismatch")
+        with tempfile.TemporaryDirectory() as folder:
+            files = generate_moshell_scripts(rows, folder, "MIN3117", "audit.xlsx")
+            self.assertEqual(len(files), 1)
+            text = Path(files[0]).read_text(encoding="utf-8")
+            self.assertIn(f"set {row.mo}$ ipAddress 10.40.128.0", text)
+            self.assertEqual(len(_collect_set_rows(rows, ("Mismatch",), "MIN3117")), 1)
+            for invalid in (replace(row, expected="(unavailable)"),
+                            replace(row, expected="0.0.0.0"),
+                            replace(row, mo="TermPointToGNB"),
+                            replace(row, status="NotFound")):
+                self.assertEqual(_collect_set_rows([invalid], ("Mismatch", "NotFound"), "MIN3117"), {})
 
     def test_intmom_modump(self):
         payload = "\n".join(f"{dn} {k} {v}" for dn, attrs in fixture().items()

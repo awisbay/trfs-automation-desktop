@@ -79,6 +79,20 @@ def _tilt_deg(raw) -> str:
     return str(int(f)) if f == int(f) else str(f)
 
 
+def _ret_identity(label, ldn):
+    """Explicit label sector first; port-only labels use their AUG sector."""
+    parsed = _parse_ret(label)
+    if parsed:
+        return parsed
+    # Only the observed site/band + R-port form is eligible. N/A labels
+    # and arbitrary text cannot identify which cells the RET controls.
+    match = re.fullmatch(r'([A-Za-z][A-Za-z0-9]*)_R\d+(?:/R?\d+)*', str(label or '').strip(), re.I)
+    sector = re.search(r'(?:^|,)AntennaUnitGroup=[^,]*_S(\d+)(?:,|$)', ldn, re.I)
+    if match and sector:
+        return match[1].upper(), sector[1]
+    return None
+
+
 def _eq(a: str, b: str) -> bool:
     try:
         return abs(float(a) - float(b)) < 1e-6
@@ -140,7 +154,7 @@ def audit_etilt(targets: List[tuple],
     for ldn, a in records.items():
         if ldn.split(",")[-1].split("=", 1)[0] != "RetSubUnit":
             continue
-        p = _parse_ret(a.get("userLabel") or "")
+        p = _ret_identity(a.get("userLabel") or "", ldn)
         t = a.get("electricalAntennaTilt")
         if p and t not in (None, ""):
             ret_by[p].append((_below_me(ldn), str(t)))

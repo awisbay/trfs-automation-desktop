@@ -95,8 +95,24 @@ def _hnorm(s) -> str:
     return re.sub(r"\s+", " ", str(s).replace("\xa0", " ")).strip()
 
 
+class CddReadCache:
+    """One audit's complete sheets; never shared across runs or workers."""
+    def __init__(self):
+        self.workbooks = {}
+        self.sheets = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        for wb in self.workbooks.values():
+            wb.close()
+        self.workbooks.clear()
+        self.sheets.clear()
+
+
 def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
-                     audit_map: dict, log=lambda m: None) -> List[AuditItem]:
+                     audit_map: dict, log=lambda m: None, cache=None) -> List[AuditItem]:
     """Read all profiles whose tech has a CDD file provided → AuditItems for
     the audited ``node_name``.
 
@@ -105,8 +121,8 @@ def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
     re-reading per profile made audits take minutes."""
     node_l = _norm(node_name)
     items: List[AuditItem] = []
-    wbcache: Dict[str, object] = {}       # path -> workbook
-    sheet_cache: Dict[tuple, tuple] = {}  # (path, sheet, header_row) -> (col_idx, rows)
+    wbcache = cache.workbooks if cache is not None else {}
+    sheet_cache = cache.sheets if cache is not None else {}
     try:
         for prof in audit_map.get("profiles", []):
             tech = prof.get("tech", "")
@@ -119,7 +135,7 @@ def read_audit_items(cdd_paths: Dict[str, str], node_name: str,
             except Exception as exc:
                 log(f"[audit] profile '{prof.get('name')}' failed: {exc}")
     finally:
-        for wb in wbcache.values():
+        for wb in (() if cache is not None else wbcache.values()):
             try:
                 wb.close()
             except Exception:
@@ -146,7 +162,10 @@ def _get_sheet(path, sheet, header_row, sheet_cache, wbcache, want_col=None):
     if sheet not in wb.sheetnames:
         sheet_cache[key] = (None, None)
         return sheet_cache[key]
-    rows = list(wb[sheet].iter_rows(min_row=header_row, values_only=True))
+    raw_key = (path, sheet, "complete-rows")
+    if raw_key not in sheet_cache:
+        sheet_cache[raw_key] = list(wb[sheet].iter_rows(values_only=True))
+    rows = sheet_cache[raw_key][header_row - 1:]
     if not rows:
         sheet_cache[key] = ({}, [])
         return sheet_cache[key]

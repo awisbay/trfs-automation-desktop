@@ -3,6 +3,106 @@ from audit.bandwidth_audit import audit_bandwidth_license, RULES
 
 
 class BandwidthTests(unittest.TestCase):
+    def test_fru_name_classification_aas_precedence_and_name_priority(self):
+        records = self.fixture()
+        records = {dn.replace('FieldReplaceableUnit=RADIO', 'FieldReplaceableUnit=B0B28_RRU2'):
+                   {k: v.replace('FieldReplaceableUnit=RADIO', 'FieldReplaceableUnit=B0B28_RRU2') for k, v in a.items()}
+                   for dn, a in records.items()}
+        records = {dn.replace('FieldReplaceableUnit=AIR', 'FieldReplaceableUnit=AAS_B41_RRU1'):
+                   {k: v.replace('FieldReplaceableUnit=AIR', 'FieldReplaceableUnit=AAS_B41_RRU1') for k, v in a.items()}
+                   for dn, a in records.items()}
+        radio = records['ManagedElement=BB1,FieldReplaceableUnit=B0B28_RRU2']
+        air = records['ManagedElement=BB1,FieldReplaceableUnit=AAS_B41_RRU1']
+        radio.clear()
+        air.clear()
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual((rows['2367'].expected, rows['2367'].status), ('4', 'Match'))
+        self.assertEqual(rows['2283'].expected, '4')
+        self.assertIn('B0B28_RRU2', rows['2367'].remark)
+        self.assertIn('AAS_B41_RRU1', rows['2283'].remark)
+        radio['productName'] = 'AIR 6419'
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual(rows['2217'].expected, '0')
+        self.assertEqual(rows['2367'].expected, '4')
+        radio['productName'] = 'Unknown product'
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual(rows['2367'].status, 'Match')
+
+    def test_empty_array_manual_and_carrier_band_fallback(self):
+        records = self.fixture()
+        records['ManagedElement=BB1,NRCellDU=N'].update(bandList='i[0] =', bandListManual='[1] = 41')
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual(rows['2290'].expected, '4')
+        records['ManagedElement=BB1,NRCellDU=N'].update(bandList='', bandListManual='', nRSectorCarrierRef='NRSectorCarrier=N41_S1')
+        records['ManagedElement=BB1,NRSectorCarrier=N41_S1'] = records.pop('ManagedElement=BB1,NRSectorCarrier=N')
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual((rows['2290'].expected, rows['2290'].status), ('4', 'Match'))
+        self.assertIn('NR band from NRSectorCarrier=N41_S1', rows['2290'].remark)
+
+    def test_missing_references_have_specific_english_remarks(self):
+        records = self.fixture()
+        records['ManagedElement=BB1,NRCellDU=N']['nRSectorCarrierRef'] = 'NRSectorCarrier=MISSING'
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertIn('NRCellDU is not linked', rows['2290'].remark)
+        del records['ManagedElement=BB1,RfBranch=1']
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertIn('Reference path incomplete:', rows['2367'].remark)
+        self.assertIn('RfBranch=1', rows['2367'].remark)
+
+    def test_dangling_extra_nr_cell_is_not_silently_ignored(self):
+        records = self.fixture()
+        records['ManagedElement=BB1,NRCellDU=ORPHAN'] = {'bandListManual': '41',
+                                                      'nRSectorCarrierRef': 'NRSectorCarrier=MISSING'}
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual(rows['2290'].status, 'NotFound')
+        self.assertIn('NRCellDU=ORPHAN', rows['2290'].remark)
+        self.assertIn('NRSectorCarrier=MISSING', rows['2290'].remark)
+
+    def test_manual_band_fallback_and_active_band_precedence(self):
+        records = self.fixture()
+        cell = records['ManagedElement=BB1,NRCellDU=N']
+        cell.update(bandList='', bandListManual='41')
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual((rows['2290'].expected, rows['2290'].status), ('4', 'Match'))
+        self.assertEqual(rows['2283'].expected, '4')
+        cell.update(bandList='999', bandListManual='41')
+        self.assertEqual({r.mo[-4:]: r for r in audit_bandwidth_license(records)}['2290'].status, 'NotFound')
+
+    def test_per_node_technology_filter_even_with_unused_license_mos(self):
+        records = self.fixture()
+        lte_codes = {'1622', '2367', '2203', '2217'}
+        nr_codes = {'2290', '2283', '2284', '2321', '2322'}
+        for technology in ('gsm', 'lte-gsm', 'nr-gsm', 'lte-nr-gsm'):
+            with self.subTest(technology=technology):
+                mos = dict(records)
+                if 'lte' not in technology:
+                    mos = {dn: a for dn, a in mos.items() if 'EUtranCell' not in dn}
+                if 'nr' not in technology:
+                    mos = {dn: a for dn, a in mos.items() if 'NRCellDU=' not in dn and 'NRSectorCarrier=' not in dn}
+                mos['ManagedElement=BB1,BtsFunction=1,GsmSector=S1,Trx=0'] = {}
+                codes = {row.mo[-4:] for row in audit_bandwidth_license(mos)}
+                expected = (lte_codes if 'lte' in technology else set()) | (nr_codes if 'nr' in technology else set())
+                self.assertEqual(codes, expected)
+
+    def test_ess_anchor_does_not_require_local_nr(self):
+        records = {dn: a for dn, a in self.fixture().items()
+                   if 'NRCellDU=' not in dn and 'NRSectorCarrier=' not in dn}
+        records['ManagedElement=BB1,EUtranCellFDD=F,GUtranCellRelation=NR'] = {'essEnabled': 'true'}
+        records['ManagedElement=BB1,SectorCarrier=F']['essScPairId'] = '1'
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual(rows['2411'].expected, '4')
+        self.assertNotIn('2290', rows)
+
+    def test_concise_report_without_calculation_detail(self):
+        records = self.fixture()
+        records['ManagedElement=BB1,Lm=1,CapacityState=CXC4011622']['grantedCapacityLevel'] = '5'
+        rows = {row.mo[-4:]: row for row in audit_bandwidth_license(records)}
+        self.assertEqual(rows['1622'].source, 'CapacityState=CXC4011622')
+        self.assertIn('shortage 1', rows['1622'].remark)
+        self.assertIn('sufficient', rows['2367'].remark)
+        for row in rows.values():
+            self.assertNotIn('MHz/', row.source + row.remark)
+
     def fixture(self):
         r = {
             'ManagedElement=BB1,EUtranCellFDD=F': {'dlChannelBandwidth':'20000', 'ulChannelBandwidth':'20000', 'sectorCarrierRef':'SectorCarrier=F'},

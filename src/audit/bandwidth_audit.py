@@ -20,6 +20,12 @@ RULES = {
 }
 
 
+def _nr_bands(value):
+    # Ignore array-count markers: i[0] = is an empty list, not band zero.
+    text = re.sub(r'(?:i)?\[\d+\]\s*=?', '', str(value or ''))
+    return {int(b) for b in re.findall(r'\d+', text)}
+
+
 def audit_bandwidth_license(records, nodes=None):
     grouped = defaultdict(dict)
     for dn, attrs in records.items():
@@ -29,12 +35,17 @@ def audit_bandwidth_license(records, nodes=None):
     results = []
     for node in sorted(set(nodes) if nodes is not None else grouped):
         mos = grouped.get(node, {})
-        if not any(mo.split(',')[-1].split('=')[0] in
-                   ('EUtranCellFDD', 'EUtranCellTDD', 'NRSectorCarrier') for mo in mos):
+        classes = {mo.split(',')[-1].split('=')[0] for mo in mos}
+        has_lte = bool(classes & {'EUtranCellFDD', 'EUtranCellTDD'})
+        has_nr = bool(classes & {'NRCellDU', 'NRSectorCarrier'})
+        if not has_lte and not has_nr:
             continue
         totals = {k: Decimal(0) for k in RULES}
-        evidence = defaultdict(list)
         errors = defaultdict(list)
+        fallback_notes = defaultdict(set)
+        if has_nr and 'NRSectorCarrier' not in classes:
+            for key in ('2290', '2283', '2284', '2321', '2322'):
+                errors[key].append('NR cells present but NRSectorCarrier evidence missing')
 
         def attr(a, key):
             return next((v for k, v in a.items() if k.lower() == key.lower()), '')
@@ -50,38 +61,61 @@ def audit_bandwidth_license(records, nodes=None):
             return hits[0] if len(hits) == 1 else None
 
         def aas(carrier, nr=False):
-            sef = resolve(attr(carrier, 'sectorEquipmentFunctionRef' if nr else 'sectorFunctionRef'))
+            sef_ref = attr(carrier, 'sectorEquipmentFunctionRef' if nr else 'sectorFunctionRef')
+            sef = resolve(sef_ref)
             if sef is None:
-                return None
+                return None, set(), f'Reference path incomplete: SectorCarrier -> SectorEquipmentFunction [{sef_ref or "reference missing"}]'
             refs = str(attr(sef, 'rfBranchRef')).split(';')
             kinds = set()
+            fallback_frus = set()
             for ref in refs:
                 if 'FieldReplaceableUnit=' in ref:
                     radio_ref = ref
                 else:
                     branch = resolve(ref)
                     if branch is None:
-                        return None
+                        return None, set(), f'Reference path incomplete: SectorCarrier -> SectorEquipmentFunction [{sef_ref}] -> RfBranch [{ref or "reference missing"}]'
                     radio_ref = attr(branch, 'rfPortRef') or ref
                 fru_ref = re.sub(r',(?:RfPort|Transceiver)=.*$', '', str(radio_ref))
                 fru = resolve(fru_ref)
                 if fru is None:
-                    return None
-                product = str(attr(fru, 'productData.productName') or attr(fru, 'productName'))
+                    return None, set(), f'Reference path incomplete: SectorCarrier -> SectorEquipmentFunction [{sef_ref}] -> RfBranch [{ref}] -> FieldReplaceableUnit [{fru_ref or "reference missing"}]'
+                product = str(attr(fru, 'productData.productName') or attr(fru, 'productName')).strip()
                 if not product:
                     match = re.search(r'productName=([^,}]+)', str(attr(fru, 'productData')))
-                    product = match[1] if match else ''
-                if product.startswith('AIR '):
+                    product = match[1].strip() if match else ''
+                match = re.search(r'(?:^|,)FieldReplaceableUnit=([^,]+)$', fru_ref)
+                name = match[1] if match else ''
+                # Operator convention is authoritative: AAS FRUs also have
+                # an RRU suffix, so check AAS before RRU.
+                if re.search(r'(?:^|[^A-Z0-9])AAS(?:$|[^A-Z0-9])', name.upper()):
                     kinds.add(True)
-                elif product.startswith('Radio '):
+                    fallback_frus.add(name)
+                elif re.search(r'(?:^|[^A-Z0-9])RRU\d*(?:$|[^A-Z0-9])', name.upper()):
+                    kinds.add(False)
+                    fallback_frus.add(name)
+                elif product.upper().startswith('AIR '):
+                    kinds.add(True)
+                elif product.upper().startswith('RADIO '):
                     kinds.add(False)
                 else:
-                    return None
-            return kinds.pop() if len(kinds) == 1 else None
+                    return None, set(), f'Radio type cannot be identified: FieldReplaceableUnit={name}; AAS/RRU naming and radio product unavailable or unrecognized'
+            if len(kinds) != 1:
+                return None, set(), 'Unexpected mixed AAS/non-AAS radio references; verify the carrier reference path'
+            return kinds.pop(), fallback_frus, ''
 
         def add(key, mo, bw, divisor):
             totals[key] += bw / Decimal(divisor)
-            evidence[key].append(f'{mo}: {display(bw)}MHz/{divisor}')
+
+        for cell_mo, cell_attrs in mos.items():
+            if not cell_mo.split(',')[-1].startswith('NRCellDU='):
+                continue
+            refs = str(attr(cell_attrs, 'nRSectorCarrierRef')).split(';')
+            if any(not re.search(r'(?:^|,)NRSectorCarrier=[^,]+$', ref.strip())
+                   or resolve(ref) is None for ref in refs):
+                for key in ('2290', '2283', '2284', '2321', '2322'):
+                    errors[key].append(f'{cell_mo}: NRCellDU is not linked to a valid NRSectorCarrier; '
+                                       f'nRSectorCarrierRef=[{attr(cell_attrs, "nRSectorCarrierRef") or "reference missing"}]')
 
         for mo, a in mos.items():
             cls = mo.split(',')[-1].split('=')[0]
@@ -94,7 +128,17 @@ def audit_bandwidth_license(records, nodes=None):
                 carrier = a
                 cells = [ca for cm, ca in mos.items() if cm.split(',')[-1].startswith('NRCellDU=')
                          and any(resolve(ref) is a for ref in str(attr(ca, 'nRSectorCarrierRef')).split(';'))]
-                bands = {int(b) for ca in cells for b in re.findall(r'\d+', re.sub(r'^i\[\d+\]\s*=\s*', '', str(attr(ca, 'bandList'))))}
+                bands = set()
+                for ca in cells:
+                    bands.update(_nr_bands(attr(ca, 'bandList')) or _nr_bands(attr(ca, 'bandListManual')))
+                if cells and not bands:
+                    # Last resort: established N41_S1 / N28_S1 carrier naming.
+                    name = mo.split('NRSectorCarrier=', 1)[-1]
+                    match = re.fullmatch(r'N(\d+)(?:_.*)?', name, re.IGNORECASE)
+                    if match:
+                        bands = {int(match[1])}
+                        for key in ('2290', '2283', '2284', '2321', '2322'):
+                            fallback_notes[key].add('NR band from NRSectorCarrier=' + name)
                 # Supported duplex classifications; unsupported bands remain unverified.
                 tdd_bands = {38, 40, 41, 48, 77, 78, 79, 90}
                 fdd_bands = {1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20, 25, 26, 28, 66, 68, 71}
@@ -109,16 +153,28 @@ def audit_bandwidth_license(records, nodes=None):
                 carrier = resolve(attr(a, 'sectorCarrierRef'))
                 affected = ['1622', '2367', '2203' if tdd else '2217', '2411']
             if bw is None or bw <= 0 or tdd is None or ul != bw:
+                reasons = []
+                if nr and not cells:
+                    reasons.append('NRCellDU is not linked to this NRSectorCarrier; check nRSectorCarrierRef')
+                if bw is None or bw <= 0:
+                    reasons.append('Bandwidth DL missing or invalid; verify dump completeness')
+                if ul is None or ul != bw:
+                    reasons.append('Bandwidth UL missing/invalid or differs from DL; verify dump values')
+                if tdd is None and (not nr or cells):
+                    reasons.append('NR duplex cannot be identified from bandList, bandListManual or NRSectorCarrier name; band unsupported or inconsistent')
                 for k in affected:
-                    errors[k].append(f'{mo}: missing/invalid bandwidth, unknown duplex, or asymmetric DL/UL')
+                    errors[k].append(f'{mo}: ' + '; '.join(reasons))
                 continue
             add('2290' if nr else '1622', mo, bw, 10 if tdd else 5)
-            is_aas = aas(carrier, nr) if carrier is not None else None
+            classification = aas(carrier, nr) if carrier is not None else (None, set(),
+                f'Reference path incomplete: Cell [{mo}] -> SectorCarrier [{attr(a, "sectorCarrierRef") or "reference missing"}]')
+            is_aas, fallback_frus, reference_error = classification
             if is_aas is None:
                 for k in (['2283', '2284', '2321', '2322'] if nr else ['2367', '2203' if tdd else '2217']):
-                    errors[k].append(f'{mo}: radio product/topology unavailable')
+                    errors[k].append(f'{mo}: {reference_error}')
             else:
                 key = ('2283' if tdd else '2284') if nr and is_aas else ('2322' if tdd else '2321') if nr else ('2203' if tdd else '2217') if is_aas else '2367'
+                fallback_notes[key].update(fallback_frus)
                 # NR TDD non-AAS uses 5MHz BW units (sample nodes MIN1802,
                 # MIN3745, MIN3785 and MIN5134); AAS uses 10MHz units.
                 add(key, mo, bw, 10 if is_aas else 5)
@@ -130,8 +186,16 @@ def audit_bandwidth_license(records, nodes=None):
                 if shared and pair not in ('', '0'):
                     add('2411', mo, bw, 5)
                 elif shared or pair not in ('', '0'):
-                    errors['2411'].append(f'{mo}: incomplete ESS evidence')
+                    errors['2411'].append(f'{mo}: ESS configuration incomplete/inconsistent (essEnabled versus essScPairId); review the ESS audit')
         for key, label in RULES.items():
+            if key in ('1622', '2367', '2203', '2217') and not has_lte:
+                continue
+            if key in ('2290', '2283', '2284', '2321', '2322') and not has_nr:
+                continue
+            # ESS belongs to the LTE anchor and may target NR on another BB.
+            # Do not require local NR, but skip when no sharing is configured.
+            if key == '2411' and not (has_lte and (totals[key] or errors[key])):
+                continue
             hits = [a for mo, a in mos.items() if mo.endswith('CapacityState=CXC401' + key)]
             granted = number(attr(hits[0], 'grantedCapacityLevel')) if len(hits) == 1 else None
             problems = errors[key]
@@ -139,9 +203,19 @@ def audit_bandwidth_license(records, nodes=None):
                 problems = problems + ['grantedCapacityLevel unavailable/invalid']
             required = totals[key]
             status = 'NotFound' if problems else 'Match' if granted >= required else 'Mismatch'
-            source = '; '.join(evidence[key] + problems) or 'No applicable configured carriers'
+            source = 'CapacityState=CXC401' + key
+            if problems:
+                remark = '; '.join(problems)
+            elif granted < required:
+                remark = f'Insufficient bandwidth license; shortage {display(required - granted)} capacity units.'
+            elif required == 0:
+                remark = 'No applicable configured carriers.'
+            else:
+                remark = 'Bandwidth license capacity is sufficient.'
+            if fallback_notes[key]:
+                remark += ' Classification based on naming: ' + ', '.join(sorted(fallback_notes[key])) + '.'
             results.append(AuditResult('bandwidth-license', node,
                 'SystemFunctions=1,Lm=1,CapacityState=CXC401' + key, label,
                 '(unverified)' if errors[key] else display(required), display(granted),
-                status, source, node))
+                status, source, node, remark=remark))
     return results

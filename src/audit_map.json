@@ -351,6 +351,18 @@
   ],
   "_comment_feature_rules": "Conditional feature compliance. detect => when that config is present on the node the listed CXC features MUST be featureState=ACTIVATED & licenseState=ENABLED; when the config is ABSENT they must be DEACTIVATED. Editable, no rebuild.",
   "feature_rules": {
+    "mixed_mode_gsm": {
+      "detect": "mixed_gsm",
+      "features": ["CXC4012017"]
+    },
+    "mixed_mode_lte": {
+      "detect": "mixed_lte",
+      "features": ["CXC4012015"]
+    },
+    "always_required": {
+      "detect": "always",
+      "features": ["CXC4012026", "CXC4011018"]
+    },
     "lte": {
       "detect": "lte",
       "features": [
@@ -418,8 +430,6 @@
         "CXC4011966",
         "CXC4011055",
         "CXC4011999",
-        "CXC4012015",
-        "CXC4011018",
         "CXC4011345",
         "CXC4010723",
         "CXC4011485",

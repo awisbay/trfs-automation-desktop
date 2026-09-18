@@ -178,18 +178,61 @@ def _radio_type_matches(cdd_type: str, radio_fru: str) -> bool:
     return any(cb in b for cb in cdd_bands) or any(fb in a for fb in fru_bands)
 
 
+def _canonical_header(value) -> str:
+    """Resolve known LLD concepts, allowing formatting and trailing notes.
+
+    Match the leading concept rather than fuzzy similarity: the cascade BB
+    header mentions Radio DATA Port too, but is still a BB RI Port column.
+    Unknown concepts stay unchanged rather than being guessed.
+    """
+    name = str(value).strip() if value is not None else ""
+    text = re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
+    aliases = {
+        "PLA ID": ("pla id", "plaid", "site id"),
+        "BBID": ("bbid", "bb id", "baseband id"),
+        "BB RI Port": ("bb ri port", "baseband ri port", "baseband cpri port", "bb cpri port"),
+        "Radio DATA Port": ("radio data port", "rru data port", "rru cpri port"),
+        "Radio Type": ("radio type", "rru type"),
+        "Radio Number": ("radio number", "radio no", "rru number", "rru no"),
+        "Sector": ("sector", "sector id", "sector number"),
+        "Radio Shared between BB": ("radio shared between bb", "radio shared between basebands"),
+    }
+    # Longest alias wins (e.g. Radio Number, not another Radio concept).
+    matches = [(len(alias), canonical) for canonical, names in aliases.items()
+               for alias in names if text == alias or text.startswith(alias + " ")]
+    if matches:
+        return max(matches)[1]
+    bb = re.fullmatch(r"(?:bb|baseband)\s*(\d+)", text)
+    return f"BB-{int(bb.group(1))}" if bb else name
+
+
 def _sheet_rows(wb, sheet: str, header_row: int):
     if sheet not in wb.sheetnames:
         return None, None
-    rows = list(wb[sheet].iter_rows(min_row=header_row, values_only=True))
+    rows = list(wb[sheet].iter_rows(values_only=True))
     if not rows:
         return {}, []
+    # Titles/notes may move the header row in subsequent workbook revisions.
+    candidates = []
+    for index, row in enumerate(rows[:20]):
+        names = [_canonical_header(h) for h in row]
+        is_header = "PLA ID" in names and (
+            "BBID" in names or any(re.fullmatch(r"BB-\d+", n) for n in names))
+        if is_header:
+            candidates.append(index)
+    if len(candidates) > 1:
+        raise ValueError(f"LLD '{sheet}': ambiguous header rows {[i + 1 for i in candidates]}")
+    index = candidates[0] if candidates else header_row - 1
+    if index >= len(rows):
+        return {}, []
     col = {}
-    for i, h in enumerate(rows[0]):
-        name = str(h).strip() if h is not None else ""
-        if name and name not in col:
+    for i, h in enumerate(rows[index]):
+        name = _canonical_header(h)
+        if name in col:
+            raise ValueError(f"LLD '{sheet}': ambiguous columns for '{name}' at {col[name] + 1} and {i + 1}")
+        if name:
             col[name] = i
-    return col, rows[1:]
+    return col, rows[index + 1:]
 
 
 def _row_matches_node(row, col, node_l) -> bool:
@@ -247,10 +290,11 @@ def audit_lld(lld_path: str, node_name: str,
         if col is None:
             log(f"[audit/lld] sheet '{cpri_sheet}' missing — RiLink skipped")
         else:
-            need = ["BBID", "BB RI Port", "Radio DATA Port"]
+            need = ["PLA ID", "BBID", "BB RI Port", "Radio DATA Port"]
             missing = [c for c in need if c not in col]
             if missing:
-                log(f"[audit/lld] columns missing in '{cpri_sheet}': {missing}")
+                log(f"[audit/lld] WARNING: CPRI checks skipped; columns missing in '{cpri_sheet}': {missing}. "
+                    f"Recognized headers: {list(col)}")
             else:
                 out += _audit_rilink_rows(col, data, node_name, node_l, k, bbid,
                                           records, cpri_sheet, log)

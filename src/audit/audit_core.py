@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import collections
+import ipaddress
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -224,6 +225,8 @@ class AuditResult:
                            #   generated set can re-format the value to the
                            #   node's convention (list/latlong/geo/…)
     from_cmedit: bool = False  # BSC/cmedit-sourced → kept out of the .mos script
+    remark: str = ""
+    feature_activation_allowed: bool = False
 
 
 @dataclass
@@ -943,46 +946,96 @@ def audit_chain_trace(records: Dict[str, Dict[str, str]],
     return out
 
 
-def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
+def cdd_lte_tx_by_carrier(items, records):
+    """Resolve LTE CDD Tx counts to owning carriers without cross-node lookup."""
+    by_node = collections.defaultdict(dict)
+    for dn, attrs in records.items():
+        owner = re.search(r"(?:^|,)ManagedElement=([^,]+)(?:,|$)", dn)
+        if owner:
+            local = re.sub(r"^.*?ManagedElement=[^,]+,?", "", dn)
+            by_node[owner[1].casefold()][local.casefold()] = attrs
+    out = collections.defaultdict(set)
+    for item in items:
+        if item.tech != "lte_nr" or item.parameter != "noOfTxAntennas":
+            continue
+        try:
+            tx = int(item.expected)
+        except (ValueError, TypeError):
+            continue
+        if tx <= 0:
+            continue
+        local = item.mo_local
+        if item.via_ref:
+            attrs = by_node[item.node.casefold()].get(local.casefold(), {})
+            ref = next((v for k, v in attrs.items() if k.casefold() == item.via_ref.casefold()), "")
+            owner = re.search(r"(?:^|,)ManagedElement=([^,]+)(?:,|$)", str(ref))
+            if owner and owner[1].casefold() != item.node.casefold():
+                continue
+            local = re.sub(r"^.*?ManagedElement=[^,]+,?", "", str(ref)).strip()
+        if re.search(r"(?:^|,)SectorCarrier=[^,;\s]+$", local):
+            out[(item.node.casefold(), local.casefold())].add(tx)
+    return dict(out)
+
+
+def _detect_feature_conditions(node, records, cdd_tx_by_node=None, cdd_tx_by_carrier=None):
     """Return the set of config conditions present on ``node`` — the vocabulary
     used by ``feature_rules`` detect keys:
-      lte, nr, ess, 8t8r, 4t4r, aas_b41_lte, aas_b41_nr, aas_b1b3.
+      lte, nr, gsm, mixed_gsm, mixed_lte, ess, 8t8r, 4t4r,
+      aas_b41_lte, aas_b41_nr, aas_b1b3.
 
     8T8R/4T4R detection priority (per spec): CDD MIMO Tx count first (reliable
-    even pre-integration), then node ``noOfTxAntennas`` on (NR)SectorCarrier
-    (skipping 0/-1 which mean "not set"), then the number of ``RfBranch`` MOs
-    under a radio (8 → 8x8, 4 → 4x4)."""
+    even pre-integration), then node ``noOfTxAntennas`` on LTE SectorCarrier
+    (skipping 0/-1 which mean "not set"), then the number of attached
+    ``RfBranch`` targets for that LTE carrier (8 → 8x8, 4 → 4x4)."""
     conds = set()
+    technologies = set()
     nl = node
     fru_ids = []
-    tx_counts = set()
-    rfbranch_by_radio = collections.defaultdict(set)
+    carriers = {}
+    lte_carrier_refs = set()
+    local_records = {}
+    fru_names = {}
     for ldn, a in records.items():
         m = re.search(r"ManagedElement=([^,]+)", ldn)
-        if not m or m.group(1) != nl:
+        if not m or m.group(1).casefold() != nl.casefold():
             continue
+        local = re.sub(r"^.*?ManagedElement=[^,]+,?", "", ldn)
+        local_records[local.casefold()] = a
         leaf = ldn.split(",")[-1].split("=", 1)[0]
+        # Mixed mode uses only technologies present in this ManagedElement,
+        # never neighbours/external cells or another BB at the same site.
+        if leaf in ("BtsFunction", "GsmSector", "Trx"):
+            technologies.add("gsm")
+            conds.add("gsm")
+        elif leaf in ("ENodeBFunction", "EUtranCellFDD", "EUtranCellTDD"):
+            technologies.add("lte")
+        elif leaf in ("GNBDUFunction", "GNBCUCPFunction", "GNBCUUPFunction", "NRCellDU", "NRCellCU"):
+            technologies.add("nr")
         if leaf in ("EUtranCellFDD", "EUtranCellTDD"):
             conds.add("lte")
+            ref = str(a.get("sectorCarrierRef") or "").strip()
+            if ref:
+                lte_carrier_refs.add(re.sub(r"^.*?ManagedElement=[^,]+,?", "", ref).casefold())
         elif leaf == "NRCellDU":
             conds.add("nr")
         elif leaf == "FieldReplaceableUnit":
             fid = ldn.split(",")[-1].split("=", 1)[1]
             fru_ids.append(fid)
-        elif leaf in ("SectorCarrier", "NRSectorCarrier"):
-            v = a.get("noOfTxAntennas")
-            try:
-                iv = int(str(v).strip())
-                if iv > 0:
-                    tx_counts.add(iv)
-            except (ValueError, TypeError):
-                pass
-        elif leaf == "RfBranch":
-            mg = re.search(r"(AntennaUnitGroup=[^,]+)", ldn)
-            if mg:
-                rfbranch_by_radio[mg.group(1)].add(ldn.split(",")[-1])
+            low = {k.casefold(): v for k, v in a.items()}
+            pname = low.get("productdata.productname") or low.get("productname")
+            if not pname:
+                match = re.search(r"productName\s*=\s*([^,}]+)", str(low.get("productdata") or ""), re.I)
+                pname = match[1].strip() if match else ""
+            fru_names[fid] = str(pname).upper()
+        elif leaf == "SectorCarrier":
+            carriers[local.casefold()] = a
         if "SpectrumSharingFunction=" in ldn:
             conds.add("ess")
+
+    if "gsm" in technologies and technologies & {"lte", "nr"}:
+        conds.add("mixed_gsm")
+    if "lte" in technologies and technologies & {"gsm", "nr"}:
+        conds.add("mixed_lte")
 
     # 8T8R / 4T4R — CDD first, then node noOf*, then RfBranch count. These gate
     # LTE antenna features (4x4/8x8 Quad/Octal Antenna Downlink etc.), so they
@@ -990,16 +1043,65 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
     # shared radio happens to expose 4 RfBranch ports would wrongly demand the
     # LTE quad features.
     if "lte" in conds:
-        tx = set(cdd_tx_by_node.get(node, set())) if cdd_tx_by_node else set()
-        tx |= tx_counts
-        tx |= {len(v) for v in rfbranch_by_radio.values()}
+        def positive(values):
+            out = set()
+            for value in values:
+                try:
+                    count = int(str(value).strip())
+                    if count > 0:
+                        out.add(count)
+                except (ValueError, TypeError):
+                    pass
+            return out
+
+        def below(ref):
+            owner = re.search(r"(?:^|,)ManagedElement=([^,]+)(?:,|$)", str(ref))
+            if owner and owner[1].casefold() != node.casefold():
+                return ""
+            return re.sub(r"^.*?ManagedElement=[^,]+,?", "", str(ref)).strip().casefold()
+
+        tx = set()
+        # Legacy callers with only a node-level CDD map still get CDD priority.
+        legacy_cdd = positive((cdd_tx_by_node or {}).get(node, set()))
+        if cdd_tx_by_carrier is None and legacy_cdd:
+            tx = legacy_cdd
+        else:
+            for carrier_dn, attrs in carriers.items():
+                if lte_carrier_refs and carrier_dn not in lte_carrier_refs:
+                    continue
+                planned = positive((cdd_tx_by_carrier or {}).get((node.casefold(), carrier_dn), set()))
+                if planned:
+                    tx.update(planned)
+                    continue
+                configured = positive([attrs.get("noOfTxAntennas")])
+                if configured:
+                    tx.update(configured)
+                    continue
+                # Use only branches attached to this LTE carrier, not the total
+                # ports exposed by an unrelated/shared radio elsewhere in the node.
+                refs = str(attrs.get("rfBranchTxRef") or "").strip()
+                if not refs:
+                    sef = local_records.get(below(attrs.get("sectorFunctionRef") or ""), {})
+                    refs = str(sef.get("rfBranchRef") or "").strip()
+                targets = [below(ref) for ref in re.split(r"[;\s]+", refs) if ref]
+                if targets and all(t in local_records and re.search(r"(?:^|,)rfbranch=", t) for t in targets):
+                    tx.add(len(set(targets)))
         if 8 in tx:
             conds.add("8t8r")
         if 4 in tx:
             conds.add("4t4r")
 
     # AAS/AIR radios by band (FieldReplaceableUnit id, e.g. AAS_B41_RRU1, AIR…B1B3)
-    up = [f.upper() for f in fru_ids]
+    # FRU naming remains authoritative. Product name is a fallback only when
+    # that FRU's ID does not identify a supported AAS band.
+    up = []
+    for fid in fru_ids:
+        name = fid.upper()
+        if ("AAS" in name or "AIR" in name) and ("B41" in name or "B1B3" in name):
+            up.append(name)
+        else:
+            product = re.sub(r"[\s_/+&-]+", "", fru_names[fid])
+            up.append(product)
     aas_b41 = any(("AAS" in f or "AIR" in f) and "B41" in f for f in up)
     aas_b1b3 = any(("AAS" in f or "AIR" in f) and "B1B3" in f for f in up)
     if aas_b41 and "lte" in conds:
@@ -1011,23 +1113,30 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None):
     return conds
 
 
+def _feature_mo(feat):
+    # REV_E image45: the spectrum-sharing enabler is a CapacityState MO.
+    klass = "CapacityState" if feat == "CXC4012411" else "FeatureState"
+    return f"SystemFunctions=1,Lm=1,{klass}={feat}"
+
+
 def _feature_state(node, feat, records):
-    """(featureState, licenseState, description) for ``FeatureState=<feat>`` on
+    """(featureState, licenseState, description) for the feature's MO class on
     ``node``, or (None, None, "") if the MO is absent."""
     for ldn, a in records.items():
-        if ldn.split(",")[-1] != f"FeatureState={feat}":
+        if ldn.split(",")[-1] != _feature_mo(feat).split(",")[-1]:
             continue
         m = re.search(r"ManagedElement=([^,]+)", ldn)
-        if m and m.group(1) != node:
+        if not m or m.group(1).casefold() != node.casefold():
             continue
-        return (a.get("featureState"), a.get("licenseState"),
-                (a.get("description") or "").strip())
+        low = {k.casefold(): v for k, v in a.items()}
+        return (low.get("featurestate"), low.get("licensestate"),
+                str(low.get("description") or "").strip())
     return (None, None, "")
 
 
 def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                    cdd_tx_by_node=None, nodes=None,
-                   log=lambda m: None) -> List[AuditResult]:
+                   log=lambda m: None, cdd_tx_by_carrier=None) -> List[AuditResult]:
     """Conditional feature-compliance audit.
 
     ``feature_rules`` (from audit_map.json) maps a rule key → {detect, features}.
@@ -1067,7 +1176,9 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
     # belongs to (e.g. "AAS FDD", "AAS TDD", "EN-DC/NR").
     _LABEL = {"8t8r": "8T8R", "4t4r": "4T4R", "nr": "EN-DC/NR",
               "aas_b41_lte": "AAS TDD", "aas_b41_nr": "AAS TDD",
-              "aas_b1b3": "AAS FDD", "lte": "LTE", "ess": "ESS"}
+              "aas_b1b3": "AAS FDD", "lte": "LTE", "ess": "ESS",
+              "mixed_gsm": "Mixed Mode GSM", "mixed_lte": "Mixed Mode LTE",
+              "always": "Always Required"}
 
     def _labels(conds_set):
         seen, out_l = set(), []
@@ -1088,14 +1199,15 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
 
     out: List[AuditResult] = []
     for node in target:
-        conds = _detect_feature_conditions(node, records, cdd_tx_by_node)
+        conds = _detect_feature_conditions(node, records, cdd_tx_by_node, cdd_tx_by_carrier)
+        conds.add("always")
         log(f"[audit/feature] {node}: conditions {sorted(conds) or '(none)'}")
         for feat in sorted(feat_conds):
             gov = feat_conds[feat]
             active_conds = sorted(gov & conds)
             expect_active = bool(active_conds)
             fstate, lstate, fdesc = _feature_state(node, feat, records)
-            mo = f"SystemFunctions=1,Lm=1,FeatureState={feat}"
+            mo = _feature_mo(feat)
             src = fdesc or "feature compliance"       # feature name (description)
             gov_label = _labels(gov)                  # config this feature needs
             ref = _labels(active_conds) if active_conds else gov_label
@@ -1109,7 +1221,7 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                     out.append(AuditResult(
                         "feature", node, mo, "featureState",
                         f"ACTIVATED ({ref})",
-                        "(FeatureState MO not found)", "NotFound",
+                        f"({_feature_mo(feat).split(',')[-1].split('=')[0]} MO not found)", "NotFound",
                         src, node, ref_cell=ref))
                 continue
             f_on, l_on = _is1(fstate), _is1(lstate)
@@ -1138,7 +1250,8 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 ref = reason
             out.append(AuditResult(
                 "feature", node, mo, "featureState", exp, act, status,
-                src, node, ref_cell=ref))
+                src, node, ref_cell=ref, feature_activation_allowed=l_on,
+                remark="License DISABLED or unknown; activation script omitted." if expect_active and not l_on else ""))
     return out
 
 
@@ -1821,9 +1934,6 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
                 ess_rows: Optional[list] = None,
                 power_results=None, power_evidence=None) -> str:
     wb = Workbook()
-    if power_results is not None:
-        from .power_audit import write_power_sheets
-        write_power_sheets(wb, power_results, power_evidence or [])
 
     # Summary sheet
     summ = wb.active
@@ -1834,7 +1944,7 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
     ws = wb.create_sheet("Detail")
     headers = ["Category", "Node", "Reference Cell",
                "MO (below ManagedElement)", "Parameter",
-               "CDD (expected)", "Node (actual)", "Status", "Source"]
+               "CDD / Required (expected)", "Node / Granted (actual)", "Status", "Source", "Remark"]
     ws.append(headers)
     for c in ws[1]:
         c.fill = _FILL_HEADER
@@ -1848,7 +1958,7 @@ def write_excel(results: List[AuditResult], out_path: str, meta: dict,
         if param.startswith("__") and "!" in (r.source or ""):
             param = r.source.split("!", 1)[1]
         ws.append([r.category, (r.node or r.key), r.ref_cell, r.mo, param,
-                   r.expected, r.actual, r.status, r.source])
+                   r.expected, r.actual, r.status, r.source, r.remark])
         row = ws.max_row
         fill = _STATUS_FILL.get(r.status)
         if fill:
@@ -1910,11 +2020,26 @@ def _banner(name: str) -> str:
 # the full FDN + clean IP and ARE generated (see broker_check).
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
                             "consistency", "endc", "chain", "feature",
-                            "termpoint-gnb", "power-license", "bandwidth-license"}
+                            "termpoint-gnb", "power-license", "bandwidth-license", "trx-license"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.
 _MOSHELL_SETTABLE = {"etilt"}
+
+
+def _safe_set_row(row):
+    if row.parameter.casefold() == "licensestate":
+        return False  # Read-only license evidence, never a correction target.
+    if row.category != "termpoint-gnb":
+        return True
+    if (row.status != "Mismatch" or row.parameter != "ipAddress"
+            or not re.search(r"(?:^|,)TermPointToGNB=[^,\s]+$", row.mo)):
+        return False
+    try:
+        address = ipaddress.IPv4Address(row.expected)
+        return not address.is_unspecified and not address.is_multicast and str(address) == row.expected
+    except (ValueError, TypeError):
+        return False
 
 
 def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
@@ -1933,9 +2058,11 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
     by_node: Dict[str, Dict[str, list]] = {}
     seen = set()
     for r in results:
+        if not _safe_set_row(r):
+            continue
         if r.status not in statuses or r.expected == "":
             continue
-        if (r.category in _NON_SETTABLE_CATEGORIES
+        if (r.category in _NON_SETTABLE_CATEGORIES and r.category != "termpoint-gnb"
                 and r.category not in _MOSHELL_SETTABLE):
             continue
         if r.parameter.startswith("__"):
@@ -1967,6 +2094,8 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             continue
         feat_seen.add((node, cxc_mo))
         val = "1" if str(r.expected).strip().upper().startswith("ACTIVATED") else "0"
+        if val == "1" and not r.feature_activation_allowed:
+            continue
         feat_by_node.setdefault(node, []).append((cxc_mo, val))
 
     written: List[str] = []
@@ -2034,9 +2163,11 @@ def _collect_set_rows(results: List[AuditResult], statuses, site: str):
     by_node: Dict[str, list] = {}
     seen = set()
     for r in results:
+        if not _safe_set_row(r):
+            continue
         if r.status not in statuses or r.expected == "":
             continue
-        if r.category in _NON_SETTABLE_CATEGORIES:
+        if r.category in _NON_SETTABLE_CATEGORIES and r.category != "termpoint-gnb":
             continue
         if r.parameter.startswith("__"):
             continue          # synthetic (e.g. __count__) — not a settable attr
