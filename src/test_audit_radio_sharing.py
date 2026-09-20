@@ -14,7 +14,7 @@ def fixture(node=NODE,flag='false',serial='ABC'):
     return {
         f'ManagedElement={node},Equipment=1,FieldReplaceableUnit=BB-1':{},
         f'ManagedElement={node},Equipment=1,FieldReplaceableUnit=B28_RRU1':
-            {'serialNumber':serial,'isSharedWithExternalNE':flag},
+            {'serialNumber':serial,'isSharedWithExternalMe':flag},
         f'ManagedElement={node},RiLink=1':{
             'riPortRef1':'Equipment=1,FieldReplaceableUnit=BB-1,RiPort=A',
             'riPortRef2':'Equipment=1,FieldReplaceableUnit=B28_RRU1,RiPort=DATA_1'}}
@@ -34,20 +34,16 @@ def lld(path,shared='No',second=None):
 
 
 class SharingTests(unittest.TestCase):
-    def test_flag_on_radio_riport_uses_actual_mo(self):
+    def test_flag_is_read_from_physical_radio_fru(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'lld.xlsx'
             lld(path)
             records=fixture()
             fru=f'ManagedElement={NODE},Equipment=1,FieldReplaceableUnit=B28_RRU1'
-            del records[fru]['isSharedWithExternalNE']
-            records[fru+',RiPort=DATA_1']={'isSharedWithExternalNE':'true'}
+            self.assertEqual(records[fru]['isSharedWithExternalMe'], 'false')
             rows=audit_radio_sharing(records,lld_path=path)
             self.assertEqual((rows[0].mo,rows[0].status),
-                             ('Equipment=1,FieldReplaceableUnit=B28_RRU1,RiPort=DATA_1','Mismatch'))
-            records[fru+',RiPort=DATA_2']={'isSharedWithExternalNE':'false'}
-            rows=audit_radio_sharing(records,lld_path=path)
-            self.assertEqual([r.status for r in rows],['Mismatch','NotFound'])
+                             ('Equipment=1,FieldReplaceableUnit=B28_RRU1','Match'))
 
     def test_nonshared_and_wrong_true_both_formats(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -99,14 +95,18 @@ class SharingTests(unittest.TestCase):
     def test_incomplete_or_conflicting_evidence_never_passes(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'lld.xlsx'
-            for shared in ('','invalid','Yes'):
+            lld(path, '')
+            self.assertEqual(
+                audit_radio_sharing(fixture(), lld_path=path)[0].status,
+                'Match')
+            for shared in ('invalid','Yes'):
                 lld(path,shared)
                 self.assertEqual(audit_radio_sharing(fixture(),lld_path=path)[0].status,'NotFound')
             lld(path)
             for mutation in ('flag','reference','port','duplicate'):
                 records=fixture()
                 if mutation=='flag':
-                    del records[f'ManagedElement={NODE},Equipment=1,FieldReplaceableUnit=B28_RRU1']['isSharedWithExternalNE']
+                    del records[f'ManagedElement={NODE},Equipment=1,FieldReplaceableUnit=B28_RRU1']['isSharedWithExternalMe']
                 elif mutation=='reference':
                     records[f'ManagedElement={NODE},RiLink=1']['riPortRef2']='ManagedElement=OTHER,FieldReplaceableUnit=B28_RRU1,RiPort=DATA_1'
                 elif mutation=='port':
@@ -125,7 +125,7 @@ class SharingTests(unittest.TestCase):
             report=Path(folder)/'report.xlsx'
             write_excel(rows,str(report),{})
             wb=load_workbook(report)
-            self.assertEqual(wb['Detail']['E2'].value,'isSharedWithExternalNE')
+            self.assertEqual(wb['Detail']['E2'].value,'isSharedWithExternalMe')
             self.assertIn('RI A',wb['Detail']['J2'].value)
             wb.close()
             self.assertEqual(generate_moshell_scripts(rows,folder,'SITE',str(report)),[])

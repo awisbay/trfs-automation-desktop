@@ -88,8 +88,15 @@ def audit_radio_sharing(records, nodes=None, lld_path=None, log=lambda m:None):
                                 i=col.get(name,-1)
                                 return str(row[i] or '').strip() if 0<=i<len(row) else ''
                             if _row_matches_node(row,col,node.casefold()) and _bbid_index(cell('BBID'))==_node_bb_index(node) and _node_bb_index(node):
+                                shared_raw = cell('Radio Shared between BB')
+                                # In the LLD template, shared radios are marked
+                                # "Yes" and ordinary/non-shared radios leave
+                                # this cell blank. Treating blank as unknown hid
+                                # real FRU=true mismatches.
+                                shared = (False if not shared_raw
+                                          else _bool(shared_raw))
                                 planned[(node.casefold(),cell('BB RI Port').upper())].append(
-                                    (_bool(cell('Radio Shared between BB')),cell('Radio DATA Port').upper(),cell('Radio Type')))
+                                    (shared,cell('Radio DATA Port').upper(),cell('Radio Type')))
             finally:
                 wb.close()
         except Exception as exc:
@@ -111,9 +118,16 @@ def audit_radio_sharing(records, nodes=None, lld_path=None, log=lambda m:None):
             if owner==key[0] and child.startswith(key[1]+',riport=') and child.count(',')==key[1].count(',')+1:
                 port_name=child_mo.rsplit('=',1)[1].upper()
                 port_links=[link for link in all_attached if link[2]==port_name]
-                if port_links or any(k.casefold()=='issharedwithexternalne' for k in child_attrs):
+                if port_links:
                     targets.append((child_mo,child_attrs,port_links))
-        if not targets and (all_attached or any(k.casefold()=='issharedwithexternalne' for k in attrs)):
+        # isSharedWithExternalMe is an FRU attribute. Collapse the connected
+        # RiPorts back to their owning physical radio so the report checks the
+        # actual MO/parameter instead of inventing a RiPort attribute.
+        has_sharing_attr = any(
+            k.casefold() == 'issharedwithexternalme' for k in attrs)
+        if has_sharing_attr:
+            targets = [(mo, attrs, all_attached)]
+        elif not targets and all_attached:
             targets.append((mo,attrs,all_attached))
         elif targets:
             covered={t[0].rsplit('=',1)[1].upper() for t in targets}
@@ -163,15 +177,15 @@ def audit_radio_sharing(records, nodes=None, lld_path=None, log=lambda m:None):
                 issues=[i for i in issues if 'LLD row missing/ambiguous' not in i]
             if expected is None and lld_error:
                 issues.append(lld_error)
-            actual=_bool(_attr(target_attrs,'isSharedWithExternalNE'))
+            actual=_bool(_attr(target_attrs,'isSharedWithExternalMe'))
             status='NotFound' if expected is None or issues or actual is None else ('Match' if actual==expected else 'Mismatch')
             if actual is None:
-                issues.append('isSharedWithExternalNE missing or invalid')
+                issues.append('isSharedWithExternalMe missing or invalid')
             remark='; '.join(issues) if issues else 'External radio sharing flag agrees with available topology evidence and LLD when supplied.'
             remark+='\n'+'\n'.join(details)
             remark+=f'\nSerial: {serial or "unavailable"}; connected NEs: {", ".join(sorted(peers)) or "unverified"}; sync evidence: {sync}.'
             remark+='\nReport only. Dump configuration does not establish restart/effective runtime state.'
-            out.append(AuditResult('radio-sharing',node,target_mo,'isSharedWithExternalNE',
+            out.append(AuditResult('radio-sharing',node,target_mo,'isSharedWithExternalMe',
                        str(expected).lower() if expected is not None else '(unavailable)',
                        str(actual).lower() if actual is not None else '(unavailable)',status,
                        'LLD CPRI connectivity + RiLink/FRU serial + NodeGroupSyncMember',node,remark=remark))

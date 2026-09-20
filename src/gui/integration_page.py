@@ -988,6 +988,7 @@ class IntegrationRunPage:
             # Fresh run — no summary to return to until this one finishes, so a
             # stale "Back to Summary" from a previous run can't fire.
             self.page.integration_has_summary = False
+            self.page.integration_dump_paths = []
 
         # Put the SHORTCODE in the OS window title so the taskbar
         # preview / Alt-Tab shows which site each window is running —
@@ -3428,6 +3429,25 @@ class IntegrationRunPage:
                         if success:
                             self._set_step(node_tag, key, "done",
                                            "Downloaded")
+                            # Give CDD Audit the exact downloaded file. Source
+                            # and packaged runs may use different LOG roots, so
+                            # rediscovery from the Audit process is not enough.
+                            dump_path = os.path.abspath(os.path.join(
+                                self.log_dir, "DUMP",
+                                f"{node_name}_modump.zip",
+                            ))
+                            if os.path.isfile(dump_path):
+                                known = list(getattr(
+                                    self.page, "integration_dump_paths", []
+                                ) or [])
+                                identity = os.path.normcase(dump_path)
+                                if not any(
+                                    os.path.normcase(os.path.abspath(p)) == identity
+                                    for p in known
+                                ):
+                                    known.append(dump_path)
+                                self.page.integration_dump_paths = known
+                                ui_cb(f"Audit source registered: {dump_path}")
                             ui_cb(f"{step_label} — downloaded.")
                         else:
                             self._set_step(node_tag, key, "error", "Failed (continued)")

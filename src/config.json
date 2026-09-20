@@ -275,12 +275,10 @@
       "subdir": "EVIDENCE",
       "max_width": 4000
     },
-    "_comment_bsc_traffic": "BSC traffic evidence: ssh from the ENM scripting VM to the BSC with the ENM user/password, `mml`, then `rlcrp:cell=<cell>;` for every GSM cell (images per sector). The site's BSC is read from the GeranCell FDN (MeContext=...); add each BSC's IP to ip_map (name -> IP, case-insensitive).",
+    "_comment_bsc_traffic": "BSC traffic evidence: the BSC name is read from GeranCell MeContext, its current IP is resolved from BscConnectivityInformation.ipAddress in ENM, then the tool logs in from the scripting VM and runs rlcrp for each GSM cell.",
     "bsc_traffic": {
       "enabled": true,
-      "ip_map": {
-        "MINBS01": "10.14.204.197"
-      },
+      "ip_get_timeout_s": 90,
       "ssh_port": 22,
       "login_timeout_s": 45,
       "cell_timeout_s": 90

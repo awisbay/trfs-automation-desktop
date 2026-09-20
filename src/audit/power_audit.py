@@ -77,7 +77,7 @@ def audit_power_license(records, nodes=None):
                {'', 'null', 'none', 'n/a', 'unknown', '0', '-1'} else full_dn.casefold())
         return key, full_dn
 
-    def radio_for_mo(mo, attrs, node):
+    def radios_for_mo(mo, attrs, node):
         sef_refs = refs(attr(attrs, 'sectorFunctionRef') or attr(attrs, 'sectorEquipmentFunctionRef'))
         if not sef_refs:
             raise ValueError('SectorEquipmentFunction reference missing')
@@ -90,9 +90,9 @@ def audit_power_license(records, nodes=None):
             for branch_ref in branch_refs:
                 key, full_dn = radio_from_ref(branch_ref, target)
                 radios[key] = full_dn
-        if len(radios) != 1:
-            raise ValueError('MO maps to multiple physical radios; power allocation unavailable')
-        return next(iter(radios.items()))
+        if not radios:
+            raise ValueError('MO has no resolved physical radio')
+        return list(radios.items())
 
     evidence, calculations = [], {}
     # A shared radio receives its initial package independently on each BB.
@@ -114,12 +114,20 @@ def audit_power_license(records, nodes=None):
                     problems.append(f'{mo}: unsupported power MO; physical radio allocation unavailable')
                     continue
                 try:
-                    key, radio_dn = radio_for_mo(mo, attrs, node)
+                    mapped_radios = radios_for_mo(mo, attrs, node)
                 except ValueError as exc:
                     problems.append(f'{mo}: {exc}')
                     continue
-                radio = radios.setdefault(key, {'dn': radio_dn, 'power': Decimal(0)})
-                radio['power'] += value
+                # configuredMaxTxPower belongs to the carrier/TRX. When its RF
+                # branches terminate on multiple physical FRUs, that total is
+                # distributed evenly over those radios. Counting the full
+                # carrier power on every FRU would duplicate demand; rejecting
+                # it made valid multi-radio sectors unverifiable.
+                share = value / Decimal(len(mapped_radios))
+                for key, radio_dn in mapped_radios:
+                    radio = radios.setdefault(
+                        key, {'dn': radio_dn, 'power': Decimal(0)})
+                    radio['power'] += share
             elif mo.split(",")[-1].split("=")[0] in ("SectorCarrier", "NRSectorCarrier", "Trx"):
                 problems.append(f"configuredMaxTxPower missing: {mo}")
             if re.search(r"(?:^|,)Lm=1,CapacityState=CXC4012338$", mo):

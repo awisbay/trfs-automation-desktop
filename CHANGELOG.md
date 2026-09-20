@@ -4,6 +4,44 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.16.0] - 2026-09-20
+
+### Added
+- **Band-aware GSM sector actions:** the Low Band sector buttons include only
+  GSM900 cells and the Mid Band sector buttons include only GSM1800 cells,
+  with explicit labels such as `Unlock S1 + GSM900` and matching lock actions.
+- **Live BSC address lookup:** BSC traffic resolves the current IP from ENM
+  `BscConnectivityInformation.ipAddress`; names containing `V` use
+  `VBscConnectivityInformation.ipAddress`. The static BSC IP map is no longer
+  required.
+- **Reliable Integration-to-Audit dump handoff:** Integration passes downloaded
+  modump paths directly to CDD Audit. Browsing a cmdump also discovers its
+  sibling modump so topology checks can use the more complete snapshot.
+
+### Changed
+- **Mixed-mode feature audit follows RAT applicability:** CXC4012017 is required
+  for GSM combined with LTE/NR, CXC4012015 for LTE combined with GSM/NR,
+  CXC4012026 on GSM basebands, and CXC4011018 on LTE basebands. These rules are
+  requirement-only; an already-active feature outside its required scope is
+  skipped.
+- Feature report rows now keep `featureState` in Parameter, show only
+  `ACTIVATED`/`DEACTIVATED` in expected and actual, put the feature description
+  in Source, and move applicability/license explanations to Remark.
+- **Power license audit supports multi-radio carriers:** configured carrier/TRX
+  power is distributed across its resolved physical FRUs before applying one
+  free 20 W package per radio per baseband.
+- **External radio sharing audit uses the real FRU attribute
+  `isSharedWithExternalMe`.** Blank LLD sharing cells mean non-shared; the audit
+  now reports an FRU configured `true` against that plan as a mismatch.
+- Dump browsing accepts text modumps, normalizes pasted/quoted paths, reports
+  missing files before starting, and prefers the exact Integration artifacts.
+
+### Fixed
+- Prevent bandwidth capacity from appearing unverified when a browsed cmdump
+  has a complete sibling modump containing the RF reference chain.
+- Prevent stale Audit dump paths from another application location from hiding
+  valid Integration artifacts.
+
 ## [1.15.0] - 2026-09-18
 
 ### Added

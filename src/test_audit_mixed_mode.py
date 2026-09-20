@@ -13,7 +13,9 @@ class MixedModeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.rules = json.loads(Path(__file__).with_name('audit_map.json').read_text(encoding='utf-8'))['feature_rules']
+        mapping = json.loads(Path(__file__).with_name('audit_map.json').read_text(encoding='utf-8'))
+        cls.rules = mapping['feature_rules']
+        cls.descriptions = mapping['feature_descriptions']
 
     def fixture(self, node, techs, state='0', license_state='1'):
         prefix = f'ManagedElement={node},'
@@ -32,7 +34,11 @@ class MixedModeTests(unittest.TestCase):
             for combo in itertools.combinations(self.markers, size):
                 techs = set(combo)
                 with self.subTest(techs=techs):
-                    required = {'CXC4012026', 'CXC4011018'}
+                    required = set()
+                    if 'gsm' in techs:
+                        required.add('CXC4012026')
+                    if 'lte' in techs:
+                        required.add('CXC4011018')
                     if 'gsm' in techs and techs & {'lte', 'nr'}:
                         required.add('CXC4012017')
                     if 'lte' in techs and techs & {'gsm', 'nr'}:
@@ -41,8 +47,7 @@ class MixedModeTests(unittest.TestCase):
                     self.assertEqual(set(off_rows), required)
                     self.assertTrue(all(r.expected.startswith('ACTIVATED') for r in off_rows.values()))
                     on_rows = self.rows(self.fixture('BB1', techs, state='1'))
-                    self.assertEqual(set(on_rows), set(self.codes) - required)
-                    self.assertTrue(all(r.expected.startswith('DEACTIVATED') for r in on_rows.values()))
+                    self.assertEqual(set(on_rows), set())
 
     def test_separate_basebands_and_external_neighbours_do_not_enable_mixed_mode(self):
         records = {}
@@ -50,17 +55,32 @@ class MixedModeTests(unittest.TestCase):
             records.update(self.fixture(node, {tech}))
         records['ManagedElement=BB2,ExternalGNodeBFunction=NR'] = {'gNodeBId': '99'}
         records['ManagedElement=BB1,ExternalEUtranCellFDD=LTE'] = {}
-        for node in ('BB1', 'BB2', 'BB3'):
-            self.assertEqual(set(self.rows(records, nodes=[node])), {'CXC4012026', 'CXC4011018'})
+        self.assertEqual(set(self.rows(records, nodes=['BB1'])), {'CXC4012026'})
+        self.assertEqual(set(self.rows(records, nodes=['BB2'])), {'CXC4011018'})
+        self.assertEqual(set(self.rows(records, nodes=['BB3'])), set())
 
     def test_missing_required_features_are_reported_without_baseline_suppression(self):
         records = {'ManagedElement=BB1,BtsFunction=1': {}, 'ManagedElement=BB1,ENodeBFunction=1': {}}
         rows = self.rows(records)
         self.assertEqual(set(rows), set(self.codes))
         self.assertTrue(all(row.status == 'NotFound' for row in rows.values()))
-        # Always-on features are required even in a dump with no RAT markers.
+        # With no GSM/LTE RAT marker, no mixed-mode feature applies.
         rows = self.rows({'ManagedElement=BB2,Equipment=1': {}})
-        self.assertEqual(set(rows), {'CXC4012026', 'CXC4011018'})
+        self.assertEqual(set(rows), set())
+
+    def test_missing_feature_uses_configured_description_in_parameter(self):
+        records = {'ManagedElement=BB1,BtsFunction=1': {}}
+        rows = {row.mo.split('=')[-1]: row for row in audit_features(
+            records, self.rules, feature_descriptions=self.descriptions)}
+        self.assertEqual(
+            rows['CXC4012026'].parameter,
+            'featureState')
+        self.assertEqual(rows['CXC4012026'].expected, 'ACTIVATED')
+        self.assertEqual(rows['CXC4012026'].actual, 'DEACTIVATED')
+        self.assertEqual(rows['CXC4012026'].source,
+                         'Mixed Mode Radio GSM for Baseband')
+        self.assertIn('FeatureState MO not found',
+                      rows['CXC4012026'].remark)
 
     def test_license_disabled_blocks_generated_activation(self):
         records = self.fixture('BB1', {'gsm', 'lte'}, license_state='0')

@@ -54,6 +54,20 @@ class AuditPage:
             pass
 
         st = self._state
+        integration_dumps = [
+            os.path.abspath(str(path))
+            for path in (getattr(self.page, "integration_dump_paths", []) or [])
+            if path and os.path.isfile(str(path))
+        ]
+        saved_dumps = str(st.get("dump", "") or "")
+        saved_dump_paths = self._split_dump_paths(saved_dumps)
+        # Prefer the exact files from the completed Integration when the saved
+        # Audit selection is blank/stale. A valid manual choice remains intact.
+        if integration_dumps and (
+            getattr(self.page, "integration_has_summary", False)
+            or not any(os.path.isfile(p) for p in saved_dump_paths)
+        ):
+            saved_dumps = " | ".join(integration_dumps)
         self.site_field = self._tf(
             "Site ID",
             st.get("site") or self._form.get("shortcode", ""), expand=1)
@@ -70,7 +84,7 @@ class AuditPage:
             st.get("lld", ""), expand=3)
         self.dump_field = self._tf(
             "Dump file(s) — optional; cm/modump. Blank = auto-find in "
-            "LOG/<SiteID>/DUMP/", st.get("dump", ""), expand=3)
+            "LOG/<SiteID>/DUMP/", saved_dumps, expand=3)
         self.cluster_field = self._tf(
             "Cluster name", st.get("cluster", ""), expand=None)
         self.cluster_field.width = 260
@@ -279,12 +293,50 @@ class AuditPage:
     async def _browse_dump(self, e):
         files = await self.file_picker.pick_files(
             dialog_title="Select node dump(s) — cmdump/modump",
-            allowed_extensions=["zip", "gz", "log", "xml"],
+            allowed_extensions=["zip", "gz", "log", "xml", "txt"],
             file_type=ft.FilePickerFileType.CUSTOM, allow_multiple=True)
         if files:
-            self.dump_field.value = " | ".join(f.path for f in files)
+            self.dump_field.value = " | ".join(
+                os.path.abspath(f.path) for f in files if f.path)
             self._save_state()
             self.page.update()
+
+    @staticmethod
+    def _split_dump_paths(value: str) -> list[str]:
+        """Parse paths copied into the field without retaining UI quotes."""
+        paths = []
+        for raw in str(value or "").split("|"):
+            path = raw.strip().strip('"').strip("'").strip()
+            if path:
+                paths.append(os.path.abspath(os.path.expanduser(path)))
+        return paths
+
+    @staticmethod
+    def _with_dump_companions(paths: list[str]) -> list[str]:
+        """Add sibling modumps when a browsed cmdump has one.
+
+        Cmdump can omit the RF reference chain needed by topology audits while
+        the Integration modump for the same node contains it. The normal dump
+        selector still validates both payloads and chooses the newest coherent
+        snapshot.
+        """
+        expanded = list(paths)
+        seen = {os.path.normcase(os.path.abspath(p)) for p in expanded}
+        for path in list(paths):
+            name = os.path.basename(path)
+            match = re.match(r"^(.*?)_cmdump(?:_\d{8}_\d{6})?\.(?:zip|gz|log|xml|txt)$",
+                             name, re.I)
+            if not match:
+                continue
+            folder = os.path.dirname(path)
+            for ext in ("zip", "gz", "log", "xml", "txt"):
+                pattern = os.path.join(folder, f"{match.group(1)}_modump*.{ext}")
+                for companion in glob.glob(pattern):
+                    identity = os.path.normcase(os.path.abspath(companion))
+                    if identity not in seen and os.path.isfile(companion):
+                        expanded.append(os.path.abspath(companion))
+                        seen.add(identity)
+        return expanded
 
     # ── Run ──────────────────────────────────────────────────────
     def _log(self, msg: str):
@@ -307,7 +359,8 @@ class AuditPage:
         gsm = self.gsm_field.value.strip()
         gsm_log = self.gsm_log_field.value.strip()
         lld = self.lld_field.value.strip()
-        dumps = [p.strip() for p in self.dump_field.value.split("|") if p.strip()]
+        dumps = self._with_dump_companions(
+            self._split_dump_paths(self.dump_field.value))
         cluster = self.cluster_field.value.strip()
         batch_nodes = [n.strip() for n in re.split(r"[;\n]+", self.batch_field.value)
                        if n.strip()]
@@ -320,6 +373,11 @@ class AuditPage:
             return
         if not (lte or nr or gsm or lld):
             self._set_status("Pick at least one CDD (LTE / NR / GSM / LLD).", DANGER)
+            return
+        missing_dumps = [p for p in dumps if not os.path.isfile(p)]
+        if missing_dumps:
+            self._set_status(
+                "Dump file not found: " + "; ".join(missing_dumps), DANGER)
             return
         self.run_btn.disabled = True
         self.open_btn.visible = False
@@ -766,6 +824,8 @@ class AuditPage:
                 fr = audit_core.audit_features(
                     records, frules, cdd_tx_by_node=cdd_tx, nodes=nodes,
                     log=self._log,
+                    feature_descriptions=(
+                        audit_map.get("feature_descriptions") or {}),
                     cdd_tx_by_carrier=audit_core.cdd_lte_tx_by_carrier(items, records))
                 if fr:
                     results += fr

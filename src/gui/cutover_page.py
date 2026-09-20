@@ -42,7 +42,7 @@ from cutover_model import (
     GroupStatus,
     RunPhase,
 )
-from cutover_runner import CutoverEngine, load_cutover_config
+from cutover_runner import CutoverEngine, gsm_band_for_group, load_cutover_config
 from gui.theme import (
     ACCENT,
     ACCENT_WARM,
@@ -407,7 +407,8 @@ class _GroupSection:
         self._mo_header.width = mo_width
 
     def set_sectors(self, sectors: list, unlockable_by_sector: dict,
-                    busy: bool, ready: bool, lockable_by_sector: dict = None) -> None:
+                    busy: bool, ready: bool, lockable_by_sector: dict = None,
+                    included_band: str = "") -> None:
         """One small button per sector present in this group (``S1``/``S2``/…).
         Each toggles Unlock ↔ Lock the same way the group button does: it
         unlocks while that sector still has cells to unlock, and becomes Lock
@@ -451,7 +452,8 @@ class _GroupSection:
 
             if un > 0 or not (lo > 0 and self._on_lock is not None):
                 # Unlock mode (or nothing to do — stays an inert Unlock button).
-                text.value = f"Unlock S{s}"
+                text.value = (f"Unlock S{s} + {included_band}"
+                              if included_band else f"Unlock S{s}")
                 text.color = self._sector_accent
                 icon.name = ft.Icons.LOCK_OPEN_ROUNDED
                 icon.color = self._sector_accent
@@ -459,10 +461,12 @@ class _GroupSection:
                 btn.on_click = (lambda e, g=self.name, sec=s:
                                 self._on_unlock(g, sec))
                 btn.disabled = busy or not ready or un == 0
-                btn.tooltip = (f"Unlock the {un} S{s} {self.name} cell(s)" if un
+                scope = f"{self.name} and {included_band}" if included_band else self.name
+                btn.tooltip = (f"Unlock {un} cell(s) in S{s}: {scope}" if un
                                else f"No unlockable S{s} cell in {self.name}")
             else:
-                text.value = f"Lock S{s}"
+                text.value = (f"Lock S{s} + {included_band}"
+                              if included_band else f"Lock S{s}")
                 text.color = DANGER
                 icon.name = ft.Icons.LOCK_ROUNDED
                 icon.color = DANGER
@@ -470,7 +474,8 @@ class _GroupSection:
                 btn.on_click = (lambda e, g=self.name, sec=s:
                                 self._on_lock(g, sec))
                 btn.disabled = busy or not ready
-                btn.tooltip = f"Lock the {lo} S{s} {self.name} cell(s) that are unlocked"
+                scope = f"{self.name} and {included_band}" if included_band else self.name
+                btn.tooltip = f"Lock {lo} unlocked cell(s) in S{s}: {scope}"
 
     def set_counts(self, counts: dict, status: GroupStatus, busy: bool,
                    unlockable: int, relockable: int = 0, lockable: int = 0) -> None:
@@ -1106,15 +1111,27 @@ class CutOverPage:
             )
             if name != UNMAPPED:
                 sectors = run.sectors_of(name)
+                included_band = gsm_band_for_group(name)
+                included_gsm = ([c for c in run.cells_of(GSM)
+                                 if c.band_key == included_band]
+                                if included_band else [])
+                sectors = sorted(set(sectors) | {c.sector for c in included_gsm
+                                                 if c.sector},
+                                 key=lambda s: (len(s), s))
                 unlockable_by_sector = {
-                    s: len(run.unlockable_cells_of(name, s)) for s in sectors
+                    s: (len(run.unlockable_cells_of(name, s)) +
+                        sum(1 for c in run.unlockable_cells_of(GSM, s)
+                            if c.band_key == included_band)) for s in sectors
                 }
                 lockable_by_sector = {
-                    s: len(run.lockable_cells_of(name, s)) for s in sectors
+                    s: (len(run.lockable_cells_of(name, s)) +
+                        sum(1 for c in run.lockable_cells_of(GSM, s)
+                            if c.band_key == included_band)) for s in sectors
                 }
                 section.set_sectors(
                     sectors, unlockable_by_sector, busy,
                     run.phase == RunPhase.READY, lockable_by_sector,
+                    included_band,
                 )
             if run.phase != RunPhase.READY:
                 section.button.disabled = True

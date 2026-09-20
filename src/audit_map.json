@@ -350,18 +350,32 @@
     }
   ],
   "_comment_feature_rules": "Conditional feature compliance. detect => when that config is present on the node the listed CXC features MUST be featureState=ACTIVATED & licenseState=ENABLED; when the config is ABSENT they must be DEACTIVATED. Editable, no rebuild.",
+  "feature_descriptions": {
+    "CXC4012017": "Mixed Mode Baseband GSM",
+    "CXC4012015": "Mixed Mode Baseband LTE",
+    "CXC4012026": "Mixed Mode Radio GSM for Baseband",
+    "CXC4011018": "Mixed Mode Radio LTE"
+  },
   "feature_rules": {
     "mixed_mode_gsm": {
       "detect": "mixed_gsm",
+      "required_only": true,
       "features": ["CXC4012017"]
     },
     "mixed_mode_lte": {
       "detect": "mixed_lte",
+      "required_only": true,
       "features": ["CXC4012015"]
     },
-    "always_required": {
-      "detect": "always",
-      "features": ["CXC4012026", "CXC4011018"]
+    "mixed_mode_radio_gsm": {
+      "detect": "gsm",
+      "required_only": true,
+      "features": ["CXC4012026"]
+    },
+    "mixed_mode_radio_lte": {
+      "detect": "lte",
+      "required_only": true,
+      "features": ["CXC4011018"]
     },
     "lte": {
       "detect": "lte",

@@ -78,12 +78,11 @@ class PowerAuditTests(unittest.TestCase):
         rows,_=audit_power_license({},nodes=['MISSING'])
         self.assertEqual(rows[0].status,'NotFound')
 
-    def test_multiple_radios_or_wrong_owner_unresolved(self):
+    def test_multiple_radios_are_evenly_allocated_and_wrong_owner_unresolved(self):
         records=fixture([[80000],[80000]])
         records['ManagedElement=BB1,SectorEquipmentFunction=R0']['rfBranchRef']='RfBranch=R0;RfBranch=R1'
         rows,_=audit_power_license(records)
-        self.assertEqual(rows[0].status,'NotFound')
-        self.assertIn('multiple physical radios',rows[0].remark)
+        self.assertEqual((rows[0].expected, rows[0].status), ('6', 'Match'))
         records=fixture([[80000]])
         records['ManagedElement=BB1,SectorCarrier=0']['sectorFunctionRef']='ManagedElement=OTHER,SectorEquipmentFunction=R0'
         rows,_=audit_power_license(records)

@@ -16,6 +16,7 @@ row-producing sibling of ``detect_bands_from_hgetc``, which returns only the
 from __future__ import annotations
 
 import re
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,6 +27,27 @@ from band_detector import (
     _CELL_PREFIX_RE,
 )
 from cutover_model import CutoverCell, UNMAPPED
+
+
+def parse_bsc_connectivity_ip(output: str, bsc_name: str) -> Optional[str]:
+    """Return the one valid IP in the requested BSC's connectivity row.
+
+    The node name must match exactly. IPs elsewhere in command banners or error
+    messages are deliberately ignored, and ambiguous rows are unresolved.
+    """
+    expected = str(bsc_name or '').strip().casefold()
+    if not expected:
+        return None
+    found = set()
+    for line in strip_ansi(output or '').splitlines():
+        fields = line.split()
+        if len(fields) != 3 or fields[0].casefold() != expected:
+            continue
+        try:
+            found.add(str(ipaddress.IPv4Address(fields[2])))
+        except ipaddress.AddressValueError:
+            continue
+    return next(iter(found)) if len(found) == 1 else None
 
 # ──────────────────────────────────────────────────────────────────
 # Shared line handling

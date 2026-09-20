@@ -67,6 +67,7 @@ from cutover_parsers import (
     match_row,
     parse_alarm_summary,
     parse_barred_state,
+    parse_bsc_connectivity_ip,
     parse_cells_from_hgetc,
     parse_gerancell,
     parse_gsmsector_list,
@@ -89,6 +90,15 @@ logger = logging.getLogger(__name__)
 #: Serializing it keeps the Flet event loop getting frames — the same reason
 #: the integration page has a ``_heavy_lock``.
 _render_lock = threading.Lock()
+
+
+def bsc_connectivity_mo(bsc_name: str) -> str:
+    return ("VBscConnectivityInformation" if "V" in str(bsc_name).upper()
+            else "BscConnectivityInformation")
+
+
+def gsm_band_for_group(group: str) -> str:
+    return {"LB": "GSM900", "MB": "GSM1800"}.get(group, "")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -290,10 +300,10 @@ _DEFAULTS = {
     "bsc_traffic": {
         # BSC traffic evidence: ssh from the ENM scripting VM to the BSC with
         # the ENM user/password, `mml`, then `rlcrp:cell=<cell>;` per GSM cell.
-        # ip_map: BSC name -> IP. The site's BSC is read from the GeranCell FDN
-        # (MeContext=<BSC>); the form's BSC name is the fallback.
+        # BSC name comes from GeranCell MeContext. Resolve its current IP from
+        # ENM immediately before RLCRP; never use a static IP mapping.
         "enabled": True,
-        "ip_map": {},
+        "ip_get_timeout_s": 90,
         "ssh_port": 22,
         "login_timeout_s": 45,
         "cell_timeout_s": 90,
@@ -1978,8 +1988,6 @@ class CutoverEngine:
         form = self.form
         user = str(form.get("username", "")).strip()
         password = str(form.get("password", ""))
-        ip_map = {str(k).upper(): str(v).strip()
-                  for k, v in (bt.get("ip_map") or {}).items()}
         by_bsc: dict = {}
         for c in gsm:
             by_bsc.setdefault(self._bsc_of(c), []).append(c)
@@ -1997,11 +2005,33 @@ class CutoverEngine:
                               + " (no MeContext in the GeranCell FDN and no BSC "
                                 "name in the form).")
                 continue
-            ip = ip_map.get(bsc.upper())
-            if not ip:
-                errors.append(f"No IP for BSC {bsc} — add it to "
-                              f"cutover.bsc_traffic.ip_map in config.json.")
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+', bsc):
+                errors.append(f"Invalid BSC identity from GeranCell FDN: {bsc!r}.")
                 continue
+            sess = run.sessions.get(cells[0].node_name)
+            if sess is None:
+                errors.append(f"Cannot resolve IP for BSC {bsc}: no node session.")
+                continue
+            connectivity_mo = bsc_connectivity_mo(bsc)
+            command = ('!python {cli} "cmedit get {bsc} '
+                       '{mo}.ipaddress -t"').format(
+                           cli=_gsm_cli_py(self.cfg), bsc=bsc,
+                           mo=connectivity_mo)
+            try:
+                ssh = sess.read_ssh or sess.ssh
+                with sess.read_lock:
+                    ip_output = ssh.run_amos_command_safe(
+                        command, cells[0].node_name,
+                        timeout=int(bt.get("ip_get_timeout_s", 90)))
+                ip = parse_bsc_connectivity_ip(ip_output, bsc)
+            except Exception as exc:
+                errors.append(f"Cannot resolve IP for BSC {bsc}: {type(exc).__name__}: {exc}")
+                continue
+            if not ip:
+                errors.append(f"No unique valid IP for BSC {bsc} in "
+                              f"{connectivity_mo}.ipAddress.")
+                continue
+            self.log(f"[BSC {bsc}] current connectivity IP resolved from ENM: {ip}")
 
             def _factory():
                 return IntegrationSSH(
@@ -2110,7 +2140,10 @@ class CutoverEngine:
         # sector=None → the whole band group; sector="1" → only that sector's
         # cells in the group (per-(band group × sector) unlock).
         tag = f"cutover-{group}" + (f"-S{sector}" if sector else "")
-        self._spawn(lambda: self._grouped_action([group], sector), tag)
+        gsm_band = gsm_band_for_group(group) if sector else ""
+        groups = [group, GSM] if gsm_band else [group]
+        self._spawn(lambda: self._grouped_action(
+            groups, sector, gsm_band=gsm_band), tag)
 
     def unlock_all(self) -> None:
         self._spawn(lambda: self._grouped_action(list(self.cfg["group_order"])),
@@ -2143,7 +2176,10 @@ class CutoverEngine:
         button shown once a group has nothing left to unlock. Unlike rollback,
         this locks any currently-unlocked cell, not only ones this run unlocked."""
         tag = f"cutover-lock-{group}" + (f"-S{sector}" if sector else "")
-        self._spawn(lambda: self._lock_action([group], sector), tag)
+        gsm_band = gsm_band_for_group(group) if sector else ""
+        groups = [group, GSM] if gsm_band else [group]
+        self._spawn(lambda: self._lock_action(
+            groups, sector, gsm_band=gsm_band), tag)
 
     def run_final_verification(self) -> None:
         self._spawn(self._final_verify_worker, "cutover-verify")
@@ -3336,11 +3372,14 @@ class CutoverEngine:
         return cells
 
     def _run_gsm_group(self, sector: Optional[str] = None,
-                       skip_confirmation: bool = False) -> None:
+                       skip_confirmation: bool = False,
+                       band_key: str = "") -> None:
         run = self.run
         cfg = self.cfg
         g = cfg["gsm"]
         cells = run.unlockable_cells_of(GSM, sector)
+        if band_key:
+            cells = [c for c in cells if c.band_key == band_key]
         if not cells:
             self.log("No GSM cells to unlock.")
             return
@@ -3358,7 +3397,7 @@ class CutoverEngine:
         run.set_group(GSM, GroupStatus.RUNNING, started_at=time.monotonic(),
                       message="")
         run.set_phase(RunPhase.UNLOCKING, active_group=GSM)
-        where = f" S{sector}" if sector else ""
+        where = (f" {band_key}" if band_key else "") + (f" S{sector}" if sector else "")
         self.log(f"── GSM{where}: unlocking {len(cells)} GeranCell(s) ──")
         if sess is None:
             self.log(f"✗ GSM node {node_name} has no session.")
@@ -3663,7 +3702,8 @@ class CutoverEngine:
 
     # ── group orchestration ──────────────────────────────────────
     def _grouped_action(self, groups: list,
-                        sector: Optional[str] = None) -> None:
+                        sector: Optional[str] = None,
+                        gsm_band: str = "") -> None:
         run = self.run
         if run.phase != RunPhase.READY:
             self.log(
@@ -3671,7 +3711,12 @@ class CutoverEngine:
             )
             return
 
-        targets = [g for g in groups if run.unlockable_cells_of(g, sector)]
+        def selected(group):
+            cells = run.unlockable_cells_of(group, sector)
+            return ([c for c in cells if c.band_key == gsm_band]
+                    if group == GSM and gsm_band else cells)
+
+        targets = [g for g in groups if selected(g)]
         if not targets:
             where = f" (sector S{sector})" if sector else ""
             self.log(f"No unlockable cells in the selected group(s){where}.")
@@ -3684,7 +3729,7 @@ class CutoverEngine:
             lines = []
             shown_nr_carriers = set()
             for g in targets:
-                for c in run.unlockable_cells_of(g, sector):
+                for c in selected(g):
                     if g == GSM:
                         lines.append(
                             f"cmedit set GeranCell={c.cell_dn} "
@@ -3722,7 +3767,8 @@ class CutoverEngine:
         for group in targets:
             if run.is_cancelled():
                 break
-            self._run_group(group, sector, skip_confirmation=(group == GSM))
+            self._run_group(group, sector, skip_confirmation=(group == GSM),
+                            gsm_band=gsm_band if group == GSM else "")
             grp = run.groups[group]
             if (grp.status in (GroupStatus.FAILED,)
                     and self.cfg.get("stop_on_group_failure")):
@@ -3850,7 +3896,8 @@ class CutoverEngine:
                                message=f"Rolled back {len(all_cells)} cell(s)."))
 
     def _lock_action(self, groups: list,
-                     sector: Optional[str] = None) -> None:
+                     sector: Optional[str] = None,
+                     gsm_band: str = "") -> None:
         """Lock a group that is already up (the Lock button). Locks any
         currently-unlocked cell — not only ones this run unlocked — so a site
         that was already unlocked can be taken back down."""
@@ -3865,6 +3912,9 @@ class CutoverEngine:
             return
 
         targets = [(g, run.lockable_cells_of(g, sector)) for g in groups]
+        if gsm_band:
+            targets = [(g, [c for c in cells if c.band_key == gsm_band]
+                        if g == GSM else cells) for g, cells in targets]
         targets = [(g, cells) for g, cells in targets if cells]
         if not targets:
             self.log("Nothing to lock — no cell in these group(s) is unlocked.")
@@ -3877,12 +3927,17 @@ class CutoverEngine:
                     else unlock.get("lock_command_template"))
 
         if self.cfg.get("require_confirmation") and self._confirm_cb:
-            lines = [
-                template.format(mo_type=c.mo_type, cell_dn=c.cell_dn,
-                                mo_ref=c.mo_ref, node=c.node_name)
-                + f"    ({c.node_name}, {c.band_key})"
-                for c in all_cells
-            ]
+            lines = []
+            for c in all_cells:
+                if c.rat == "GSM":
+                    lines.append(f"cmedit set GeranCell={c.cell_dn} "
+                                 f"state={self.cfg['gsm']['locked_value']}"
+                                 f"    ({c.node_name}, {c.band_key})")
+                else:
+                    lines.append(template.format(
+                        mo_type=c.mo_type, cell_dn=c.cell_dn,
+                        mo_ref=c.mo_ref, node=c.node_name)
+                        + f"    ({c.node_name}, {c.band_key})")
             label = "LOCK " + ", ".join(g for g, _ in targets)
             if not self._confirm_cb(label, lines):
                 self.log("Lock cancelled — nothing was sent.")
@@ -3893,6 +3948,10 @@ class CutoverEngine:
         self.log(f"── Locking {len(all_cells)} cell(s) ──")
 
         for group, cells in targets:
+            if group == GSM:
+                self._lock_gsm(sector, band_key=gsm_band,
+                               skip_confirmation=True)
+                continue
             by_node: dict = {}
             for c in cells:
                 by_node.setdefault(c.node_name, []).append(c)
@@ -3932,19 +3991,23 @@ class CutoverEngine:
         self.emit(CutoverEvent(kind="group_done",
                                message=f"Locked {len(all_cells)} cell(s)."))
 
-    def _lock_gsm(self, sector: Optional[str] = None) -> None:
+    def _lock_gsm(self, sector: Optional[str] = None, band_key: str = "",
+                  skip_confirmation: bool = False) -> None:
         """Lock GSM cells that are up (set GeranCell HALTED) — the GSM Lock
         button. Locks any currently-active GeranCell, not only this run's."""
         run = self.run
         cfg = self.cfg
         g = cfg["gsm"]
         cells = run.lockable_cells_of(GSM, sector)
+        if band_key:
+            cells = [c for c in cells if c.band_key == band_key]
         if not cells:
             self.log("Nothing to lock — no active GeranCell.")
             return
         node_name = cells[0].node_name
         sess = run.sessions.get(node_name)
-        if self.cfg.get("require_confirmation") and self._confirm_cb:
+        if (not skip_confirmation and self.cfg.get("require_confirmation")
+                and self._confirm_cb):
             lines = [f"cmedit set GeranCell={c.cell_dn} state={g['locked_value']}"
                      f"    ({c.node_name})" for c in cells]
             if not self._confirm_cb("LOCK GSM", lines):
@@ -3986,9 +4049,11 @@ class CutoverEngine:
                                message=f"Locked {done} GeranCell(s)."))
 
     def _run_group(self, group: str, sector: Optional[str] = None,
-                   skip_confirmation: bool = False) -> None:
+                   skip_confirmation: bool = False,
+                   gsm_band: str = "") -> None:
         if group == GSM:
-            self._run_gsm_group(sector, skip_confirmation=skip_confirmation)
+            self._run_gsm_group(sector, skip_confirmation=skip_confirmation,
+                                band_key=gsm_band)
             return
         run = self.run
         grp = run.groups[group]

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bsc_mml
 import cutover_runner
+from cutover_parsers import parse_bsc_connectivity_ip
 from cutover_model import CutoverCell, NodeSession
 from cutover_parsers import parse_rlcrp_busy_tch
 
@@ -87,6 +88,25 @@ def drain(eng, kind):
 
 
 class ParserTests(unittest.TestCase):
+    def test_bsc_connectivity_ip_requires_exact_unique_valid_row(self):
+        output = (">> cmedit get MINBS01 bscconnectivityinformation.ipaddress -t\n"
+                  "NetworkElement,BscConnectivityInformation\n"
+                  "NodeId BscConnectivityInformationId ipAddress\n"
+                  "MINBS01 1 10.14.204.197\n\n1 instance(s)\n>>")
+        self.assertEqual(parse_bsc_connectivity_ip(output, "minbs01"),
+                         "10.14.204.197")
+        self.assertIsNone(parse_bsc_connectivity_ip(
+            output.replace("MINBS01 1", "OTHER 1"), "MINBS01"))
+        self.assertIsNone(parse_bsc_connectivity_ip(
+            output.replace("10.14.204.197", "999.14.204.197"), "MINBS01"))
+        self.assertIsNone(parse_bsc_connectivity_ip(
+            output.replace("\n\n1 instance", "\nMINBS01 2 10.14.204.198\n\n2 instance"),
+            "MINBS01"))
+        self.assertEqual(cutover_runner.bsc_connectivity_mo("MINBS01"),
+                         "BscConnectivityInformation")
+        self.assertEqual(cutover_runner.bsc_connectivity_mo("MINVBS02"),
+                         "VBscConnectivityInformation")
+
     def test_busy_tch_counts_only_traffic_channels(self):
         # BCCH/CBCH are BUSY but are signalling, not traffic.
         self.assertEqual(parse_rlcrp_busy_tch(RLCRP), 2)
@@ -302,18 +322,20 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(lte.sent, ["st cell"])
         self.assertEqual(gsm.sent, [])
 
-    def test_bsc_traffic_missing_ip_names_the_bsc(self):
+    def test_bsc_traffic_missing_live_ip_names_the_bsc(self):
         cells = [CutoverCell(node_name="MIN823_GINGOOB03", mo_type="GeranCell",
                              cell_dn="M8239S1", rat="GSM", sector="1",
                              gsm_fdn="SubNetwork=ONRM_ROOT_MO_R,MeContext=MINBS01,"
                                      "ManagedElement=MINBS01,GeranCell=M8239S1")]
-        eng = self._engine({}, cells)
-        eng.cfg["bsc_traffic"]["ip_map"] = {}
+        fake = NodeFake({}, delay=0)
+        eng = self._engine({"MIN823_GINGOOB03": fake}, cells)
         eng.capture_bsc_traffic()
         self._wait(eng, "bsc_traffic")
         [diag] = drain(eng, "diagnostic")
         self.assertIn("MINBS01", diag.message)
-        self.assertIn("ip_map", diag.message)
+        self.assertIn("BscConnectivityInformation.ipAddress", diag.message)
+        self.assertTrue(any("cmedit get minbs01 bscconnectivityinformation.ipaddress -t"
+                            in command.lower() for command in fake.sent))
 
     def test_bsc_traffic_per_sector_tabs_and_busy_tch(self):
         fdn = "MeContext=MINBS01,ManagedElement=MINBS01,GeranCell="
@@ -321,8 +343,15 @@ class CaptureTests(unittest.TestCase):
                              rat="GSM", sector=sec, gsm_fdn=fdn + dn)
                  for dn, sec in (("M8239S1", "1"), ("M8238S1", "1"),
                                  ("M8239S2", "2"))]
-        eng = self._engine({}, cells)
-        eng.cfg["bsc_traffic"]["ip_map"] = {"minbs01": "10.14.204.197"}
+        class BscIpFake(NodeFake):
+            def run_amos_command_safe(self, command, node, timeout=120):
+                self.sent.append(command)
+                if "bscconnectivityinformation.ipaddress" in command.lower():
+                    return ("NodeId  BscConnectivityInformationId ipAddress\n"
+                            "MINBS01 1 10.14.204.197\n\n1 instance(s)")
+                return self.outputs.get(command, "")
+        fake = BscIpFake({}, delay=0)
+        eng = self._engine({"B03": fake}, cells)
         seen = {}
 
         def fake_rlcrp(factory, ip, user, password, cell_list, log, **kw):
@@ -336,7 +365,9 @@ class CaptureTests(unittest.TestCase):
             self._wait(eng, "bsc_traffic")
         finally:
             bsc_mml.run_rlcrp = orig
-        self.assertEqual(seen["ip"], "10.14.204.197")   # map lookup is case-insensitive
+        self.assertEqual(seen["ip"], "10.14.204.197")
+        self.assertEqual(sum("bscconnectivityinformation.ipaddress" in c.lower()
+                             for c in fake.sent), 1)
         [ev] = drain(eng, "evidence_ready")
         self.assertEqual([l for l, _ in ev.images],
                          ["All", "S1", "S1 / M8239S1", "S1 / M8238S1", "S2", "S2 / M8239S2"])

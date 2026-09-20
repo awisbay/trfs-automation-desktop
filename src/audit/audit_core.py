@@ -1009,8 +1009,10 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None, cdd_tx_by_car
             conds.add("gsm")
         elif leaf in ("ENodeBFunction", "EUtranCellFDD", "EUtranCellTDD"):
             technologies.add("lte")
+            conds.add("lte")
         elif leaf in ("GNBDUFunction", "GNBCUCPFunction", "GNBCUUPFunction", "NRCellDU", "NRCellCU"):
             technologies.add("nr")
+            conds.add("nr")
         if leaf in ("EUtranCellFDD", "EUtranCellTDD"):
             conds.add("lte")
             ref = str(a.get("sectorCarrierRef") or "").strip()
@@ -1136,7 +1138,8 @@ def _feature_state(node, feat, records):
 
 def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                    cdd_tx_by_node=None, nodes=None,
-                   log=lambda m: None, cdd_tx_by_carrier=None) -> List[AuditResult]:
+                   log=lambda m: None, cdd_tx_by_carrier=None,
+                   feature_descriptions=None) -> List[AuditResult]:
     """Conditional feature-compliance audit.
 
     ``feature_rules`` (from audit_map.json) maps a rule key → {detect, features}.
@@ -1150,15 +1153,19 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
     the config, so each feature's condition set is exactly what should gate it."""
     if not feature_rules:
         return []
+    feature_descriptions = feature_descriptions or {}
     # feature → set(conditions) that would activate it.
     feat_conds = collections.defaultdict(set)
     baseline_feats = set()          # from broad LTE/NR/ESS baseline lists
+    required_only_feats = set()     # do not enforce deactivation outside scope
     for r in feature_rules.values():
         cond = r.get("detect")
         for f in r.get("features", []):
             feat_conds[f].add(cond)
             if r.get("baseline"):
                 baseline_feats.add(f)
+            if r.get("required_only"):
+                required_only_feats.add(f)
 
     def _is1(v):
         # Values look like "1 (ACTIVATED)" / "0 (DEACTIVATED)" /
@@ -1208,7 +1215,9 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
             expect_active = bool(active_conds)
             fstate, lstate, fdesc = _feature_state(node, feat, records)
             mo = _feature_mo(feat)
-            src = fdesc or "feature compliance"       # feature name (description)
+            description = fdesc or str(feature_descriptions.get(feat) or "").strip()
+            src = description or "feature compliance"
+            parameter = "featureState"
             gov_label = _labels(gov)                  # config this feature needs
             ref = _labels(active_conds) if active_conds else gov_label
             if fstate is None:
@@ -1219,14 +1228,14 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 # way a config-specific one is.
                 if expect_active and feat not in baseline_feats:
                     out.append(AuditResult(
-                        "feature", node, mo, "featureState",
-                        f"ACTIVATED ({ref})",
-                        f"({_feature_mo(feat).split(',')[-1].split('=')[0]} MO not found)", "NotFound",
-                        src, node, ref_cell=ref))
+                        "feature", node, mo, parameter,
+                        "ACTIVATED", "DEACTIVATED", "NotFound",
+                        src, node, ref_cell=ref,
+                        remark=f"FeatureState MO not found; required for {ref}."))
                 continue
             f_on, l_on = _is1(fstate), _is1(lstate)
             if expect_active:
-                exp = f"ACTIVATED ({ref})"
+                exp = "ACTIVATED"
                 if f_on and l_on:
                     continue                      # OK → hidden (only issues shown)
                 remarks = []
@@ -1234,24 +1243,31 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                     remarks.append("Feature Deactivated")
                 if not l_on:
                     remarks.append("License Missing")
-                act = (f"{'ACTIVATED' if f_on else 'DEACTIVATED'} / "
-                       f"{'ENABLED' if l_on else 'DISABLED'} "
-                       f"({'; '.join(remarks)})")
+                act = "ACTIVATED" if f_on else "DEACTIVATED"
                 status = "Mismatch"
+                remark = f"Required for {ref}; " + "; ".join(remarks) + "."
             else:
+                if feat in required_only_feats:
+                    # Mixed-mode features are checked only when their RAT
+                    # condition requires activation. If already active outside
+                    # that scope, accept it and omit it from the report.
+                    continue
                 if not f_on:
                     continue                      # correctly deactivated → hidden
                 # Remark names the config this feature belongs to, prefixed
                 # "Non " because the node does NOT have it (e.g. "Non AAS TDD").
                 reason = f"Non {gov_label}"
-                exp = f"DEACTIVATED ({reason})"
-                act = f"ACTIVATED (Should be Deactivated: {reason})"
+                exp = "DEACTIVATED"
+                act = "ACTIVATED"
                 status = "Mismatch"
                 ref = reason
+                remark = f"Should be Deactivated: {reason}."
             out.append(AuditResult(
-                "feature", node, mo, "featureState", exp, act, status,
+                "feature", node, mo, parameter, exp, act, status,
                 src, node, ref_cell=ref, feature_activation_allowed=l_on,
-                remark="License DISABLED or unknown; activation script omitted." if expect_active and not l_on else ""))
+                remark=(remark + (" Activation script omitted because license "
+                                  "is DISABLED or unknown."
+                                  if expect_active and not l_on else ""))))
     return out
 
 
