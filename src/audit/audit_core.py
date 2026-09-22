@@ -2037,7 +2037,7 @@ def _banner(name: str) -> str:
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
                             "consistency", "endc", "chain", "feature",
                             "termpoint-gnb", "power-license", "bandwidth-license", "trx-license",
-                            "radio-sharing"}
+                            "radio-sharing", "systemconstant"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.
@@ -2115,9 +2115,12 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             continue
         feat_by_node.setdefault(node, []).append((cxc_mo, val))
 
+    syscon_nodes = {r.node or r.key or site for r in results
+                    if r.category == "systemconstant" and r.status in statuses
+                    and r.expected == "4631:1"}
+
     written: List[str] = []
-    all_nodes = list(by_node.keys()) + [n for n in feat_by_node
-                                        if n not in by_node]
+    all_nodes = list(dict.fromkeys([*by_node, *feat_by_node, *sorted(syscon_nodes)]))
     for node in all_nodes:
         groups = by_node.get(node, {})
         lines = [
@@ -2155,6 +2158,8 @@ def generate_moshell_scripts(results: List[AuditResult], out_dir: str,
             lines.append(_banner("FEATURE"))
             for cxc_mo, val in sorted(feats):
                 lines.append(f"set {cxc_mo} featureState {val}")
+        if node in syscon_nodes:
+            lines.extend(["", _banner("SYSTEMCONSTANT"), "scw 4631:1"])
         # Close the log opened with l+ at the top.
         lines.append("")
         lines.append("l-")

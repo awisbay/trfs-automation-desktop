@@ -710,6 +710,12 @@ class AuditPage:
                                if (it.expected or "").strip())
             self._cdd_bsc = cdd_bscs.most_common(1)[0][0] if cdd_bscs else ""
             results = audit_core.compare(items, records)
+            from audit.systemconstant_audit import audit_systemconstant
+            systemconstant_results = audit_systemconstant(records, nodes, dump_evidence)
+            results += systemconstant_results
+            syscon_counts = Counter(r.status for r in systemconstant_results)
+            self._log(f"SystemConstant 4631:1: {syscon_counts['Match']} match, "
+                      f"{syscon_counts['Mismatch']} mismatch.")
             try:
                 if broker_items:
                     try:

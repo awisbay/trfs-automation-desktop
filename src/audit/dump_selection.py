@@ -18,7 +18,7 @@ def site_matches(node, site):
 
 
 def select_node_dumps(paths, *, site='', expected_nodes=None, existing_nodes=(), log=lambda m: None):
-    """Newest snapshot wins across formats; never fill it with older config.
+    """Prefer modump per node, then newest snapshot within the same format.
 
     Filename capture time, when present, precedes filesystem modification time.
     Untimestamped files use mtime, explicitly marked as such in the evidence.
@@ -48,11 +48,14 @@ def select_node_dumps(paths, *, site='', expected_nodes=None, existing_nodes=(),
                 basis = 'filename capture time'
             except ValueError:
                 log(f'[audit/dump] Invalid capture timestamp: {os.path.basename(path)}; using mtime')
-        candidates.append((stamp, identity, path, named, basis))
+        # rnclog.txt, required for SystemConstant, exists only in modump.
+        # A cmdump remains the fallback when no usable modump exists.
+        priority = 0 if "modump" in os.path.basename(path).casefold() else 1
+        candidates.append((priority, stamp, identity, path, named, basis))
 
     chosen, records = {}, {}
     # Stable path tie-break, independent of input ordering and file format.
-    for stamp, _, path, named, basis in sorted(candidates, key=lambda c: (-c[0], c[1])):
+    for _, stamp, _, path, named, basis in sorted(candidates, key=lambda c: (c[0], -c[1], c[2])):
         if named and (named['node'].casefold() in protected or named['node'].casefold() in chosen):
             log(f"[audit/dump] Ignored older/duplicate snapshot for {named['node']}: {os.path.basename(path)}")
             continue

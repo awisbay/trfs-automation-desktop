@@ -4,6 +4,16 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.16.1] - 2026-09-22
+
+### Changed
+- Prefer a valid modump over cmdump for each node in CDD Audit, with cmdump
+  used when no modump is available.
+- Audit LTE and NR SystemConstant 4631:1 from the selected modump's `rnclog.txt`.
+  Missing or incorrect values are mismatches and generate `scw 4631:1` in the
+  Moshell correction script. Cmdump results show `N/A use cmdump`; GSM-only
+  nodes are excluded from this check.
+
 ## [1.16.0] - 2026-09-20
 
 ### Added

@@ -42,6 +42,14 @@ class DumpSelectionTests(unittest.TestCase):
                 self.assertEqual(records['ManagedElement=MIN1_B01,SectorCarrier=SC1'], {'noOfTxAntennas': '2'})
                 self.assertEqual(evidence[0]['path'], new)
 
+    def test_modump_has_priority_over_newer_cmdump(self):
+        with tempfile.TemporaryDirectory() as folder:
+            modump = self.write_dump(folder, 'MIN1_B01_modump.log', [('MIN1_B01', 2)], 100)
+            cmdump = self.write_dump(folder, 'MIN1_B01_cmdump.zip', [('MIN1_B01', 8)], 200, xml=True)
+            records, _, evidence = select_node_dumps([cmdump, modump], site='MIN1')
+            self.assertEqual(evidence[0]['path'], modump)
+            self.assertEqual(records['ManagedElement=MIN1_B01,SectorCarrier=SC1']['noOfTxAntennas'], '2')
+
     def test_capture_filename_time_precedes_copy_mtime(self):
         with tempfile.TemporaryDirectory() as folder:
             old = self.write_dump(folder, 'MIN1_B01_modump_20260916_100000.log', [('MIN1_B01', 8)], 9999999999)
