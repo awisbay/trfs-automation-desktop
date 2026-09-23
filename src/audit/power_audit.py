@@ -98,7 +98,21 @@ def audit_power_license(records, nodes=None):
     # A shared radio receives its initial package independently on each BB.
     for node in sorted(set(grouped) | set(nodes or [])):
         mos = grouped.get(node, {})
-        radios, grants, problems = {}, [], []
+        radios, grants, problems, ess_excluded = {}, [], [], []
+        # An ESS LTE/NR carrier pair transmits the shared spectrum allocation.
+        # Count its LTE SectorCarrier power and exclude the paired NR carrier,
+        # otherwise the same RF demand is licensed twice.
+        lte_ess_pairs, nr_ess_pairs = set(), set()
+        for mo, attrs in mos.items():
+            leaf = mo.split(',')[-1].split('=')[0]
+            pair_id = str(attr(attrs, 'essScPairId') or '').strip()
+            if pair_id in ('', '0'):
+                continue
+            if leaf == 'SectorCarrier':
+                lte_ess_pairs.add(pair_id)
+            elif leaf == 'NRSectorCarrier':
+                nr_ess_pairs.add(pair_id)
+        paired_ess_ids = lte_ess_pairs & nr_ess_pairs
         power_mos = 0
         for mo, attrs in mos.items():
             attrs = {k.lower(): v for k, v in attrs.items()}
@@ -110,8 +124,13 @@ def audit_power_license(records, nodes=None):
                 if value is None:
                     problems.append(f"invalid configuredMaxTxPower: {mo}")
                     continue
-                if mo.split(',')[-1].split('=')[0] not in ('SectorCarrier', 'NRSectorCarrier', 'Trx'):
+                leaf = mo.split(',')[-1].split('=')[0]
+                if leaf not in ('SectorCarrier', 'NRSectorCarrier', 'Trx'):
                     problems.append(f'{mo}: unsupported power MO; physical radio allocation unavailable')
+                    continue
+                pair_id = str(attrs.get('essscpairid') or '').strip()
+                if leaf == 'NRSectorCarrier' and pair_id in paired_ess_ids:
+                    ess_excluded.append(f'{mo} ({display(value / 1000)} W; ESS pair {pair_id})')
                     continue
                 try:
                     mapped_radios = radios_for_mo(mo, attrs, node)
@@ -136,17 +155,18 @@ def audit_power_license(records, nodes=None):
             problems.append("no configuredMaxTxPower evidence")
         if len(grants) != 1 or grants[0] is None:
             problems.append("CXC4012338 grantedCapacityLevel missing/invalid/ambiguous")
-        calculations[node] = (radios, grants, problems)
+        calculations[node] = (radios, grants, problems, ess_excluded)
 
     results = []
     for node in sorted(set(nodes) if nodes is not None else grouped):
-        radios, grants, problems = calculations[node]
+        radios, grants, problems, ess_excluded = calculations[node]
         demands = [max(Decimal(0), radio['power'] / Decimal(20000) - 1) for radio in radios.values()]
         required = sum(demands, Decimal(0)) if radios and not problems else None
         granted = grants[0] if len(grants) == 1 else None
         delta = granted - required if granted is not None and required is not None else None
         status = "NotFound" if problems else ("Match" if delta >= 0 else "Mismatch")
-        source = "CapacityState=CXC4012338; per-radio power / 20 W minus initial package"
+        source = ("CapacityState=CXC4012338; per-radio power / 20 W minus initial package; "
+                  "paired ESS NR power excluded (LTE side counted)")
         remark = ("; ".join(problems) if problems else
                   f"Insufficient power license; shortage {display(-delta)} capacity units."
                   if delta < 0 else "Power license capacity is sufficient.")
@@ -155,6 +175,9 @@ def audit_power_license(records, nodes=None):
                          f"{display(max(Decimal(0), radio['power'] / Decimal(20000) - 1))} units"
                          for radio in radios.values()]
             remark += '\nRadio calculation (one free 20 W package per radio per BB):\n' + '\n'.join(breakdown)
+        if ess_excluded:
+            remark += ('\nESS paired NR carriers excluded; LTE carrier power counted:\n'
+                       + '\n'.join(ess_excluded))
         results.append(AuditResult(
             "power-license", node, "SystemFunctions=1,Lm=1,CapacityState=CXC4012338",
             "Power license capacity (required vs granted)", display(required),

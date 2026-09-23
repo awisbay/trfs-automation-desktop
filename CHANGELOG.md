@@ -4,6 +4,24 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.17.0] - 2026-09-23
+
+### Added
+- **Audit Clear Data button:** clears all Audit input fields, log, elapsed/status
+  text, and in-memory report/script actions without deleting source dumps, CDDs,
+  or generated reports from disk.
+
+### Fixed
+- **Power license: an ESS carrier pair is no longer counted twice.** When an
+  LTE SectorCarrier and an NR NRSectorCarrier share the same `essScPairId`, they
+  transmit the same spectrum, so only the LTE side's power is counted and the
+  paired NR carrier is excluded. The excluded carriers (with their power and
+  pair id) are listed in the result's remark.
+- **SystemConstant audit reports one result per node** instead of one per
+  technology, and a GSM-only node is explicitly reported as N/A rather than
+  looking unchecked. LTE/NR presence is decided from the cell MOs
+  (`EUtranCellFDD/TDD`, `NRCellDU/CU`), not from the function MOs.
+
 ## [1.16.2] - 2026-09-23
 
 ### Fixed

@@ -26,27 +26,30 @@ def _read_rnclog(path):
 
 
 def audit_systemconstant(records, nodes, dump_evidence):
-    """Return one result for each LTE/NR technology actually present per node."""
+    """Return one node-level result; GSM-only nodes are explicitly N/A."""
     paths = {row["node"].casefold(): row["path"] for row in dump_evidence}
     results = []
     for node in dict.fromkeys(nodes):
         node_records = [dn for dn in records
                         if re.search(r"(?:^|,)ManagedElement=" + re.escape(node) + r"(?:,|$)", dn, re.I)]
-        techs = []
-        if any(re.search(r"(?:^|,)(?:ENodeBFunction|EUtranCell(?:FDD|TDD))=", dn, re.I)
-               for dn in node_records):
-            techs.append("LTE")
-        if any(re.search(r"(?:^|,)(?:GNBDUFunction|GNBCUCPFunction|GNBCUUPFunction|NRCellDU)=", dn, re.I)
-               for dn in node_records):
-            techs.append("NR")
-        if not techs:
+        has_lte = any(re.search(r"(?:^|,)EUtranCell(?:FDD|TDD)=", dn, re.I)
+                      for dn in node_records)
+        has_nr = any(re.search(r"(?:^|,)NRCell(?:DU|CU)=", dn, re.I)
+                     for dn in node_records)
+        if not (has_lte or has_nr):
+            results.append(AuditResult(
+                category="systemconstant", key=node, mo="[GSM]",
+                parameter="SystemConstant 4631", expected="N/A", actual="N/A",
+                status="Match", source="Technology applicability",
+                node=node, remark="Not Required - GSM-only node",
+            ))
             continue
         path = paths.get(node.casefold(), "")
         try:
             log_text = _read_rnclog(path)
         except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
             log_text = None
-        found = {tech: [] for tech in techs}
+        found = []
         if log_text is not None:
             active = False
             value = None
@@ -54,8 +57,9 @@ def audit_systemconstant(records, nodes, dump_evidence):
             owner = None
 
             def commit():
-                if tech in found and value is not None and (owner is None or owner.casefold() == node.casefold()):
-                    found[tech].append(value)
+                if (tech in ("LTE", "NR") and value is not None
+                        and (owner is None or owner.casefold() == node.casefold())):
+                    found.append((tech, value))
 
             for line in log_text.splitlines():
                 if _COMMAND.search(line):
@@ -77,18 +81,17 @@ def audit_systemconstant(records, nodes, dump_evidence):
                 if owner_match:
                     owner = owner_match.group(1)
             commit()
-        for tech in techs:
-            values = found[tech]
-            cmdump = bool(path) and "cmdump" in os.path.basename(path).casefold()
-            actual = (", ".join(f"4631:{v}" for v in values) if values else
-                      "N/A" if cmdump else "(not found)")
-            results.append(AuditResult(
-                category="systemconstant", key=node, mo=f"[{tech}]",
-                parameter="SystemConstant 4631", expected="4631:1", actual=actual,
-                status="Match" if cmdump or "1" in values else "Mismatch",
-                source=f"{os.path.basename(path) or 'dump'} / rnclog.txt",
-                node=node,
-                remark=("N/A use cmdump" if cmdump else
-                        "/cm/sysconread all; correction: scw 4631:1"),
-            ))
+        cmdump = bool(path) and "cmdump" in os.path.basename(path).casefold()
+        values = [value for _, value in found]
+        actual = (", ".join(f"{tech} 4631:{value}" for tech, value in found)
+                  if found else "N/A" if cmdump else "(not found)")
+        results.append(AuditResult(
+            category="systemconstant", key=node, mo="[LTE/NR]",
+            parameter="SystemConstant 4631", expected="N/A" if cmdump else "4631:1",
+            actual=actual, status="Match" if cmdump or (values and all(v == "1" for v in values)) else "Mismatch",
+            source=f"{os.path.basename(path) or 'dump'} / rnclog.txt",
+            node=node,
+            remark=("N/A use cmdump" if cmdump else
+                    "/cm/sysconread all; correction: scw 4631:1"),
+        ))
     return results

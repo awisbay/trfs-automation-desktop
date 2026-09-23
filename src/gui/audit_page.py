@@ -126,6 +126,9 @@ class AuditPage:
             style=secondary_button_style(), on_click=self._apply_cmedit)
         self.editmap_btn = ft.OutlinedButton(
             "Edit Map", icon=ft.Icons.EDIT_NOTE, on_click=self._open_map_editor)
+        self.clear_btn = ft.OutlinedButton(
+            "Clear Data", icon=ft.Icons.DELETE_SWEEP,
+            style=secondary_button_style(), on_click=self._clear_data)
 
         def browse_row(field, handler, label):
             return ft.Row([
@@ -181,7 +184,7 @@ class AuditPage:
                     ft.Row([self.batch_field], spacing=10),
                     ft.Text(creds_line, size=11,
                             color=(TEXT_MUTED if creds_ok else ACCENT_WARM)),
-                    ft.Row([self.run_btn, self.open_btn, self.gen_btn,
+                    ft.Row([self.run_btn, self.clear_btn, self.open_btn, self.gen_btn,
                             self.runscript_btn, self.apply_btn,
                             self.timer_text, self.status_text],
                            spacing=14, wrap=True,
@@ -235,6 +238,38 @@ class AuditPage:
     def _toggle_log_height(self, e):
         self._log_big = not getattr(self, "_log_big", False)
         self.log_col.height = 900 if self._log_big else 460
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _clear_data(self, e):
+        """Reset Audit UI/session state without deleting any files on disk."""
+        if getattr(self.run_btn, "disabled", False):
+            self._set_status("Audit is running; wait until it finishes before clearing.",
+                             ACCENT_WARM)
+            return
+        for field in (self.site_field, self.lte_field, self.nr_field,
+                      self.gsm_field, self.gsm_log_field, self.lld_field,
+                      self.dump_field, self.cluster_field, self.batch_field):
+            field.value = ""
+        self.batch_count_text.value = ""
+        self.status_text.value = ""
+        self.timer_text.value = ""
+        self.log_col.controls.clear()
+        self._result_path = None
+        self._results = None
+        self._gen_ctx = None
+        self._script_dir = None
+        self._bsc_by_cell = {}
+        self._cdd_bsc = ""
+        for button in (self.open_btn, self.gen_btn, self.runscript_btn,
+                       self.apply_btn):
+            button.visible = False
+        # Prevent an old Integration handoff from repopulating the dump field
+        # when the user leaves and returns to Audit. Source/report files remain.
+        self.page.integration_dump_paths = []
+        self._save_state()
         try:
             self.page.update()
         except Exception:

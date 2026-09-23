@@ -106,5 +106,24 @@ class PowerAuditTests(unittest.TestCase):
             self.assertEqual(generate_moshell_scripts(rows,folder,'SITE',str(path)),[])
             self.assertEqual(generate_cmedit_scripts(rows,folder,'SITE',str(path)),[])
 
+    def test_ess_pair_counts_lte_power_and_excludes_paired_nr_power(self):
+        records = fixture([[]], grant='23')
+        prefix = 'ManagedElement=BB1,'
+        sef = 'SectorEquipmentFunction=R0'
+        for sector, local in enumerate((171, 172, 173), 1):
+            pair = f'{500 + sector}0000000{local}'
+            records[prefix + f'SectorCarrier=B28_S{sector}'] = {
+                'configuredMaxTxPower': '160000', 'sectorFunctionRef': sef,
+                'essScLocalId': str(local), 'essScPairId': pair}
+            records[prefix + f'NRSectorCarrier=N28_S{sector}'] = {
+                'configuredMaxTxPower': '160000', 'sectorEquipmentFunctionRef': sef,
+                'essScLocalId': str(local), 'essScPairId': pair}
+        rows, evidence = audit_power_license(records)
+        self.assertEqual((rows[0].expected, rows[0].actual, rows[0].status),
+                         ('23', '23', 'Match'))
+        self.assertIn('ESS paired NR carriers excluded', rows[0].remark)
+        self.assertEqual(rows[0].remark.count('NRSectorCarrier=N28_'), 3)
+        self.assertEqual(len(evidence), 6)
+
 if __name__=='__main__':
     unittest.main()
