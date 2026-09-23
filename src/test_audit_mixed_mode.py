@@ -8,7 +8,7 @@ from audit.audit_core import audit_features, generate_moshell_scripts
 
 
 class MixedModeTests(unittest.TestCase):
-    codes = ('CXC4012017', 'CXC4012015', 'CXC4012026', 'CXC4011018')
+    codes = ('CXC4012017', 'CXC4012015', 'CXC4012026', 'CXC4011018', 'CXC4040019')
     markers = {'gsm': 'BtsFunction=1', 'lte': 'ENodeBFunction=1', 'nr': 'GNBDUFunction=1'}
 
     @classmethod
@@ -36,11 +36,9 @@ class MixedModeTests(unittest.TestCase):
                 with self.subTest(techs=techs):
                     required = set()
                     if 'gsm' in techs:
-                        required.add('CXC4012026')
+                        required.update(('CXC4012017', 'CXC4012026', 'CXC4040019'))
                     if 'lte' in techs:
-                        required.add('CXC4011018')
-                    if 'gsm' in techs and techs & {'lte', 'nr'}:
-                        required.add('CXC4012017')
+                        required.update(('CXC4011018', 'CXC4040019'))
                     if 'lte' in techs and techs & {'gsm', 'nr'}:
                         required.add('CXC4012015')
                     off_rows = self.rows(self.fixture('BB1', techs))
@@ -55,8 +53,10 @@ class MixedModeTests(unittest.TestCase):
             records.update(self.fixture(node, {tech}))
         records['ManagedElement=BB2,ExternalGNodeBFunction=NR'] = {'gNodeBId': '99'}
         records['ManagedElement=BB1,ExternalEUtranCellFDD=LTE'] = {}
-        self.assertEqual(set(self.rows(records, nodes=['BB1'])), {'CXC4012026'})
-        self.assertEqual(set(self.rows(records, nodes=['BB2'])), {'CXC4011018'})
+        self.assertEqual(set(self.rows(records, nodes=['BB1'])),
+                         {'CXC4012017', 'CXC4012026', 'CXC4040019'})
+        self.assertEqual(set(self.rows(records, nodes=['BB2'])),
+                         {'CXC4011018', 'CXC4040019'})
         self.assertEqual(set(self.rows(records, nodes=['BB3'])), set())
 
     def test_missing_required_features_are_reported_without_baseline_suppression(self):

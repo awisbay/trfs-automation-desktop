@@ -90,3 +90,6 @@ src/_load_pid.txt
 
 # Extracted review material (not source)
 review_rev_e/
+
+# Local GUI debug logs
+local_gui_*.log

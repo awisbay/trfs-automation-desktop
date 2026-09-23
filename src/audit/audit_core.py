@@ -1031,7 +1031,15 @@ def _detect_feature_conditions(node, records, cdd_tx_by_node=None, cdd_tx_by_car
             fru_names[fid] = str(pname).upper()
         elif leaf == "SectorCarrier":
             carriers[local.casefold()] = a
-        if "SpectrumSharingFunction=" in ldn:
+        # Some modumps omit SpectrumSharingFunction. A non-zero carrier pair
+        # is direct evidence that ESS is configured on this node.
+        ess_pair = str(a.get("essScPairId") or "").strip()
+        ess_local = str(a.get("essScLocalId") or "").strip()
+        ess_enabled = str(a.get("essEnabled") or "").strip().casefold()
+        if ("SpectrumSharingFunction=" in ldn
+                or (leaf in ("SectorCarrier", "NRSectorCarrier")
+                    and (ess_pair not in ("", "0") or ess_local not in ("", "0")))
+                or ess_enabled in ("true", "1", "1 (true)", "1 (enabled)")):
             conds.add("ess")
 
     if "gsm" in technologies and technologies & {"lte", "nr"}:
@@ -1184,7 +1192,7 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
     _LABEL = {"8t8r": "8T8R", "4t4r": "4T4R", "nr": "EN-DC/NR",
               "aas_b41_lte": "AAS TDD", "aas_b41_nr": "AAS TDD",
               "aas_b1b3": "AAS FDD", "lte": "LTE", "ess": "ESS",
-              "mixed_gsm": "Mixed Mode GSM", "mixed_lte": "Mixed Mode LTE",
+              "gsm": "GSM", "mixed_gsm": "Mixed Mode GSM", "mixed_lte": "Mixed Mode LTE",
               "always": "Always Required"}
 
     def _labels(conds_set):
@@ -1226,7 +1234,8 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 # Baseline (broad LTE/NR/ESS) features whose MO isn't on the node
                 # are NOT flagged — a missing broad feature is not actionable the
                 # way a config-specific one is.
-                if expect_active and feat not in baseline_feats:
+                if (expect_active and
+                        (feat not in baseline_feats or feat in required_only_feats)):
                     out.append(AuditResult(
                         "feature", node, mo, parameter,
                         "ACTIVATED", "DEACTIVATED", "NotFound",

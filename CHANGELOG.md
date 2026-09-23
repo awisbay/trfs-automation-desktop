@@ -4,6 +4,22 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.16.2] - 2026-09-23
+
+### Fixed
+- **ESS is detected even when the dump has no `SpectrumSharingFunction` MO.**
+  A non-zero `essScPairId` / `essScLocalId` on a (NR)SectorCarrier, or
+  `essEnabled` being true, now counts as evidence that ESS is configured, so
+  those nodes are no longer audited as if ESS were absent.
+- **ESS local-ID check uses the CDD ESS local ID for both carriers.** The LTE
+  SectorCarrier and the NR NRSectorCarrier are matched against the ESS local ID
+  from the CDD (normally the LTE cell ID); the NR cell itself still keeps its own
+  NR local ID.
+- **GSM feature rule adds Multiple GNSS Support (CXC4040019)** alongside Mixed
+  Mode GSM, and the rule now triggers on GSM presence rather than mixed mode
+  only. A feature that is required by a specific rule is reported even when it
+  also appears in a baseline rule.
+
 ## [1.16.1] - 2026-09-22
 
 ### Changed

@@ -354,13 +354,14 @@
     "CXC4012017": "Mixed Mode Baseband GSM",
     "CXC4012015": "Mixed Mode Baseband LTE",
     "CXC4012026": "Mixed Mode Radio GSM for Baseband",
-    "CXC4011018": "Mixed Mode Radio LTE"
+    "CXC4011018": "Mixed Mode Radio LTE",
+    "CXC4040019": "Multiple GNSS Support"
   },
   "feature_rules": {
     "mixed_mode_gsm": {
-      "detect": "mixed_gsm",
+      "detect": "gsm",
       "required_only": true,
-      "features": ["CXC4012017"]
+      "features": ["CXC4012017", "CXC4040019"]
     },
     "mixed_mode_lte": {
       "detect": "mixed_lte",

@@ -116,6 +116,38 @@ class FeatureDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(generate_moshell_scripts(rows, folder, 'MIN1', 'audit.xlsx'), [])
 
+    def test_gsm_standalone_requires_all_three_gsm_features(self):
+        prefix = 'ManagedElement=' + self.node + ','
+        records = {prefix + 'BtsFunction=1': {}}
+        features = ['CXC4012017', 'CXC4012026', 'CXC4040019']
+        for feature in features:
+            records[prefix + f'SystemFunctions=1,Lm=1,FeatureState={feature}'] = {
+                'featureState': '0 (DEACTIVATED)', 'licenseState': '1 (ENABLED)'}
+        rules = {
+            'gsm_baseband': {'detect': 'gsm', 'required_only': True,
+                             'features': ['CXC4012017', 'CXC4040019']},
+            'gsm_radio': {'detect': 'gsm', 'required_only': True,
+                          'features': ['CXC4012026']},
+        }
+        rows = audit_features(records, rules)
+        self.assertEqual({row.mo.rsplit('=', 1)[-1] for row in rows}, set(features))
+        self.assertTrue(all(row.status == 'Mismatch' and row.ref_cell == 'GSM'
+                            for row in rows))
+
+    def test_nonzero_carrier_pair_detects_ess_without_sharing_function(self):
+        prefix, records = self.fixture()
+        records[prefix + 'SectorCarrier=SC1']['essScPairId'] = '5010000000171'
+        self.assertIn('ess', self.conditions(records))
+
+    def test_ess_fallback_layers_detect_local_id_and_enabled_relation(self):
+        prefix, records = self.fixture()
+        records[prefix + 'SectorCarrier=B28_S1'] = {'essScLocalId': '171'}
+        self.assertIn('ess', self.conditions(records))
+        prefix, records = self.fixture()
+        records[prefix + 'ENodeBFunction=1,EUtranCellFDD=L700,'
+                         'GUtranCellRelation=N700'] = {'essEnabled': 'true'}
+        self.assertIn('ess', self.conditions(records))
+
 
 if __name__ == '__main__':
     unittest.main()
