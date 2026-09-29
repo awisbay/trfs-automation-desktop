@@ -3,10 +3,18 @@ import unittest
 from pathlib import Path
 
 from openpyxl import Workbook
-from audit.lld_audit import audit_lld, _sheet_rows, _canonical_header
+from audit.lld_audit import (audit_lld, _sheet_rows, _canonical_header,
+                             _rru_sector_matches)
 
 
 class LldHeaderTests(unittest.TestCase):
+    def test_combined_sector_radio_requires_multiple_links(self):
+        self.assertTrue(_rru_sector_matches('1', 'B41_RRU12', 2))
+        self.assertTrue(_rru_sector_matches('2', 'B41_RRU12', 2))
+        self.assertFalse(_rru_sector_matches('3', 'B41_RRU12', 2))
+        self.assertFalse(_rru_sector_matches('1', 'B0B28_RRU123_1', 1))
+        self.assertTrue(_rru_sector_matches('123', 'B0B28_RRU123_1', 1))
+
     def test_old_and_v53_port_headers(self):
         for header in ("BB RI Port", "BB RI Port / \nFor Cascade - Radio DATA Port",
                        "Baseband CPRI Port (new allocation)", "BB_RI_PORT / revised notes"):

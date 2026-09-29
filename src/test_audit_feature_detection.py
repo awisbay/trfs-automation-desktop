@@ -116,6 +116,23 @@ class FeatureDetectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(generate_moshell_scripts(rows, folder, 'MIN1', 'audit.xlsx'), [])
 
+    def test_ess_capacity_enabler_is_not_mandatory_for_plain_lte(self):
+        prefix, records = self.fixture()
+        mo = 'SystemFunctions=1,Lm=1,CapacityState=CXC4012411'
+        records[prefix + mo] = {
+            'featureState': '1 (ACTIVATED)', 'licenseState': '0 (DISABLED)'}
+        rules = {'ess_capacity': {
+            'detect': 'ess', 'required_only': True,
+            'features': ['CXC4012411']}}
+        self.assertEqual(audit_features(records, rules), [])
+
+        records[prefix + 'SectorCarrier=SC1']['essScLocalId'] = '171'
+        records[prefix + 'SectorCarrier=SC1']['essScPairId'] = '5010000000171'
+        rows = audit_features(records, rules)
+        self.assertEqual([(row.mo, row.status, row.ref_cell) for row in rows],
+                         [(mo, 'Mismatch', 'ESS')])
+        self.assertIn('License Missing', rows[0].remark)
+
     def test_gsm_standalone_requires_all_three_gsm_features(self):
         prefix = 'ManagedElement=' + self.node + ','
         records = {prefix + 'BtsFunction=1': {}}

@@ -26,6 +26,17 @@ def _nr_bands(value):
     return {int(b) for b in re.findall(r'\d+', text)}
 
 
+def _refs(value):
+    """Split Ericsson reference arrays from either dump format.
+
+    Modump normally separates FDNs with semicolons. Cmdump may flatten the
+    same array to whitespace-separated absolute FDNs.
+    """
+    text = re.sub(r'^(?:i)?\[\d+\]\s*=\s*', '', str(value or '').strip())
+    return [ref.strip() for ref in re.split(
+        r';|\s+(?=(?:SubNetwork|ManagedElement)=)', text) if ref.strip()]
+
+
 def audit_bandwidth_license(records, nodes=None):
     grouped = defaultdict(dict)
     for dn, attrs in records.items():
@@ -65,7 +76,7 @@ def audit_bandwidth_license(records, nodes=None):
             sef = resolve(sef_ref)
             if sef is None:
                 return None, set(), f'Reference path incomplete: SectorCarrier -> SectorEquipmentFunction [{sef_ref or "reference missing"}]'
-            refs = str(attr(sef, 'rfBranchRef')).split(';')
+            refs = _refs(attr(sef, 'rfBranchRef'))
             kinds = set()
             fallback_frus = set()
             for ref in refs:
@@ -110,7 +121,7 @@ def audit_bandwidth_license(records, nodes=None):
         for cell_mo, cell_attrs in mos.items():
             if not cell_mo.split(',')[-1].startswith('NRCellDU='):
                 continue
-            refs = str(attr(cell_attrs, 'nRSectorCarrierRef')).split(';')
+            refs = _refs(attr(cell_attrs, 'nRSectorCarrierRef'))
             if any(not re.search(r'(?:^|,)NRSectorCarrier=[^,]+$', ref.strip())
                    or resolve(ref) is None for ref in refs):
                 for key in ('2290', '2283', '2284', '2321', '2322'):
@@ -127,7 +138,7 @@ def audit_bandwidth_license(records, nodes=None):
                 ul = number(attr(a, 'bSChannelBwUL'))
                 carrier = a
                 cells = [ca for cm, ca in mos.items() if cm.split(',')[-1].startswith('NRCellDU=')
-                         and any(resolve(ref) is a for ref in str(attr(ca, 'nRSectorCarrierRef')).split(';'))]
+                         and any(resolve(ref) is a for ref in _refs(attr(ca, 'nRSectorCarrierRef')))]
                 bands = set()
                 for ca in cells:
                     bands.update(_nr_bands(attr(ca, 'bandList')) or _nr_bands(attr(ca, 'bandListManual')))

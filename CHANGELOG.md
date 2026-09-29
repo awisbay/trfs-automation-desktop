@@ -4,6 +4,20 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.17.1] - 2026-09-29
+
+### Fixed
+- **Bandwidth license reads reference arrays from cmdump too.** `rfBranchRef`
+  and `nRSectorCarrierRef` are split on semicolons *or* on whitespace before an
+  absolute FDN, so a cmdump that flattens the array no longer looks like a
+  broken reference path.
+- **RiLink audit keeps a single-link combined RRU strict.** A combined-sector
+  FRU (e.g. `B41_RRU12`) only satisfies a per-sector plan row when it really
+  carries more than one RiLink, so an `RRU123` with one link can no longer
+  accidentally match a Sector 1 plan.
+- **ESS capacity enabler (CXC4012411) is only required when ESS is configured**
+  instead of being part of the baseline feature list.
+
 ## [1.17.0] - 2026-09-23
 
 ### Added

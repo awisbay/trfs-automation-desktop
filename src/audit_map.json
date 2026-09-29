@@ -502,7 +502,6 @@
         "CXC4011258",
         "CXC4011914",
         "CXC4012024",
-        "CXC4012411",
         "CXC4011666",
         "CXC4012392",
         "CXC4012396",
@@ -547,6 +546,13 @@
         "CXC4012528"
       ],
       "baseline": true
+    },
+    "ess_capacity_enabler": {
+      "detect": "ess",
+      "required_only": true,
+      "features": [
+        "CXC4012411"
+      ]
     },
     "8t8r": {
       "detect": "8t8r",

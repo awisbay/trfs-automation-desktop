@@ -49,6 +49,17 @@ class BandwidthTests(unittest.TestCase):
         self.assertIn('Reference path incomplete:', rows['2367'].remark)
         self.assertIn('RfBranch=1', rows['2367'].remark)
 
+    def test_cmdump_whitespace_separated_rf_branch_references(self):
+        records = self.fixture()
+        prefix = 'SubNetwork=ROOT,ManagedElement=BB1,'
+        records['ManagedElement=BB1,SectorEquipmentFunction=F']['rfBranchRef'] = (
+            prefix + 'RfBranch=1 ' + prefix + 'RfBranch=2')
+        records['ManagedElement=BB1,RfBranch=2'] = {
+            'rfPortRef': 'FieldReplaceableUnit=RADIO,RfPort=B'}
+        rows = {r.mo[-4:]: r for r in audit_bandwidth_license(records)}
+        self.assertEqual((rows['2367'].expected, rows['2367'].status),
+                         ('4', 'Match'))
+
     def test_dangling_extra_nr_cell_is_not_silently_ignored(self):
         records = self.fixture()
         records['ManagedElement=BB1,NRCellDU=ORPHAN'] = {'bandListManual': '41',

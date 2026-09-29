@@ -162,6 +162,17 @@ def _rru_index(radio_fru: str) -> str:
     return m.group(1) if m else ""
 
 
+def _rru_sector_matches(sector: str, radio_fru: str, link_count: int) -> bool:
+    """Accept a combined-sector FRU only when it really has multiple links."""
+    sector = str(sector or "").strip()
+    rru = _rru_index(radio_fru)
+    if not sector or not rru or rru == sector:
+        return True
+    # B41_RRU12 with two RiLinks serves sectors 1 and 2. Keep a one-link
+    # RRU123 strict so it cannot accidentally satisfy a Sector 1 plan.
+    return link_count > 1 and len(sector) == 1 and sector in rru
+
+
 def _radio_type_matches(cdd_type: str, radio_fru: str) -> bool:
     """Best-effort radio-type check: compare CDD radio type vs the radio FRU
     name on riPortRef2 via shared band tokens (B41 / B1B3 / B0AB28≈B0B28)."""
@@ -329,6 +340,8 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
 
     # Pool of node links, keyed by port; consumed as we pair them.
     pool = {port: (fru, dport) for port, (_rid, fru, dport) in idx.items()}
+    fru_link_count = collections.Counter(
+        fru.casefold() for _port, (_rid, fru, _dport) in idx.items() if fru)
 
     def _pair(p):
         """Pick this planned row's node link. The radio BAND is the identity, so
@@ -383,8 +396,8 @@ def _audit_rilink_rows(col, data, node_name, node_l, k, bbid, records, sheet, lo
         # should be per-sector (RRU1/RRU2/RRU3).
         band_ok = (not p["radio_type"]
                    or _radio_type_matches(p["radio_type"], radio_fru))
-        rru = _rru_index(radio_fru)
-        sector_ok = (not p["sector"]) or (not rru) or (rru == p["sector"])
+        sector_ok = _rru_sector_matches(
+            p["sector"], radio_fru, fru_link_count[radio_fru.casefold()])
         hw_ok = band_ok and sector_ok
         data_ok = (not p["data_port"]
                    or _norm(p["data_port"]) == _norm(radio_port))
