@@ -4,6 +4,41 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.18.0] - 2026-09-29
+
+### Added
+- **RET Audit** (new button next to CDD Audit): compares every RET before the
+  swap (Nokia IM snapshot, `.ims2`) with after the swap (Ericsson log of
+  `lhgetc AntennaUnitGroup=.*,AntennaNearUnit=`, one or more files, several
+  nodes per log allowed). RET subunits are paired in passes: same device
+  (controller serial + subunit), then the Ericsson configured uniqueId for a
+  RET whose device was never read, then base station ID / sector ID + subunit
+  for a replaced RET. The target is the RET working on Ericsson: **OK** when
+  the Ericsson RetSubUnit is ENABLED in the same sector as on Nokia (a
+  different antenna, a new RET or one Nokia never had is fine), **Not OK**
+  when it is DISABLED or absent on Ericsson, or moved to another sector. The
+  remark explains each row: Ericsson state, "mismatch <field>" for unique ID
+  (`uniqueId` first, then `onUnitUniqueId`), product, HW version, min/max
+  tilt, bearing, antenna model/serial, base station ID, sector ID, installer
+  ID and gain, tilt as a note, how a different device was paired, and whether
+  the RET was already faulty on Nokia (disabled, no tilt, active RET alarm, or
+  not in the commissioned plan). Differing cells are red in the report.
+  Each RET shows its physical sector on both sides: Ericsson from the
+  AntennaUnitGroup name (`…_S1`), Nokia from the radio its controller is
+  linked to and the cells that radio serves. Results show on the page and
+  export to `LOG/<SiteID>/AUDIT/<site>_RET_audit_<ts>.xlsx` (Summary with
+  sector counts, side-by-side RET Audit with differing cells in red, the raw
+  RETs of each side, and **Nokia Alarms**: active alarms on top, the alarm
+  history from the snapshot log below, with Active/Cleared status).
+  The Sector ID programmed in each RET (e.g. `SEC-3_ANT1&2`) is cross-checked
+  against its physical sector on both sides and noted when it disagrees. An
+  active Nokia alarm raised on a RET or its controller (e.g. 7113 "RET Antenna
+  control failure") marks that RET as already faulty before the swap.
+- **Nokia `.ims2` reader** (`ims2_reader.py`): decodes the snapshot directly,
+  without the WebEM reader, using the info model (meta.xml) carried inside the
+  file, so it keeps working across Nokia releases. Deleted MOs (e.g. cleared
+  alarms) are dropped, and the full write/delete history is kept for alarms.
+
 ## [1.17.1] - 2026-09-29
 
 ### Fixed

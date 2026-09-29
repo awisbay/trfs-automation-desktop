@@ -23,6 +23,7 @@ ensure_assets_in_app_dir([
 
 import flet as ft
 from gui.audit_page import AuditPage
+from gui.ret_audit_page import RetAuditPage
 from gui.cutover_page import CutOverPage
 from gui.form_page import FormPage
 from gui.integration_page import IntegrationPage, IntegrationRunPage
@@ -155,6 +156,8 @@ def main(page: ft.Page):
             return TerminalPage(page).build()
         elif route == "/audit":
             return AuditPage(page).build()
+        elif route == "/ret_audit":
+            return RetAuditPage(page).build()
         elif route == "/cutover":
             return CutOverPage(page).build()
         return FormPage(page).build()

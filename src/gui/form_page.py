@@ -595,6 +595,25 @@ class FormPage:
                                 on_click=self._on_audit,
                             ),
                             ft.OutlinedButton(
+                                "RET Audit",
+                                icon=ft.Icons.SETTINGS_INPUT_ANTENNA,
+                                disabled=FEATURE_AUDIT not in self._features,
+                                tooltip=(
+                                    "Compare RETs before (Nokia .ims2) and "
+                                    "after (Ericsson lhgetc log) the swap"
+                                    if FEATURE_AUDIT in self._features
+                                    else self._feature_locked_tooltip("RET Audit")
+                                ),
+                                style=ft.ButtonStyle(
+                                    color=ACCENT_WARM,
+                                    side=ft.BorderSide(1, ft.Colors.with_opacity(0.6, ACCENT_WARM)),
+                                    mouse_cursor=ft.MouseCursor.CLICK,
+                                    padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                                    shape=ft.RoundedRectangleBorder(radius=14),
+                                ),
+                                on_click=self._on_ret_audit,
+                            ),
+                            ft.OutlinedButton(
                                 "Clear Data",
                                 icon=ft.Icons.CLEANING_SERVICES_OUTLINED,
                                 icon_color="#FF8A8A",
@@ -1182,6 +1201,15 @@ class FormPage:
         self._persist_session(f)
         self.page.integration_form = f
         self.page.go("/audit")
+
+    def _on_ret_audit(self, e):
+        if FEATURE_AUDIT not in self._features:
+            self._show_alert("Feature locked", self._feature_locked_tooltip("RET Audit"))
+            return
+        f = self._collect_form()
+        self._persist_session(f)
+        self.page.integration_form = f
+        self.page.go("/ret_audit")
 
     def _on_integration(self, e):
         if FEATURE_INTEGRATION not in self._features:
