@@ -75,6 +75,11 @@ class RetAuditPage:
             style=primary_button_style(), on_click=self._run)
         self.table_panel = panel(self.table_col, bgcolor=PANEL, padding=12)
         self.table_panel.visible = False
+        self.clear_btn = ft.OutlinedButton(
+            "Clear Data", icon=ft.Icons.DELETE_SWEEP,
+            tooltip="Clear the inputs and results on this page "
+                    "(report files on disk are kept)",
+            style=secondary_button_style(), on_click=self._clear_data)
         self.open_btn = ft.ElevatedButton(
             "Open Report", icon=ft.Icons.OPEN_IN_NEW, visible=False,
             style=secondary_button_style(), on_click=self._open_result)
@@ -129,7 +134,8 @@ class RetAuditPage:
                     browse_row(self.log_field, self._browse_logs,
                                "Ericsson log(s)"),
                     command_box,
-                    ft.Row([self.run_btn, self.open_btn, self.status_text],
+                    ft.Row([self.run_btn, self.clear_btn, self.open_btn,
+                            self.status_text],
                            spacing=14, wrap=True,
                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=12), bgcolor=PANEL, padding=18),
@@ -209,6 +215,25 @@ class RetAuditPage:
         except Exception as exc:
             self._set_status(f"Copy failed: {exc}", DANGER)
 
+    def _clear_data(self, e):
+        """Reset the page's inputs and results. Files on disk (the .ims2,
+        the Ericsson logs, earlier reports) are not touched."""
+        if self._running:
+            self._set_status("RET Audit is running; wait until it finishes "
+                             "before clearing.", ACCENT_WARM)
+            return
+        for field in (self.site_field, self.ims2_field, self.log_field):
+            field.value = ""
+        self._result_path = None
+        self.open_btn.visible = False
+        self.site_banner.visible = False
+        self.summary_row.controls.clear()
+        self.table_col.controls.clear()
+        self.table_panel.visible = False
+        self.log_col.controls.clear()
+        self._save_state()
+        self._set_status("Cleared.", TEXT_MUTED)
+
     def _open_result(self, e):
         if self._result_path and os.path.isfile(self._result_path):
             try:
@@ -275,6 +300,14 @@ class RetAuditPage:
             snap = Snapshot(ims2)
             nokia = ret_audit.nokia_rets(snap)
             alarms = ret_audit.nokia_alarms(snap)
+            from audit import nokia_radio
+            radio = nokia_radio.radio_rows(snap)
+            flagged = [r for r in radio
+                       if r["VSWR status"] in ("Warning", "Minor", "Major")]
+            self._log(f"  Radio view: {len({r['Radio'] for r in radio})} radio(s), "
+                      f"{len(radio)} port/band/cell row(s)"
+                      + (f", ⚠ {len(flagged)} row(s) with VSWR ≥ 1.4" if flagged
+                         else ", VSWR all below 1.4"))
             self._log(f"  {len(snap.raw)} MOs decoded in {time.time() - t0:.1f}s"
                       f" → {len(nokia)} RET subunit(s), {len(alarms[0])} "
                       f"active alarm(s), {len(alarms[1])} in history")
@@ -310,7 +343,7 @@ class RetAuditPage:
             ret_audit.write_excel(rows, nokia, ericsson, path,
                                   ret_audit.default_meta(ims2, logs, site,
                                                          check),
-                                  alarms=alarms)
+                                  alarms=alarms, radio=radio)
             self._result_path = path
             counts = ret_audit.summarize(rows)
             self._log(f"✓ Report: {path}")

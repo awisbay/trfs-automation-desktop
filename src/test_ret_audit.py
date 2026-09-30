@@ -270,6 +270,23 @@ UNDETECTED_LOG = "\n".join([
 ])
 
 
+# Real shape of an Ericsson site whose RET devices never connected
+# (MIN2362): ANU LOCKED / NO_CONNECTION, no serial or onUnitUniqueId,
+# subunitNumber 0 (retSubUnitId holds the number), -1000 = not read.
+LOCKED_LOG = "\n".join([
+    "MIN2362_TIGUHALPUYANZDSB01> lhgetc AntennaUnitGroup=.*,AntennaNearUnit=",
+    "MO;administrativeState;availabilityStatus;connectionState;onUnitUniqueId;"
+    "operationalState;serialNumber;uniqueId",
+    "AntennaUnitGroup=RB_2G6WD01_S1,AntennaNearUnit=2;0 (LOCKED)         ;"
+    "i[2] = 9 5 (DEPENDENCY_LOCKED DEPENDENCY);0 (NO_CONNECTION);;"
+    "0 (DISABLED)    ;;RBK77222B1526540-M2",
+    "MO;electricalAntennaTilt;iuantAntennaBearing;iuantAntennaOperatingGain;"
+    "maxTilt;minTilt;operationalState;retSubUnitId;subunitNumber",
+    "AntennaUnitGroup=RB_2G6WD01_S1,AntennaNearUnit=2,RetSubUnit=3;20 ;-1000;"
+    "i[4] = -1000 -1000 -1000 -1000 ;120;20;0 (DISABLED);3 ;0 ",
+])
+
+
 def _nokia_like(e, **over):
     r = ra.Ret(**{k: getattr(e, k) for k in ra.Ret.__dataclass_fields__
                   if k != "faults"})
@@ -374,6 +391,24 @@ class CompareTests(unittest.TestCase):
         row = ra.compare([n], rets)[0]
         self.assertEqual((row.status, row.paired_by),
                          ("Not OK", "configured uniqueId"))
+
+    def test_locked_unconnected_device_pairs_on_unique_id_and_ret_id(self):
+        e = ra.ericsson_rets(LOCKED_LOG)[0]
+        self.assertEqual((e.serial, e.subunit, e.sector), ("", 3, "S1"))
+        self.assertEqual((e.bearing, e.gains), (None, ""))       # -1000
+        for f in ("device not detected", "AntennaNearUnit LOCKED",
+                  "NO_CONNECTION"):
+            self.assertIn(f, e.faults)
+        n = _nokia_like(self.ok, serial="K77222B1526540-M2",
+                        device_id="RBK77222B1526540-M2",
+                        unique_id="RBK77222B1526540-M2", subunit=3,
+                        sector="S1")
+        row = ra.compare([n], [e])[0]
+        self.assertEqual((row.status, row.paired_by),
+                         ("Not OK", "configured uniqueId"))
+        # unread AISG data is unknown, not "different"
+        self.assertNotIn("Antenna model", row.diffs)
+        self.assertNotIn("Unique ID", row.diffs)
 
     # ── replaced antenna (different device, same position) ──────────────
     def _replaced_pair(self, **eric_over):

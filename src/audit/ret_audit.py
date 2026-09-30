@@ -550,6 +550,25 @@ def ericsson_sector(mo: str, anu: dict, rsu: dict) -> Tuple[str, str]:
     return "", ""
 
 
+def _subunit(rsu: dict) -> Optional[int]:
+    """subunitNumber is what the device reports; while the device is not
+    connected it reads 0/-1, so fall back to the configured retSubUnitId."""
+    n = _int(rsu.get("subunitNumber"))
+    if n is None or n <= 0:
+        n = _int(rsu.get("retSubUnitId"))
+    return n
+
+
+def _known(v: Optional[int]) -> Optional[int]:
+    """-1000 is Ericsson's 'not read from the device' value."""
+    return None if v is not None and v <= -1000 else v
+
+
+def _known_list(v: str) -> str:
+    """'-1000 -1000 -1000 -1000' (gains of an unread device) -> ''."""
+    return "" if all(x == "-1000" for x in (v or "").split()) else v
+
+
 def ericsson_rets(text: str) -> List[Ret]:
     rets: List[Ret] = []
     for node, mos in parse_lhgetc(text).items():
@@ -566,16 +585,17 @@ def ericsson_rets(text: str) -> List[Ret]:
                 product=anu.get("productNumber", ""),
                 hw=anu.get("hardwareVersion", ""),
                 sw=anu.get("softwareVersion", ""),
-                subunit=_int(a.get("subunitNumber") or a.get("retSubUnitId")),
-                tilt=_int(a.get("electricalAntennaTilt")),
-                min_tilt=_int(a.get("minTilt")), max_tilt=_int(a.get("maxTilt")),
-                bearing=_int(a.get("iuantAntennaBearing")),
+                subunit=_subunit(a),
+                tilt=_known(_int(a.get("electricalAntennaTilt"))),
+                min_tilt=_known(_int(a.get("minTilt"))),
+                max_tilt=_known(_int(a.get("maxTilt"))),
+                bearing=_known(_int(a.get("iuantAntennaBearing"))),
                 ant_model=a.get("iuantAntennaModelNumber", ""),
                 ant_serial=a.get("iuantAntennaSerialNumber", ""),
                 base_station_id=a.get("iuantBaseStationId", ""),
                 sector_id=a.get("iuantSectorId", ""),
                 installer=a.get("iuantInstallersId", ""),
-                gains=a.get("iuantAntennaOperatingGain", ""),
+                gains=_known_list(a.get("iuantAntennaOperatingGain", "")),
                 bands=a.get("iuantAntennaOperatingBand", ""),
                 state=state,
             )
@@ -587,6 +607,10 @@ def ericsson_rets(text: str) -> List[Ret]:
                 r.faults.append("RetSubUnit %s" % (state or "state unknown"))
             if anu.get("operationalState", "").upper() == "DISABLED":
                 r.faults.append("AntennaNearUnit DISABLED")
+            if anu.get("administrativeState", "").upper() == "LOCKED":
+                r.faults.append("AntennaNearUnit LOCKED")
+            if anu.get("connectionState", "").upper() == "NO_CONNECTION":
+                r.faults.append("NO_CONNECTION")
             if "FAILED" in a.get("availabilityStatus", "").upper():
                 r.faults.append("availability FAILED")
             if "FAILED" in a.get("calibrationStatus", "").upper():
@@ -642,11 +666,16 @@ def ericsson_unique_id(n: Optional[Ret], e: Optional[Ret]) -> str:
 
 
 def _diffs(n: Ret, e: Ret) -> List[str]:
+    """Fields that differ. When the Ericsson device was never read (no
+    serial), its empty AISG data is unknown rather than different."""
+    unread = not e.serial
     out = []
     for label, attr, _t in COMPARE_FIELDS:
         if attr == "unique_id":
             if not unique_id_matches(n, e):
                 out.append(label)
+        elif unread and _norm(e, attr) in ("", None):
+            continue
         elif _norm(n, attr) != _norm(e, attr):
             out.append(label)
     return out
@@ -802,9 +831,11 @@ def run(ims2_path: str, log_paths: List[str], node: str = ""):
 
 # ── Excel ─────────────────────────────────────────────────────────────
 def write_excel(rows: List[RetRow], nokia: List[Ret], ericsson: List[Ret],
-                path: str, meta: Dict[str, str], alarms=None) -> str:
+                path: str, meta: Dict[str, str], alarms=None,
+                radio=None) -> str:
     """``alarms`` = (active, history) from :func:`nokia_alarms` — adds the
-    "Nokia Alarms" sheet."""
+    "Nokia Alarms" sheet; ``radio`` = rows from ``nokia_radio.radio_rows`` —
+    adds the "Nokia Radio" sheet (VSWR + RTWP/RSSI per radio/port/band)."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -939,12 +970,72 @@ def write_excel(rows: List[RetRow], nokia: List[Ret], ericsson: List[Ret],
         ws.column_dimensions["B"].width = 44
         ws.auto_filter.ref = ws.dimensions
 
+    if radio is not None:
+        _write_radio_sheet(wb.create_sheet("Nokia Radio"), radio)
     if alarms is not None:
         _write_alarm_sheet(wb.create_sheet("Nokia Alarms"), *alarms)
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     wb.save(path)
     return path
+
+
+def _write_radio_sheet(ws, rows: List[dict]):
+    """One row per radio × port × band × cell/TRX: VSWR (coloured against
+    the radio's own minor/major limits) and the uplink level of each cell."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    from audit.nokia_radio import (BRANCH_IMBALANCE_DB, RADIO_COLUMNS,
+                                   RX_HIGH_DBM, VSWR_WARN)
+
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="4472C4")
+    red = PatternFill("solid", fgColor="FFC7CE")
+    amber = PatternFill("solid", fgColor="FFEB9C")
+    band_fill = PatternFill("solid", fgColor="F2F2F2")
+    left = Alignment(horizontal="left", vertical="center")
+    for c, h in enumerate(RADIO_COLUMNS, 1):
+        cell = ws.cell(1, c, h)
+        cell.fill, cell.border = head_fill, border
+        cell.font = Font(bold=True, color="FFFFFF")
+    col = {h: i for i, h in enumerate(RADIO_COLUMNS, 1)}
+    prev = None
+    shade = False
+    for i, row in enumerate(rows, 2):
+        key = (row.get("Radio"), row.get("Port"), row.get("Band"))
+        if key != prev:
+            shade, prev = not shade, key
+        for h in RADIO_COLUMNS:
+            cell = ws.cell(i, col[h], row.get(h))
+            cell.border, cell.alignment = border, left
+            if shade:
+                cell.fill = band_fill
+        status = row.get("VSWR status")
+        if status in ("Warning", "Minor", "Major"):
+            fill = red if status == "Major" else amber
+            ws.cell(i, col["VSWR"]).fill = fill
+            ws.cell(i, col["VSWR status"]).fill = fill
+        rx = row.get("RX (dBm)")
+        if rx is not None and rx > RX_HIGH_DBM:
+            ws.cell(i, col["RX (dBm)"]).fill = amber
+        imb = row.get("Branch imbalance (dB)")
+        if imb is not None and imb > BRANCH_IMBALANCE_DB:
+            ws.cell(i, col["Branch imbalance (dB)"]).fill = amber
+    note = len(rows) + 3
+    ws.cell(note, 1, "VSWR amber from %s, red from the radio's own major "
+                     "limit; RX (dBm) amber above %s dBm; branch imbalance "
+                     "amber above %s dB (max-min across the cell's RX "
+                     "branches)." % (VSWR_WARN, RX_HIGH_DBM,
+                                     BRANCH_IMBALANCE_DB)).font = Font(italic=True,
+                                                               color="808080")
+    widths = {"Cell": 32, "Serial": 14, "Branch imbalance (dB)": 20,
+              "VSWR status": 12, "RX (dBm)": 10}
+    for h, c in col.items():
+        ws.column_dimensions[get_column_letter(c)].width = widths.get(h, 9)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:%s%d" % (get_column_letter(len(RADIO_COLUMNS)),
+                                      max(1, len(rows) + 1))
 
 
 def _write_alarm_sheet(ws, active: List[dict], history: List[dict]):

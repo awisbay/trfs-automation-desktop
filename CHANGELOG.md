@@ -4,6 +4,28 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.19.0] - 2026-09-30
+
+### Added
+- **RET Audit: "Nokia Radio" sheet** — one row per radio × RF port × band ×
+  cell/TRX from the `.ims2`: VSWR per port per band (pipe a/b mapped to the
+  band of the radio's filters, matching WebEM), LTE RTWP per RX branch and
+  GSM RSSI per TRX per antenna, with the branch imbalance per cell/TRX.
+  Local radios (RMOD_L) are matched to runtime/plan radios on serial number.
+  VSWR amber from 1.4, red from the radio's major limit; RX amber above
+  −95 dBm; imbalance amber above 3 dB.
+- **RET Audit: Clear Data button** — resets the page inputs and results
+  without touching files on disk.
+
+### Fixed
+- **RET Audit pairs RETs whose Ericsson device never connected.** With the
+  AntennaNearUnit LOCKED / NO_CONNECTION, `subunitNumber` reads 0, so the
+  configured `retSubUnitId` is used with the configured `uniqueId`; before,
+  every RET of such a site showed up twice (Nokia-only and Ericsson-only).
+  Ericsson `-1000` (not read) values are treated as unknown, unread AISG data
+  is no longer marked as a mismatch, and LOCKED / NO_CONNECTION are named in
+  the remark.
+
 ## [1.18.0] - 2026-09-29
 
 ### Added
