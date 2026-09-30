@@ -59,7 +59,8 @@ class RetAuditPage:
         self.ims2_field = self._tf(
             "Nokia IM snapshot (.ims2) — before", st.get("ims2", ""), expand=True)
         self.log_field = self._tf(
-            "Ericsson log(s) — after; several files allowed, separated by |",
+            "Ericsson log(s) — after; optional, several files separated by "
+            "| (leave blank to audit the Nokia side only)",
             st.get("logs", ""), expand=True)
 
         self.status_text = ft.Text("", size=13, color=TEXT_MUTED)
@@ -253,9 +254,7 @@ class RetAuditPage:
         if not ims2 or not os.path.isfile(ims2):
             errors.append("Pick the Nokia .ims2 file.")
         missing = [p for p in logs if not os.path.isfile(p)]
-        if not logs:
-            errors.append("Pick at least one Ericsson log.")
-        elif missing:
+        if missing:
             errors.append("Log not found: " + ", ".join(missing))
         if errors:
             self._set_status(" ".join(errors), DANGER)
@@ -326,16 +325,22 @@ class RetAuditPage:
                 ericsson.extend(found)
             if not nokia:
                 self._log("⚠ No RET found in the Nokia snapshot.")
-            if not ericsson:
+            if not logs:
+                self._log("No Ericsson log — auditing the Nokia side only; "
+                          "every RET will be Not OK with blank Ericsson "
+                          "columns until the log is added.")
+            elif not ericsson:
                 self._log("⚠ No RetSubUnit found in the Ericsson log(s) — "
                           "was the lhgetc command run?")
 
             rows = ret_audit.compare(nokia, ericsson)
-            check = ret_audit.site_check(ret_audit.nokia_bts_name(snap),
-                                         [r.node for r in ericsson], rows)
-            self._log(("✓ Same site: " if check["ok"]
-                       else "⚠ SITE CHECK FAILED: ") + check["message"])
-            self._show_site_check(check)
+            check = None
+            if logs:
+                check = ret_audit.site_check(ret_audit.nokia_bts_name(snap),
+                                             [r.node for r in ericsson], rows)
+                self._log(("✓ Same site: " if check["ok"]
+                           else "⚠ SITE CHECK FAILED: ") + check["message"])
+                self._show_site_check(check)
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", site)
             out_dir = os.path.join(get_app_dir(), "LOG", safe, "AUDIT")
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -356,8 +361,11 @@ class RetAuditPage:
             self._set_status(
                 f"Done — {len(rows)} RET(s): {counts['OK']} OK, "
                 f"{counts['Not OK']} Not OK"
-                + ("" if check["ok"] else " — ⚠ check the site names"),
-                DANGER if bad or not check["ok"] else SUCCESS)
+                + ("" if not logs else "" if check["ok"]
+                   else " — ⚠ check the site names")
+                + (" (Nokia only — no Ericsson log)" if not logs else ""),
+                DANGER if bad or (check is not None and not check["ok"])
+                else SUCCESS)
             self.open_btn.visible = True
             self.table_panel.visible = True
         except Exception as exc:

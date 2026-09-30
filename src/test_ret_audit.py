@@ -372,6 +372,13 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(row.status, "Not OK")
         self.assertIn("not found on Ericsson", row.remark)
 
+    def test_no_ericsson_log_all_not_ok_blank(self):
+        rows = ra.compare([_nokia_like(self.ok), _nokia_like(self.bad)], [])
+        self.assertEqual([r.status for r in rows], ["Not OK", "Not OK"])
+        self.assertTrue(all(r.ericsson is None for r in rows))
+        self.assertEqual(ra.ericsson_unique_id(rows[0].nokia, None), "")
+        self.assertIn("not found on Ericsson", rows[0].remark)
+
     def test_ericsson_only_enabled_is_ok(self):
         row = ra.compare([], [self.ok])[0]
         self.assertEqual(row.status, "OK")

@@ -4,6 +4,14 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.20.0] - 2026-09-30
+
+### Added
+- **RET Audit runs without the Ericsson log.** The log is now optional: with
+  only the Nokia `.ims2`, every RET is reported Not OK and all Ericsson
+  columns are blank, so the before-swap side can be checked on its own. The
+  same-site check is skipped when there is no log.
+
 ## [1.19.0] - 2026-09-30
 
 ### Added
