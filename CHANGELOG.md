@@ -4,6 +4,24 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.21.0] - 2026-10-02
+
+### Added
+- **Cut Over: standalone Pre HC.** Pre HC can now be run on an active run
+  (create CV, run the script, download the logfile) without rediscovering or
+  resetting the already-discovered cells and their status, mirroring the
+  existing standalone Post HC.
+
+### Fixed
+- **RET Audit "Nokia Radio" sheet detects AIR / massive-MIMO radios.** Radios
+  are found under any RUNTIME_VIEW (NR nodes use RUNTIME_VIEW-3, not only -1),
+  VSWR is read from `ANTL_M` for radios that do not expose a `VSWR` MO
+  (AZHA/ARPA/FXED), and each RX branch now attaches to the correct runtime
+  port through the `ANTL_R.configDN` → plan `ANTL_A` link even when the plan
+  and runtime antenna-port numbering differ. A single-band radio's a/b paths
+  are labelled with that one band instead of being left blank, and pure-empty
+  antenna-port rows are dropped.
+
 ## [1.20.0] - 2026-09-30
 
 ### Added

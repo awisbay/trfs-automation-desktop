@@ -605,6 +605,44 @@ check("discovery did not run after preparation failure",
       not any(s.startswith("hgetc") for s in fake14b.sent), str(fake14b.sent))
 
 # ──────────────────────────────────────────────────────────────────
+
+print("\n[14c] standalone Pre HC after Start preserves discovery")
+fake14c = FakeSSH()
+eng14c = build_engine(tmpdir, fake14c)
+eng14c.cfg["preparation"]["enabled"] = True
+eng14c.cfg["preparation"]["prehc"]["script_path"] = "/enm/preHC.mos"
+eng14c.start_discovery(skip_preparation=True); wait_idle(eng14c)
+cells_before = eng14c.run.cells
+keys_before = tuple(c.key for c in cells_before)
+discovery_commands_before = sum(
+    1 for command in fake14c.sent if command.startswith("hgetc"))
+standalone_calls = []
+try:
+    cutover_runner.run_cutover_create_cv = (
+        lambda *a, **k: (standalone_calls.append("CV") or True, "cv output")
+    )
+    cutover_runner.run_cutover_modump = (
+        lambda *a, **k: (standalone_calls.append("MODUMP") or True, "dump output")
+    )
+    cutover_runner.run_cutover_prehc = (
+        lambda *a, **k: (standalone_calls.append("PREHC") or True, "prehc output")
+    )
+    eng14c.start_prehc(); wait_idle(eng14c)
+finally:
+    cutover_runner.run_cutover_create_cv = orig_cv
+    cutover_runner.run_cutover_modump = orig_dump
+    cutover_runner.run_cutover_prehc = orig_hc
+check("standalone Pre HC runs CV and PREHC without modump",
+      standalone_calls == ["CV", "PREHC"], str(standalone_calls))
+check("standalone Pre HC keeps READY phase",
+      eng14c.run.phase == RunPhase.READY, str(eng14c.run.phase))
+check("standalone Pre HC preserves discovered cells",
+      eng14c.run.cells is cells_before
+      and tuple(c.key for c in eng14c.run.cells) == keys_before)
+check("standalone Pre HC does not repeat discovery",
+      sum(1 for command in fake14c.sent if command.startswith("hgetc"))
+      == discovery_commands_before, str(fake14c.sent))
+
 print("\n[15] restart recovery reconciles without replaying unlock")
 recovery_dir = tempfile.mkdtemp(prefix="cutover-recovery-test-")
 try:

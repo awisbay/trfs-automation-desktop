@@ -1201,10 +1201,19 @@ class CutOverPage:
         self.cancel_btn.content = ft.Text("Cancelling…" if stopping else "Cancel")
         self.back_btn.disabled = stopping
         self.start_hc_btn.disabled = (
+            busy or run.phase not in (RunPhase.IDLE, RunPhase.READY)
+            or (run.phase == RunPhase.IDLE
+                and bool(self.engine.recovery_checkpoint))
+        )
+        self.start_hc_btn.tooltip = (
+            "Create CV and run preHC while preserving the current cells and status"
+            if run.phase == RunPhase.READY else
+            "Create CV, run preHC (download its logfile), then discover cells"
+        )
+        self.start_unlock_btn.disabled = (
             busy or run.phase != RunPhase.IDLE
             or bool(self.engine.recovery_checkpoint)
         )
-        self.start_unlock_btn.disabled = self.start_hc_btn.disabled
         # TRFS Log and Post HC are independent actions: each connects the nodes
         # itself (TRFS identifies techs with `pv $rats`; Post HC runs its own
         # discovery), so they only wait on another action finishing — not on the
@@ -1274,6 +1283,8 @@ class CutOverPage:
             self._trfs_done_dialog(event)
         elif event.kind == "posthc_done":
             self._posthc_done_dialog(event)
+        elif event.kind == "prehc_done":
+            self._prehc_done_dialog(event)
         elif event.kind == "evidence_ready":
             self._evidence_dialog(event)
         elif event.kind == "cancel_done":
@@ -1304,6 +1315,36 @@ class CutOverPage:
         dlg = ft.AlertDialog(
             modal=False,
             title=ft.Text("Post HC finished — review results", color=TEXT),
+            content=body,
+        )
+        actions.append(ft.TextButton("OK", on_click=lambda e: self._close_dialog(dlg)))
+        dlg.actions = actions
+        self._show_dialog(dlg)
+
+    def _prehc_done_dialog(self, event) -> None:
+        """Confirm standalone Pre HC completion without changing the run state."""
+        local_dir = event.png_path or ""
+        body = ft.Column(
+            [
+                ft.Text(event.message, size=13, color=TEXT, selectable=True),
+                ft.Container(height=8),
+                ft.Text("Saved on this laptop under:", size=11, color=TEXT_MUTED),
+                ft.Text(local_dir, size=12, color=ACCENT, selectable=True,
+                        font_family="Consolas"),
+            ],
+            spacing=4, tight=True, width=620,
+        )
+        actions = []
+        if local_dir:
+            def _open(_e):
+                try:
+                    os.startfile(local_dir)  # noqa: S606 (Windows only)
+                except Exception as exc:
+                    self._alert("Pre HC", f"Could not open the folder: {exc}")
+            actions.append(ft.TextButton("Open folder", on_click=_open))
+        dlg = ft.AlertDialog(
+            modal=False,
+            title=ft.Text("Pre HC finished — review results", color=TEXT),
             content=body,
         )
         actions.append(ft.TextButton("OK", on_click=lambda e: self._close_dialog(dlg)))
@@ -1760,9 +1801,11 @@ class CutOverPage:
 
     # ── button handlers ──────────────────────────────────────────
     def _on_start_hc(self, e) -> None:
-        """Health check: run preparation (CV backup + preHC) and discovery, but
-        skip the slow modump capture."""
-        self.engine.start_discovery(skip_modump=True)
+        """Run CV + Pre HC; only perform discovery when starting from IDLE."""
+        if self.run.phase == RunPhase.READY:
+            self.engine.start_prehc()
+        else:
+            self.engine.start_discovery(skip_modump=True)
         self._refresh_chrome()
         self.page.update()
 

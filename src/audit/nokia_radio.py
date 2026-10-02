@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from ims2_reader import parent
 from typing import Dict, List, Optional, Tuple
 
 RX_HIGH_DBM = -95.0          # uplink level flagged as high (interference)
 VSWR_WARN = 1.4              # VSWR flagged from here, below the radio's minor
 BRANCH_IMBALANCE_DB = 3.0    # max-min across a cell's RX branches
 
-_RV = "/RUNTIME_VIEW-1/"
+_RV = "/RUNTIME_VIEW-"       # a node may use RUNTIME_VIEW-1, -3, … (NR core)
 
 # E-UTRA downlink ranges: band -> (MHz low, MHz high), (EARFCN low, high)
 _BANDS = {
@@ -120,27 +121,46 @@ def radio_rows(snapshot) -> List[Dict[str, object]]:
         if rt is not None and ff is not None:
             filters[rt].append((ff, band_of_freq(v.get("centerFrequencyDownlink"))))
     pipe_band: Dict[Tuple[int, str], Optional[int]] = {}
+    single_band: Dict[int, int] = {}
     for rt, ffs in filters.items():
         order: List[int] = []
         for _ff, b in sorted(ffs):
             if b is not None and b not in order:
                 order.append(b)
+        if len(order) == 1:
+            single_band[rt] = order[0]
         for letter, b in zip("abcd", order):
             pipe_band[(rt, letter)] = b
 
-    # VSWR per runtime radio / port / pipe
+    # VSWR per runtime radio / port / pipe. rp1Name 'antenna<port><pipe>'
+    # is the reliable key on every radio type. Older radios expose a VSWR MO
+    # (RMOD_L/…/VU_L/VSWR); AIR / newer radios only expose it on the runtime
+    # ANTL_M under RMOD_R — read both, ANTL_M wins.
     vswr: Dict[Tuple[int, int, str], dict] = {}
-    for dn, v in snapshot.by_class("VSWR"):
-        rt = local_to_rt.get(_idx(dn, "RMOD_L"))
-        m = re.match(r"antenna(\d+)([a-z])$", str(v.get("rp1Name", "")))
-        if rt is None or not m:
-            continue
-        val = v.get("vswr")
+
+    def _put(rt, name, val, minor, major):
+        m = re.match(r"antenna(\d+)([a-z])$", str(name or ""))
+        if rt is None or not m or val is None:
+            return
         vswr[(rt, int(m.group(1)), m.group(2))] = {
-            "value": None if val is None or v.get("invalidVswr") else val / 10.0,
-            "minor": (v.get("vswrMinorLimit") or 15) / 10.0,
-            "major": (v.get("vswrMajorLimit") or 17) / 10.0,
-        }
+            "value": val / 10.0, "minor": (minor or 15) / 10.0,
+            "major": (major or 17) / 10.0}
+
+    for dn, v in snapshot.by_class("VSWR"):
+        if v.get("invalidVswr"):
+            continue
+        _put(local_to_rt.get(_idx(dn, "RMOD_L")), v.get("rp1Name"),
+             v.get("vswr"), v.get("vswrMinorLimit"), v.get("vswrMajorLimit"))
+    # ANTL_R holds the thresholds; ANTL_M (its child) holds the live VSWR
+    thr: Dict[str, Tuple] = {}
+    for dn, v in snapshot.by_class("ANTL_R"):
+        if _RV in dn:
+            thr[dn] = (v.get("vswrMinorThreshold"), v.get("vswrMajorThreshold"))
+    for dn, v in snapshot.by_class("ANTL_M"):
+        if _RV not in dn:
+            continue
+        minor, major = thr.get(parent(dn), (None, None))
+        _put(_idx(dn, "RMOD_R"), v.get("rp1Name"), v.get("vswr"), minor, major)
 
     # cells: name / band
     cell_name, cell_band = {}, {}
@@ -160,7 +180,25 @@ def radio_rows(snapshot) -> List[Dict[str, object]]:
             cell_band[("GSM", k)] = int(v["bandNumber"])
         cell_name.setdefault(("GSM", k), "GSM LCELC-%s" % k)
 
-    # plan RX channels -> (plan radio, port)
+    # runtime ANTL_R (the VSWR port) <-> plan (RMOD_A, ANTL_A) via configDN,
+    # so an RX branch on a plan antenna port attaches to the right runtime
+    # port even when the two numberings differ (AIR / massive-MIMO radios).
+    rp_of: Dict[str, str] = {}
+    for dn, v in snapshot.by_class("ANTL_M"):
+        if _RV in dn:
+            rp_of[parent(dn)] = str(v.get("rp1Name", ""))
+    rtport_to_plan: Dict[Tuple[int, int, str], Tuple[int, int]] = {}
+    for dn, v in snapshot.by_class("ANTL_R"):
+        if _RV not in dn:
+            continue
+        m = re.match(r"antenna(\d+)([a-z])$", rp_of.get(dn, ""))
+        rt = _idx(dn, "RMOD_R")
+        a = re.search(r"/RMOD_A-(\d+)/ANTL_A-(\d+)", str(v.get("configDN", "")))
+        if m and rt is not None and a:
+            rtport_to_plan[(rt, int(m.group(1)), m.group(2))] = \
+                (int(a.group(1)), int(a.group(2)))
+
+    # plan RX channels -> (plan radio, ANTL_A port)
     chan: Dict[tuple, Tuple[int, int]] = {}
     for dn, v in snapshot.by_class("CHANNEL_A"):
         if plan and plan not in dn or v.get("direction") != "RX":
@@ -204,39 +242,52 @@ def radio_rows(snapshot) -> List[Dict[str, object]]:
                  if len(v) > 1}
 
     sectors = _plan_radio_sectors(chan)
+
+    def plan_port(rt, port, letter):
+        a = rtport_to_plan.get((rt, port, letter))
+        if a is not None:
+            return a
+        info = radios.get(rt)
+        return (info["plan"], port) if info else None
+
+    def band_for(rt, port, letter):
+        a = rtport_to_plan.get((rt, port, letter))   # exact per-pipe only
+        if a is not None:
+            bands = {cell_band.get((t, c)) for t, c, *_ in rx.get(a, [])} - {None}
+            if len(bands) == 1:
+                return next(iter(bands))
+        if rt in single_band:
+            return single_band[rt]
+        return pipe_band.get((rt, letter))
+
     rows: List[Dict[str, object]] = []
-    for rt, info in radios.items():
-        k = info["plan"]
-        ports = sorted({p for (r_, p, _l) in vswr if r_ == rt}
-                       | {p for (r_, p) in rx if r_ == k})
-        for port in ports:
-            letters = sorted({l for (r_, p, l) in vswr if r_ == rt and p == port})
-            for letter in letters or ["?"]:
-                band = pipe_band.get((rt, letter))
-                vs = vswr.get((rt, port, letter), {})
-                base = {
-                    "Sector": sectors.get(k, ""),
-                    "Radio": "RMOD-%d" % rt, "Product": info["product"],
-                    "Serial": info["serial"], "Port": "ANT%d" % port,
-                    "Band": "B%s" % band if band else "?",
-                    "VSWR": vs.get("value"),
-                    "VSWR status": vswr_status(vs),
-                }
-                cells = [x for x in rx.get((k, port), [])
-                         if cell_band.get((x[0], x[1])) == band]
-                if not cells:
-                    rows.append(dict(base, **{"Tech": "", "Cell": "", "TRX": "",
-                                              "Measure": "", "RX (dBm)": None,
-                                              "Branch imbalance (dB)": None}))
-                for tech, cell, trx, meas, dbm in sorted(
-                        cells, key=lambda x: (x[0], x[1], x[2] or 0)):
-                    rows.append(dict(base, **{
-                        "Tech": tech,
-                        "Cell": cell_name.get((tech, cell), str(cell)),
-                        "TRX": "" if trx is None else trx,
-                        "Measure": meas, "RX (dBm)": dbm,
-                        "Branch imbalance (dB)": imbalance.get((tech, cell, trx)),
-                    }))
+    for (rt, port, letter), vs in sorted(vswr.items()):
+        info = radios.get(rt)
+        if info is None:
+            continue
+        band = band_for(rt, port, letter)
+        a = plan_port(rt, port, letter)
+        base = {
+            "Sector": sectors.get(a[0], "") if a else "",
+            "Radio": "RMOD-%d" % rt, "Product": info["product"],
+            "Serial": info["serial"], "Port": "ANT%d" % port,
+            "Band": "B%s" % band if band else "?",
+            "VSWR": vs.get("value"), "VSWR status": vswr_status(vs),
+        }
+        cells = [x for x in rx.get(a, []) if cell_band.get((x[0], x[1])) == band]
+        if not cells and vs.get("value") is not None:
+            rows.append(dict(base, **{"Tech": "", "Cell": "", "TRX": "",
+                                      "Measure": "", "RX (dBm)": None,
+                                      "Branch imbalance (dB)": None}))
+        for tech, cell, trx, meas, dbm in sorted(
+                cells, key=lambda x: (x[0], x[1], x[2] or 0)):
+            rows.append(dict(base, **{
+                "Tech": tech,
+                "Cell": cell_name.get((tech, cell), str(cell)),
+                "TRX": "" if trx is None else trx,
+                "Measure": meas, "RX (dBm)": dbm,
+                "Branch imbalance (dB)": imbalance.get((tech, cell, trx)),
+            }))
     rows.sort(key=lambda r: (r["Sector"] or "S~", int(r["Radio"][5:]),
                              r["Port"], r["Band"], r["Tech"], str(r["Cell"]),
                              str(r["TRX"])))

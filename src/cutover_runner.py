@@ -1527,6 +1527,44 @@ class CutoverEngine:
         """Run Post HC and download logs without rediscovering/resetting cells."""
         self._spawn(self._posthc_worker, "cutover-posthc")
 
+    def start_prehc(self) -> None:
+        """Run Pre HC on an active run without rediscovering/resetting cells."""
+        self._spawn(self._prehc_worker, "cutover-prehc")
+
+    def _prehc_worker(self) -> None:
+        run = self.run
+        self._hc_mode = "pre"
+        self._skip_modump = True
+        started = time.monotonic()
+        results = {}
+        self.log("Pre HC starting — CV, script, then logfile download; "
+                 "existing discovery and cell status are preserved.")
+        missing = self._ensure_sessions()
+
+        def _worker(node_name, sess):
+            with run.lock:
+                run.artifacts.pop(f"{node_name}:PREHC_LOG", None)
+            results[node_name] = self._run_preparation_for_node(node_name, sess)
+
+        self._run_per_node(dict(run.sessions), _worker)
+        if run.is_cancelled():
+            self.log("Pre HC cancelled — completion was not confirmed.")
+            return
+        downloaded = [n for n in results
+                      if run.artifacts.get(f"{n}:PREHC_LOG")]
+        issues = [n for n, ok in results.items() if not ok] + missing
+        message = (f"Pre HC action finished in {time.monotonic() - started:.1f}s. "
+                   f"Downloaded logfiles: {len(downloaded)}/{len(run.node_names)} nodes.")
+        if issues:
+            message += "\nFailed/unconnected nodes: " + ", ".join(issues)
+        absent = [n for n in run.node_names if n not in downloaded]
+        if absent:
+            message += "\nNo downloaded Pre_HC logfile: " + ", ".join(absent)
+        message += "\nExisting discovered cells and their status were preserved."
+        self.log(message)
+        self.emit(CutoverEvent(kind="prehc_done", png_path=self._run_dir,
+                               message=message))
+
     def _posthc_worker(self) -> None:
         run = self.run
         self._hc_mode = "post"

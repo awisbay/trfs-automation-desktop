@@ -115,5 +115,73 @@ class RadioViewTests(unittest.TestCase):
         self.assertEqual(ws.max_row, len(self.rows) + 3)   # + note row
 
 
+RV3 = "/MRBTS-1/RAT-1/RUNTIME_VIEW-3/MRBTS_R-3/EQM_R-3/APEQM_R-1"
+
+
+def air_snapshot():
+    """A single-band (B3) dual-pol AIR radio under RUNTIME_VIEW-3, where the
+    plan antenna ports (ANTL_A-7/8) differ from the runtime rp1Name ports
+    (antenna1a/1b), linked by ANTL_R.configDN. No VSWR MO — only ANTL_M."""
+    ant = NP + "/EQM_A-1/APEQM_A-1/RMOD_A-2/ANTL_A-%d"
+    return FakeSnap({
+        "RMOD_R": [(RV3 + "/RMOD_R-2", {"serialNumber": "FX1",
+                                        "productName": "FXED",
+                                        "configDN": NP +
+                                        "/EQM_A-1/APEQM_A-1/RMOD_A-2"})],
+        "RMOD_L": [(EQ + "/RMOD_L-1", {"serialNumber": "FX1"})],
+        "FFU_L": [(EQ + "/RMOD_L-1/RU_L-1/FF_L-%d/FFU_L-1" % i,
+                   {"centerFrequencyDownlink": 1842e6}) for i in (1, 2)],
+        # thresholds on ANTL_R, live VSWR on its ANTL_M child
+        "ANTL_R": [(RV3 + "/RMOD_R-2/ANTL_R-1",
+                    {"vswrMinorThreshold": 15, "vswrMajorThreshold": 17,
+                     "configDN": ant % 7}),
+                   (RV3 + "/RMOD_R-2/ANTL_R-2",
+                    {"vswrMinorThreshold": 15, "vswrMajorThreshold": 17,
+                     "configDN": ant % 8})],
+        "ANTL_M": [(RV3 + "/RMOD_R-2/ANTL_R-1/ANTL_M-1",
+                    {"rp1Name": "antenna1a", "vswr": 11.0}),
+                   (RV3 + "/RMOD_R-2/ANTL_R-2/ANTL_M-1",
+                    {"rp1Name": "antenna1b", "vswr": 15.0})],
+        "LNCEL_A": [(NP + "/LNBTS_A-9/LNCEL_A-3", {"cellName": "SITE-F-03"})],
+        "LNCEL_FDD_A": [(NP + "/LNBTS_A-9/LNCEL_A-3/LNCEL_FDD_A-1",
+                         {"earfcnDL": 1650})],          # B3
+        "CHANNEL_A": [
+            (MAP + "/LCELL_A-3/CHANNELGROUP_A-1/CHANNEL_A-2",
+             {"antlDN": ant % 7, "direction": "RX"}),
+            (MAP + "/LCELL_A-3/CHANNELGROUP_A-1/CHANNEL_A-3",
+             {"antlDN": ant % 8, "direction": "RX"}),
+        ],
+        "RTWP_MEASUREMENT": [
+            (MC + "/LNBTS_M-1/CELL_M-3/CHANNEL_GROUP_M-1/CHANNEL_M-2/"
+                  "RTWP_MEASUREMENT-1", {"rtwpValue": -910.0}),
+            (MC + "/LNBTS_M-1/CELL_M-3/CHANNEL_GROUP_M-1/CHANNEL_M-3/"
+                  "RTWP_MEASUREMENT-1", {"rtwpValue": -960.0}),
+        ],
+    })
+
+
+class AirRadioTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = nr.radio_rows(air_snapshot())
+
+    def test_radio_found_under_runtime_view_3(self):
+        self.assertEqual({r["Radio"] for r in self.rows}, {"RMOD-2"})
+        self.assertEqual({r["Product"] for r in self.rows}, {"FXED"})
+
+    def test_vswr_from_antl_m_both_branches(self):
+        self.assertEqual(sorted(r["VSWR"] for r in self.rows), [1.1, 1.5])
+        maj = next(r for r in self.rows if r["VSWR"] == 1.5)
+        self.assertEqual(maj["VSWR status"], "Minor")   # 1.5 == minor limit
+
+    def test_single_band_both_pipes_b3(self):
+        self.assertEqual({r["Band"] for r in self.rows}, {"B3"})
+
+    def test_cells_attach_through_configdn_port_map(self):
+        # plan ports 7/8 map to runtime antenna1a/1b, RTWP attaches per branch
+        rx = sorted(r["RX (dBm)"] for r in self.rows if r["Measure"] == "RTWP")
+        self.assertEqual(rx, [-96.0, -91.0])
+        self.assertTrue(all(r["Cell"] == "SITE-F-03" for r in self.rows))
+
+
 if __name__ == "__main__":
     unittest.main()
