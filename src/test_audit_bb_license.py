@@ -36,6 +36,24 @@ class LicenceHwIdTests(unittest.TestCase):
         self.assertEqual(licence_hw_ids(hup), ["RANP6672", "BB6621"])
 
 
+    def test_unallocated_keys_ignored(self):
+        # MIN5290: the ABW key (BB6631) is allocated; the CBW/Layer keys name
+        # RANP6655 but are only installed (totAllocated=N/A) - not in use.
+        hup = ("{licenseKeyId=CXC4012472, lteAllocated=IP:BB6631:1:1;EP::1:9;, "
+               "totAllocated=IP:BB6631:1:2;EP::1:9;, totFree=EP::1:1;, "
+               "totInstalled=IP:BB6631:1:2;EP::1:10;} | "
+               "{licenseKeyId=CXC4012473, lteAllocated=N/A, totAllocated=N/A, "
+               "totFree=N/A, totInstalled=IP:RANP6655:1:5;} | "
+               "{licenseKeyId=CXC4012474, totAllocated=N/A, totFree=N/A, "
+               "totInstalled=IP:RANP6655:1:2;}")
+        self.assertEqual(licence_hw_ids(hup), ["BB6631"])
+
+    def test_no_allocated_key_falls_back_to_installed(self):
+        hup = ("{totAllocated=N/A, totInstalled=IP:RANP6655:1:5;} | "
+               "{totAllocated=0, totInstalled=IP:BB6631:1:1;}")
+        self.assertEqual(licence_hw_ids(hup), ["RANP6655", "BB6631"])
+
+
 class BbLicenceAuditTests(unittest.TestCase):
     def test_match_compares_on_product_number(self):
         rows = audit_bb_license(records("IP:RANP6672:1:10;", "RAN Processor 6672"))

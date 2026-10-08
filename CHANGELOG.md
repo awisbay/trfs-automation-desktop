@@ -4,6 +4,18 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.21.2] - 2026-10-08
+
+### Fixed
+- **HWAC licence baseband check reads only the keys in use.** The baseband on
+  the licence is now taken from every `*Allocated` field (tot/lte/gsm/nr/wcdma)
+  of the HWAC keys in `CapacityUsage.hupInfo`; a key that is only installed
+  (all `N/A`) no longer counts. Before, an unused RANP6655 CBW/Layer key next
+  to the BB6631 ABW key in use made a 6631 node show as a mismatch. When no key
+  is allocated at all, the installed id is still used, so an LKF issued for a
+  different baseband is still reported as a mismatch. Checked on 3,481 nodes:
+  only that false mismatch changed.
+
 ## [1.21.1] - 2026-10-08
 
 ### Fixed

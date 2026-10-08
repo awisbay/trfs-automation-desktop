@@ -38,16 +38,37 @@ PARAMETER = "BB type (HWAC LKF vs installed)"
 NOT_INSTALLED = ("possible LKF not installed or not detect. please verify")
 
 
-def licence_hw_ids(hup_info: str) -> List[str]:
-    """Hardware ids named by the HWAC licences, in order, without duplicates."""
+def _ip_ids(value: str) -> List[str]:
     out: List[str] = []
-    for installed in re.findall(r"totInstalled\s*=\s*([^,}]*)", str(hup_info or "")):
-        for part in installed.split(";"):
-            fields = part.split(":")
-            if len(fields) >= 2 and fields[0].strip().upper() == "IP":
-                hw = fields[1].strip()
-                if hw and hw not in out:
-                    out.append(hw)
+    for part in str(value or "").split(";"):
+        fields = part.split(":")
+        if len(fields) >= 2 and fields[0].strip().upper() == "IP":
+            hw = fields[1].strip()
+            if hw:
+                out.append(hw)
+    return out
+
+
+def licence_hw_ids(hup_info: str) -> List[str]:
+    """Hardware ids the node actually uses, in order, without duplicates.
+
+    The ids are combined from every ``*Allocated`` field of every HWAC key
+    (``totAllocated``, ``lteAllocated``, ``gsmAllocated``, ``nrAllocated``,
+    ``wcdmaAllocated``). A key that is only installed in the LKF has all of
+    them ``N/A`` (e.g. a RANP6655 CBW/Layer key next to the BB6631 ABW key in
+    use), so it does not count. When no key is allocated at all, the
+    installed ids (``totInstalled``) are used instead."""
+    text = str(hup_info or "")
+    used: List[str] = []
+    for value in re.findall(r"\b\w*Allocated\s*=\s*([^,}]*)", text):
+        used.extend(_ip_ids(value))
+    installed: List[str] = []
+    for value in re.findall(r"totInstalled\s*=\s*([^,}]*)", text):
+        installed.extend(_ip_ids(value))
+    out: List[str] = []
+    for hw in used or installed:
+        if hw not in out:
+            out.append(hw)
     return out
 
 
