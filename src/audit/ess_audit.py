@@ -13,7 +13,7 @@ checks, against the node dump:
 
 Pattern (calibrated on a real dump), e.g. LTE cell GFATIML-171 ↔ NR GFATIMP-501:
   SectorCarrier=B28_S1    essScLocalId=171  essScPairId=5010000000171
-  NRSectorCarrier=N28_S1  essScLocalId=171  essScPairId=5010000000171
+  NRSectorCarrier=N28_S1  essScLocalId=501  essScPairId=5010000000171
   EUtranCellFDD=GFATIML-171,...,GUtranCellRelation=5152-<gNBID>-501  essEnabled=true
   NRCellCU=GFATIMP-501,EUtranCellRelation=GFATIML-171               essEnabled=true
 ``essScPairId`` = NR LocalCellID followed by the LTE LocalCellID zero-padded to
@@ -198,13 +198,13 @@ def audit_ess(pairs: List[dict], records: Dict[str, Dict[str, str]],
         nr_local_exp = p["nr_local"]       # NR cellLocalId
         lte_exists = lte_cell in lte_cells
         nr_exists = nr_cell in nr_cells
-        # Both carriers use the CDD ESS local ID (normally the LTE cell ID).
-        # The NR cell itself still uses its own NR local ID.
-        ess_local_exp = p.get("ess_local") or lte_local_exp
+        # Each carrier uses its own cell's local ID.  The LTE CDD ESS column
+        # describes SectorCarrier (171/172/173); it must not be reused for
+        # NRSectorCarrier, whose IDs follow the NR cells (501/502/503).
         sc_local = lte_local_exp if lte_local_exp in sc_pair_by_local else ""
-        nrsc_local = ess_local_exp if ess_local_exp in nrsc_pair_by_local else ""
+        nrsc_local = nr_local_exp if nr_local_exp in nrsc_pair_by_local else ""
         sc_pair = sc_pair_by_local.get(lte_local_exp, "")
-        nrsc_pair = nrsc_pair_by_local.get(ess_local_exp, "")
+        nrsc_pair = nrsc_pair_by_local.get(nr_local_exp, "")
         # The node's own cell local id — the third leg of the check.
         node_lte_id = lte_cellid.get(lte_cell, "")
         node_nr_id = nr_localid.get(nr_cell, "")
@@ -214,7 +214,7 @@ def audit_ess(pairs: List[dict], records: Dict[str, Dict[str, str]],
         # Three-way: CDD expected == node cellId/cellLocalId == node essScLocalId.
         ok = (lte_exists and nr_exists
               and sc_local == lte_local_exp and node_lte_id == lte_local_exp
-              and nrsc_local == ess_local_exp and node_nr_id == nr_local_exp
+              and nrsc_local == nr_local_exp and node_nr_id == nr_local_exp
               and sc_pair == ess_pair and nrsc_pair == ess_pair
               and e_lte == "true" and e_nr == "true")
         out.append(EssResult(

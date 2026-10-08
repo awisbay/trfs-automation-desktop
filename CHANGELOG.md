@@ -4,6 +4,17 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.21.1] - 2026-10-08
+
+### Fixed
+- **ESS audit: NRSectorCarrier uses the NR cell's own local ID.** The LTE CDD
+  ESS column describes the SectorCarrier (e.g. 171/172/173) and is no longer
+  reused for the NRSectorCarrier, whose local IDs follow the NR cells
+  (501/502/503); the three-way check matches each carrier against its own
+  cell's local ID.
+- **HWAC licence baseband check compares the licensed baseband type with the
+  baseband actually fitted** on the node.
+
 ## [1.21.0] - 2026-10-02
 
 ### Added
