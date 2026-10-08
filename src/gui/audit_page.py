@@ -837,6 +837,15 @@ class AuditPage:
             trx_results = audit_trx_license(records, nodes=nodes)
             results += trx_results
             trx_counts = Counter(r.status for r in trx_results)
+            # Baseband on the HWAC licence vs the baseband actually fitted.
+            from audit.bb_license_audit import audit_bb_license
+            bb_results = audit_bb_license(records, nodes=nodes)
+            results += bb_results
+            bb_counts = Counter(r.status for r in bb_results)
+            self._log(f"BB type vs LKF: {bb_counts['Match']} match, "
+                      f"{bb_counts['Mismatch']} mismatch, "
+                      f"{bb_counts['NotFound'] + bb_counts['MO_NotFound']} unresolved "
+                      f"(licence data is modump-only).")
             self._log(f"GSM TRX license: {trx_counts['Match']} sufficient, "
                       f"{trx_counts['Mismatch']} insufficient, {trx_counts['NotFound']} unresolved.")
             self._log(f"Bandwidth license: {bandwidth_counts['Match']} sufficient, "
