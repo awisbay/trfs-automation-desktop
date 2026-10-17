@@ -4,6 +4,19 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.22.0] - 2026-10-17
+
+### Added
+- **Audit: node name consistency (`networkManagedElementId`).** The node's
+  `ManagedElement.networkManagedElementId` from the dump is compared with the
+  node name each CDD gives it — `eNodeBName` (LTE CDD), `gNodeBName` (NR CDD)
+  and `gsmNodeName` (GSM CDD) — for the RATs the node actually carries, so a
+  GSM+LTE node needs all three equal. LTE/NR CDD rows are linked to the node by
+  ENodeBID/gNodeBID (not by name), so a CDD row with a wrong name is still
+  found and reported. One `node-name` row per node: the CDD column holds the
+  CDD names, the node column the dump value, and the remark names whichever
+  source differs. Not settable by the generated scripts.
+
 ## [1.21.2] - 2026-10-08
 
 ### Fixed

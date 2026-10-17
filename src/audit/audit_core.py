@@ -2046,7 +2046,7 @@ def _banner(name: str) -> str:
 _NON_SETTABLE_CATEGORIES = {"trx-count", "ess", "etilt", "sw-level",
                             "consistency", "endc", "chain", "feature",
                             "termpoint-gnb", "power-license", "bandwidth-license", "trx-license",
-                            "radio-sharing", "systemconstant"}
+                            "radio-sharing", "systemconstant", "node-name"}
 
 # Categories excluded from cmedit/cmbulk but STILL settable via moshell (.mos) —
 # e.g. antenna tilt is a RET operation done on the node, not an ENM cmedit set.

@@ -745,6 +745,17 @@ class AuditPage:
                                if (it.expected or "").strip())
             self._cdd_bsc = cdd_bscs.most_common(1)[0][0] if cdd_bscs else ""
             results = audit_core.compare(items, records)
+            # One node name everywhere: networkManagedElementId (dump) vs the
+            # eNodeBName / gNodeBName / gsmNodeName the CDDs give the node.
+            from audit.node_name_audit import audit_node_name
+            name_results = audit_node_name(records, items + broker_items,
+                                           nodes=nodes)
+            results += name_results
+            name_counts = Counter(r.status for r in name_results)
+            self._log(f"Node name (networkManagedElementId vs CDD): "
+                      f"{name_counts['Match']} match, "
+                      f"{name_counts['Mismatch']} mismatch, "
+                      f"{name_counts['NotFound']} not found.")
             from audit.systemconstant_audit import audit_systemconstant
             systemconstant_results = audit_systemconstant(records, nodes, dump_evidence)
             results += systemconstant_results
