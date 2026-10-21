@@ -4,6 +4,32 @@ All notable changes to NodeCraft. The version lives in `src/version.py`
 (single source of truth). Bump it and add an entry here on every release:
 PATCH = fixes, MINOR = new feature, MAJOR = breaking change.
 
+## [1.23.0] - 2026-10-21
+
+### Added
+- **GSM cmedit: real GeranCell FDN.** `gsmaudit` now also runs
+  `cmedit get *BS* GeranCell.(gerancellid==<prefix>*)` (no `-t`) to capture
+  each cell's full FDN. Generated GSM cmedit/cmbulk scripts use that real path
+  (e.g. `SubNetwork=T7,SubNetwork=vBSC`) instead of the fixed template.
+- **gsmaudit timeout + debug mode.** Each query has a time limit and one retry
+  on a fresh ENM session; a query that still hangs is written as `# TIMEOUT`
+  and the run continues. `gsmaudit --debug` writes `<output>_debug.log` with
+  per-query timing and the stack of any stuck query.
+
+### Fixed
+- **gsmaudit hang on PowerControlDownlink.** The query now asks for
+  `PowerControlDownlink.*`; naming attributes a BSC does not have
+  (`dlPcE2a`, `initDlPcE2a`) made ENM never answer.
+- **GeranCell longitude/latitude** in CDD with seconds written as `18."` is
+  parsed, and converted seconds keep two decimals.
+- **Feature audit: ESS CapacityState in cmdump.** A cmdump exports
+  `CapacityState` without `featureState`; it is now judged by its licence
+  instead of reported as "MO not found".
+- **Feature audit:** an activated feature with a disabled licence now shows
+  `ACTIVATED (license DISABLED)` in the node column.
+- **Dump selection:** a truncated modump zip names the incomplete file instead
+  of "no ManagedElement identity in payload".
+
 ## [1.22.0] - 2026-10-17
 
 ### Added

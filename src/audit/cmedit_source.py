@@ -17,6 +17,31 @@ import re
 from typing import Dict, List
 
 
+# Block/MO name of the non-table query that prints each GeranCell's full FDN:
+#   cmedit get *BS* GeranCell.(gerancellid==M8498*)   (no -t)
+#   FDN : SubNetwork=ONRM_ROOT_MO_R,SubNetwork=T8,…,GeranCell=M8498S1
+FDN_MO = "GeranCellFDN"
+FDN_CMD = "cmedit get *BS* GeranCell.(gerancellid=={pfx}*)"
+_FDN_LINE = re.compile(r"^\s*FDN\s*:\s*(\S+)", re.M)
+
+
+def parse_fdn_lines(out: str, cell_rx=None) -> Dict[str, Dict[str, str]]:
+    """``FDN : <fdn>`` lines of a non-table cmedit get → records keyed
+    ``GeranCell=<id>`` carrying the cell's exact FDN (``__fdn__``) and its BSC
+    (``__bsc__`` = the MeContext). Child-MO FDNs are ignored."""
+    records: Dict[str, Dict[str, str]] = {}
+    for fdn in _FDN_LINE.findall(out or ""):
+        m = re.search(r"(?:^|,)GeranCell=([^,]+)$", fdn)
+        if not m or (cell_rx is not None and not cell_rx.match(m.group(1))):
+            continue
+        rec = records.setdefault(f"GeranCell={m.group(1)}", {})
+        rec["__fdn__"] = fdn
+        bsc = re.search(r"(?:^|,)MeContext=([^,]+)", fdn)
+        if bsc:
+            rec.setdefault("__bsc__", bsc.group(1))
+    return records
+
+
 def _leaf_class(mo_fdn: str) -> str:
     """'GeranCell={geranCellId}' -> 'GeranCell'."""
     last = mo_fdn.split(",")[-1]
@@ -105,6 +130,21 @@ def fetch_cmedit_records(ssh, node_name: str, profiles: List[dict],
         log(f"[audit/cmedit] parsed {len(parsed)} MO(s) for {mo_class}")
         for ldn, a in parsed.items():
             records.setdefault(ldn, {}).update(a)
+    # Full FDN of every GeranCell (non-table get) so generated cmedit/cmbulk
+    # commands use the BSC's real SubNetwork path, not a template.
+    if site_mod and any(prof.get("source") == "cmedit" for prof in profiles):
+        fdn_recs: Dict[str, Dict[str, str]] = {}
+        for pfx in (site_mod + "8", site_mod + "9"):
+            inner = FDN_CMD.replace("{pfx}", pfx)
+            try:
+                out = ssh.run_command(f'python {CLI_PY} "{inner}"', timeout=180)
+            except Exception as exc:
+                log(f"[audit/cmedit] FDN query failed: {exc}")
+                continue
+            fdn_recs.update(parse_fdn_lines(out, cell_rx))
+        log(f"[audit/cmedit] full FDN captured for {len(fdn_recs)} GeranCell(s)")
+        for ldn, a in fdn_recs.items():
+            records.setdefault(ldn, {}).update(a)
     return records
 
 
@@ -149,7 +189,13 @@ def parse_cmedit_log(text: str, profiles, site_id: str = "",
             "file? Expected the dump script's output.")
         return records
     dropped = 0
+    n_fdn = 0
     for mo, body in zip(parts[1::2], parts[2::2]):
+        if mo == FDN_MO:
+            for ldn, a in parse_fdn_lines(body, cell_rx).items():
+                records.setdefault(ldn, {}).update(a)
+                n_fdn += 1
+            continue
         for prof in prof_by_mo.get(mo, []):
             attrs = list(dict.fromkeys(
                 c["attr"] for c in prof.get("columns", [])
@@ -170,7 +216,10 @@ def parse_cmedit_log(text: str, profiles, site_id: str = "",
     if dropped:
         log(f"[audit/cmedit-log] dropped {dropped} foreign cell(s) not "
             f"matching site {site_id}")
-    log(f"[audit/cmedit-log] parsed {len(records)} MO(s) from the log.")
+    log(f"[audit/cmedit-log] parsed {len(records)} MO(s) from the log; "
+        + (f"full FDN for {n_fdn} GeranCell(s)." if n_fdn else
+           "no full FDN block (older dump script) - GeranCell FDNs use the "
+           "gsm_fdn_prefix template."))
     return records
 
 

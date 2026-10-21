@@ -133,6 +133,29 @@ class FeatureDetectionTests(unittest.TestCase):
                          [(mo, 'Mismatch', 'ESS')])
         self.assertIn('License Missing', rows[0].remark)
 
+    def test_cmdump_capacity_state_without_feature_state_uses_license(self):
+        prefix, records = self.fixture()
+        mo = 'SystemFunctions=1,Lm=1,CapacityState=CXC4012411'
+        records[prefix + mo] = {'licenseState': 'ENABLED'}
+        records[prefix + 'SectorCarrier=SC1']['essScLocalId'] = '171'
+        records[prefix + 'SectorCarrier=SC1']['essScPairId'] = '5010000000171'
+        rules = {'ess_capacity': {'detect': 'ess', 'required_only': True,
+                                  'features': ['CXC4012411']}}
+        self.assertEqual(audit_features(records, rules), [])
+        records[prefix + mo] = {'licenseState': 'DISABLED'}
+        rows = audit_features(records, rules)
+        self.assertEqual(rows[0].status, 'Mismatch')
+        self.assertIn('License Missing', rows[0].remark)
+
+    def test_activated_feature_with_disabled_license_shows_why(self):
+        prefix, records = self.fixture()
+        mo = 'SystemFunctions=1,Lm=1,FeatureState=CXC4012218'
+        records[prefix + mo] = {'featureState': 'ACTIVATED',
+                                'licenseState': 'DISABLED'}
+        rows = audit_features(records, {'lte': {'detect': 'lte',
+                                                'features': ['CXC4012218']}})
+        self.assertEqual(rows[0].actual, 'ACTIVATED (license DISABLED)')
+
     def test_gsm_standalone_requires_all_three_gsm_features(self):
         prefix = 'ManagedElement=' + self.node + ','
         records = {prefix + 'BtsFunction=1': {}}

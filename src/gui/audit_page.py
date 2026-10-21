@@ -262,6 +262,7 @@ class AuditPage:
         self._gen_ctx = None
         self._script_dir = None
         self._bsc_by_cell = {}
+        self._gsm_fdn_by_cell = {}
         self._cdd_bsc = ""
         for button in (self.open_btn, self.gen_btn, self.runscript_btn,
                        self.apply_btn):
@@ -741,6 +742,15 @@ class AuditPage:
                 self._bsc_by_cell = audit_core.build_bsc_by_cell(records)
             except Exception:
                 self._bsc_by_cell = {}
+            # Exact GeranCell FDN from ENM (non-table cmedit get) — beats the
+            # gsm_fdn_prefix template, whose SubNetwork is fixed.
+            try:
+                self._gsm_fdn_by_cell = audit_core.build_gsm_fdn_by_cell(records)
+            except Exception:
+                self._gsm_fdn_by_cell = {}
+            if self._gsm_fdn_by_cell:
+                self._log(f"GSM FDN: exact ENM path for "
+                          f"{len(self._gsm_fdn_by_cell)} GeranCell(s).")
             cdd_bscs = Counter((it.expected or "").strip() for it in broker_items
                                if (it.expected or "").strip())
             self._cdd_bsc = cdd_bscs.most_common(1)[0][0] if cdd_bscs else ""
@@ -1159,12 +1169,14 @@ class AuditPage:
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
                 gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
-                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc,
+                gsm_fdn_by_cell=getattr(self, "_gsm_fdn_by_cell", {}) or {})
             cmbulk_paths = audit_core.generate_cmbulk_scripts(
                 self._results, script_dir, ctx["site"], ctx["xlsx"],
                 generated_by=by, statuses=("Mismatch",), fdn_prefix=fdn_prefix,
                 gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
-                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc,
+                gsm_fdn_by_cell=getattr(self, "_gsm_fdn_by_cell", {}) or {})
             allp = paths + cmedit_paths + cmbulk_paths
             if not allp:
                 self._log("No Mismatch rows — nothing to generate.")
@@ -1237,7 +1249,8 @@ class AuditPage:
             cmds = audit_core.build_cmedit_commands(
                 self._results, site, fdn_prefix=fdn_prefix,
                 gsm_fdn_prefix=gsm_fdn_prefix, gsm_child_map=gsm_child_map,
-                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc)
+                bsc_by_cell=bsc_by_cell, default_bsc=default_bsc,
+                gsm_fdn_by_cell=getattr(self, "_gsm_fdn_by_cell", {}) or {})
             source_note = ("Source: audit results in memory — click Generate "
                            "Scripts first if you want to edit before applying.")
         if not cmds:

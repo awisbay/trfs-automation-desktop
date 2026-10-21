@@ -4,12 +4,57 @@ from __future__ import annotations
 import datetime as dt
 import os
 import re
+import struct
+import zipfile
 
 from .dump_parser import parse_dump
 
 _NAMED_DUMP = re.compile(
     r'^(?P<node>.+)_(?:cm|mo)dump(?:_(?P<time>\d{8}_\d{6}))?\.(?:zip|gz|log|xml)$', re.I)
 _OWNER = re.compile(r'(?:^|,)ManagedElement=([^,]+)(?:,|$)')
+
+
+def zip_problem(path):
+    """Why a dump zip cannot be read, or '' when it looks complete.
+
+    A dump whose collection/download was cut off keeps its first local file
+    headers but loses the zip central directory (and the tail of the member
+    being written), so it parses to nothing. Name the truncated member so the
+    user re-collects the dump instead of chasing a parsing problem."""
+    if not str(path).lower().endswith(".zip"):
+        return ""
+    try:
+        with zipfile.ZipFile(path) as z:
+            bad = z.testzip()
+        return f"corrupt member {bad}" if bad else ""
+    except zipfile.BadZipFile:
+        pass
+    except Exception as exc:
+        return f"unreadable zip ({exc})"
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        return f"unreadable zip ({exc})"
+    complete, cut = [], ""
+    off = 0
+    while True:
+        i = data.find(b"PK\x03\x04", off)
+        if i < 0 or i + 30 > len(data):
+            break
+        csz, _usz, nlen, elen = struct.unpack_from("<IIHH", data, i + 18)
+        name = data[i + 30:i + 30 + nlen].decode("ascii", "replace")
+        start = i + 30 + nlen + elen
+        have = len(data) - start
+        if csz and have < csz:
+            cut = f"{name} cut at {100 * have // csz}%"
+            break
+        complete.append(name)
+        off = start + max(csz, 1)
+    detail = f"; {cut}" if cut else ""
+    return (f"zip is incomplete (truncated download/collection, central "
+            f"directory missing{detail}; complete members: "
+            f"{', '.join(complete) or 'none'}) - collect the dump again")
 
 
 def site_matches(node, site):
@@ -70,7 +115,9 @@ def select_node_dumps(paths, *, site='', expected_nodes=None, existing_nodes=(),
             if owner:
                 grouped.setdefault(owner[1], {})[dn] = attrs
         if not grouped:
-            log(f'[audit/dump] Rejected {os.path.basename(path)}: no ManagedElement identity in payload')
+            why = zip_problem(path)
+            log(f'[audit/dump] Rejected {os.path.basename(path)}: '
+                + (why or 'no ManagedElement identity in payload'))
             continue
         if named and {n.casefold() for n in grouped} != {named['node'].casefold()}:
             log(f'[audit/dump] Rejected {os.path.basename(path)}: filename node '

@@ -54,10 +54,10 @@ def normalize_segments(v) -> str:
     return "-".join(out)
 
 
-_LATLON_B = re.compile(r"^([NSEW])\s*0*(\d+)[-\s]0*(\d+)[-\s]0*(\d+(?:\.\d+)?)",
+_LATLON_B = re.compile(r"^([NSEW])\s*0*(\d+)[-\s]0*(\d+)[-\s]0*(\d+(?:\.\d*)?)",
                        re.IGNORECASE)                         # N07-40-08.15
 _LATLON_A = re.compile(r"0*(\d+)\s*[°\-]\s*0*(\d+)\s*['’\-]\s*"
-                       r"0*(\d+(?:\.\d+)?)\s*[\"”\-]?\s*([NSEW])",
+                       r"0*(\d+(?:\.\d*)?)\s*[\"”\-]?\s*([NSEW])",
                        re.IGNORECASE)                         # 7°40'8.15"N
 
 
@@ -1139,7 +1139,14 @@ def _feature_state(node, feat, records):
         if not m or m.group(1).casefold() != node.casefold():
             continue
         low = {k.casefold(): v for k, v in a.items()}
-        return (low.get("featurestate"), low.get("licensestate"),
+        fstate = low.get("featurestate")
+        if fstate is None and "CapacityState=" in ldn.split(",")[-1]:
+            # A cmdump (XML) exports CapacityState without featureState; the MO
+            # exists, so judge it by its licence instead of calling it absent.
+            lic = str(low.get("licensestate") or "").upper()
+            fstate = ("ACTIVATED" if lic.startswith(("1", "ENABLED"))
+                      else "UNKNOWN")
+        return (fstate, low.get("licensestate"),
                 str(low.get("description") or "").strip())
     return (None, None, "")
 
@@ -1253,6 +1260,8 @@ def audit_features(records: Dict[str, Dict[str, str]], feature_rules: dict,
                 if not l_on:
                     remarks.append("License Missing")
                 act = "ACTIVATED" if f_on else "DEACTIVATED"
+                if not l_on:
+                    act += " (license DISABLED)"
                 status = "Mismatch"
                 remark = f"Required for {ref}; " + "; ".join(remarks) + "."
             else:
@@ -2225,12 +2234,12 @@ def _dms_cdd_to_node(v: str) -> str:
     if not m:
         return str(v)
     d, mn, sec, hemi = m.group(1), m.group(2), m.group(3), m.group(4).upper()
-    if "." in sec:
-        ip, fp = sec.split(".", 1)
-        secf = f"{int(ip):02d}.{fp}"
-    else:
-        secf = f"{int(sec):02d}"
-    return f"{hemi}{int(d):02d}-{int(mn):02d}-{secf}"
+    # The BSC keeps seconds with two decimals (E123-45-18.00, N08-05-11.93);
+    # round on the whole value so 59.999 s carries into the minute.
+    hundredths = round((int(d) * 3600 + int(mn) * 60 + float(sec)) * 100)
+    d, rest = divmod(hundredths, 360000)
+    mn, rest = divmod(rest, 6000)
+    return f"{hemi}{d:02d}-{mn:02d}-{rest / 100:05.2f}"
 
 
 def _format_set_value(value, norm: str = "", actual: str = "") -> str:
@@ -2352,11 +2361,26 @@ def build_bsc_by_cell(records: Dict[str, Dict[str, str]]) -> Dict[str, str]:
     return out
 
 
+def build_gsm_fdn_by_cell(records: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """geranCellId → the cell's real, full ENM FDN (``__fdn__``), captured by
+    the non-table ``cmedit get … GeranCell.(gerancellid==…)`` query (live or
+    uploaded GSM log). Lets cmedit/cmbulk use the exact SubNetwork path of the
+    BSC instead of the ``gsm_fdn_prefix`` template."""
+    out: Dict[str, str] = {}
+    for ldn, attrs in records.items():
+        m = re.match(r"GeranCell=([^,]+)$", ldn)
+        fdn = (attrs.get("__fdn__") or "").strip()
+        if m and fdn:
+            out.setdefault(m.group(1), fdn)
+    return out
+
+
 def _build_fdn(node: str, mo: str, param: str = "", fdn_prefix: str = "",
                gsm_fdn_prefix: str = "",
                gsm_child_map: Optional[Dict[str, str]] = None,
                bsc_by_cell: Optional[Dict[str, str]] = None,
-               default_bsc: str = "") -> str:
+               default_bsc: str = "",
+               gsm_fdn_by_cell: Optional[Dict[str, str]] = None) -> str:
     """Pick the right FDN shape for a target MO. GSM ``GeranCell`` MOs live on
     the BSC (not the audited RadioNode) with a fixed BscFunction/GeranCellM
     lineage, so they use the configurable ``gsm_fdn_prefix`` template — the
@@ -2377,6 +2401,10 @@ def _build_fdn(node: str, mo: str, param: str = "", fdn_prefix: str = "",
             child = (gsm_child_map or {}).get((param or "").lower())
             if child:
                 leaf = f"{mo},{child}=1"
+        real = (gsm_fdn_by_cell or {}).get(cid, "")
+        if real:
+            # exact FDN of the GeranCell from ENM + whatever sits below it
+            return real.rstrip(",") + leaf[len(f"GeranCell={cid}"):]
         bsc = ((bsc_by_cell or {}).get(cid) or default_bsc or "<BSC>")
         prefix = gsm_fdn_prefix.replace("{bsc}", bsc)
         return f"{prefix.rstrip(',')},{leaf}"
@@ -2415,7 +2443,8 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
                             gsm_fdn_prefix: str = "",
                             gsm_child_map: Optional[Dict[str, str]] = None,
                             bsc_by_cell: Optional[Dict[str, str]] = None,
-                            default_bsc: str = ""
+                            default_bsc: str = "",
+                            gsm_fdn_by_cell: Optional[Dict[str, str]] = None
                             ) -> List[str]:
     """One CMEdit CLI file per node: ``cmedit set <FDN> <param>=<value>``
     (one command per parameter). Returns the files written."""
@@ -2428,7 +2457,8 @@ def generate_cmedit_scripts(results: List[AuditResult], out_dir: str,
         lines: List[str] = []
         for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map, bsc_by_cell, default_bsc)
+                             gsm_child_map, bsc_by_cell, default_bsc,
+                             gsm_fdn_by_cell)
             lines.append(
                 f"cmedit set {fdn} {param}={_format_set_value(val, norm, actual)}")
         path = os.path.join(out_dir, f"{node}_SetParameter_{stamp}_cmedit.txt")
@@ -2443,7 +2473,8 @@ def build_cmedit_commands(results: List[AuditResult], site: str,
                           gsm_fdn_prefix: str = "",
                           gsm_child_map: Optional[Dict[str, str]] = None,
                           bsc_by_cell: Optional[Dict[str, str]] = None,
-                          default_bsc: str = ""
+                          default_bsc: str = "",
+                          gsm_fdn_by_cell: Optional[Dict[str, str]] = None
                           ) -> List[tuple]:
     """The exact ``cmedit set <FDN> <param>=<value>`` commands for the rows to
     align — same FDN/value logic as the CMEdit file export, but returned as
@@ -2452,7 +2483,8 @@ def build_cmedit_commands(results: List[AuditResult], site: str,
     for node, rows in _collect_set_rows(results, statuses, site).items():
         for mo, param, val, norm, actual in sorted(rows, key=lambda x: (x[1], x[0])):
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map, bsc_by_cell, default_bsc)
+                             gsm_child_map, bsc_by_cell, default_bsc,
+                             gsm_fdn_by_cell)
             cmds.append(
                 (node, f"cmedit set {fdn} {param}={_format_set_value(val, norm, actual)}"))
     return cmds
@@ -2465,7 +2497,8 @@ def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,
                             gsm_fdn_prefix: str = "",
                             gsm_child_map: Optional[Dict[str, str]] = None,
                             bsc_by_cell: Optional[Dict[str, str]] = None,
-                            default_bsc: str = ""
+                            default_bsc: str = "",
+                            gsm_fdn_by_cell: Optional[Dict[str, str]] = None
                             ) -> List[str]:
     """One CM Bulk CLI file per node, parameters grouped per FDN into one block::
 
@@ -2485,7 +2518,8 @@ def generate_cmbulk_scripts(results: List[AuditResult], out_dir: str,
         fdn_params: Dict[str, list] = {}
         for mo, param, val, norm, actual in rows:
             fdn = _build_fdn(node, mo, param, fdn_prefix, gsm_fdn_prefix,
-                             gsm_child_map, bsc_by_cell, default_bsc)
+                             gsm_child_map, bsc_by_cell, default_bsc,
+                             gsm_fdn_by_cell)
             fdn_params.setdefault(fdn, []).append(
                 (param, _format_set_value(val, norm, actual)))
         # No comment header — the CM Bulk importer errors on ``#`` lines.
